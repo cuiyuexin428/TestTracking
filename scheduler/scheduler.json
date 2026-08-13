@@ -1,0 +1,8 @@
+{
+  "server": {
+    "router_endpoint": "tcp://*:5555",
+    "poll_timeout_ms": 50,
+    "process_threads": 4,
+    "program_version": ""
+  }
+}

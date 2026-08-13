@@ -1,0 +1,20 @@
+# Build outputs
+/build/
+/out/
+/.vs/
+
+# Third-party installs (rebuilt by tools/build_third_party.ps1)
+/third_party/
+
+# Third-party intermediate build/extract dirs (regenerated from downloads/)
+/third_party_src/build/
+/third_party_src/src/
+
+# IDE / OS noise
+*.user
+Thumbs.db
+Desktop.ini
+
+# Third-party tooling (not part of the project sources)
+/tools/x64vax2602/
+/tools/x64vax2602.zip

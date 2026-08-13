@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package common;
+
+// Stop a run. Broadcast; clients stop accepting new tasks and finish or
+// abort the current task within the grace timeout.
+message StopCommand {
+  string run_id = 1;
+  string reason = 2;
+  int32 grace_timeout_ms = 3;
+}
+
+// Incrementally sync the dataset from the shared directory. (Long command.)
+message SyncDatasetCommand {
+  string dataset_version = 1;
+  string shared_dir = 2;
+  string manifest = 3;  // manifest path or content, TBD
+}
+
+// Verify the local dataset mirror.
+message VerifyDatasetCommand {
+  string dataset_version = 1;
+
+  enum Mode {
+    FAST = 0;  // compare metadata only
+    FULL = 1;  // content hash
+  }
+
+  Mode mode = 2;
+}
+
+// Query client status. Empty items means all.
+message QueryStatusCommand {
+  repeated string items = 1;
+}
+
+// Update the deployed test program. Broadcast. (Deferred feature; reserved.)
+message UpdateProgramCommand {
+  string program_version = 1;
+  string package_location = 2;
+  string checksum = 3;
+}
+
+// Immediate acknowledgement that a command was received and accepted.
+message Ack {
+  string request_id = 1;
+  bool accepted = 2;
+  string message = 3;
+}

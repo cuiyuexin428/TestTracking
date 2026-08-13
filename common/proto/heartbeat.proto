@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package common;
+
+import "common.proto";
+
+message Heartbeat {
+  string worker_id = 1;
+  int64 timestamp_ms = 2;
+
+  enum Status {
+    IDLE = 0;
+    BUSY = 1;
+  }
+
+  Status status = 3;
+  string program_version = 4;
+  string dataset_version = 5;
+  bool dataset_ready = 6;
+  string current_wave_id = 7;  // empty when idle
+  ResourceUsage resource = 8;
+}

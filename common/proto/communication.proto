@@ -1,0 +1,96 @@
+syntax = "proto3";
+
+package common;
+
+import "command.proto";
+import "common.proto";
+import "heartbeat.proto";
+
+// Top-level message exchanged between the scheduler and clients. The type
+// field is the dispatch key; the payload carries the message content.
+// Business-specific task/result payloads travel as opaque bytes and are
+// defined by each test program's adapter, not in this file.
+message Envelope {
+  MessageType type = 1;
+  string request_id = 2;  // empty for heartbeats
+
+  oneof payload {
+    RunWaveCommand run_wave = 3;
+    StopCommand stop = 4;
+    SyncDatasetCommand sync_dataset = 5;
+    VerifyDatasetCommand verify_dataset = 6;
+    QueryStatusCommand query_status = 7;
+    UpdateProgramCommand update_program = 8;
+    Heartbeat heartbeat = 9;
+    Ack ack = 10;
+    Response response = 11;
+  }
+}
+
+// Assign one wave of tasks. Long command: ack first, final response later.
+// task_type identifies the business schema of TaskSpec.payload, e.g. "stp".
+message RunWaveCommand {
+  string run_id = 1;
+  string wave_id = 2;
+  string task_type = 3;
+  repeated TaskSpec tasks = 4;
+}
+
+// Final response carrying command-specific results.
+message Response {
+  string request_id = 1;
+  Status status = 2;
+  string message = 3;
+
+  oneof result {
+    RunWaveResult run_wave = 4;
+    StopResult stop = 5;
+    SyncDatasetResult sync_dataset = 6;
+    VerifyDatasetResult verify_dataset = 7;
+    QueryStatusResult query_status = 8;
+    UpdateProgramResult update_program = 9;
+  }
+}
+
+message RunWaveResult {
+  repeated TaskResult tasks = 1;
+}
+
+// Framework-level task outcome. The business-specific result (e.g. bug
+// reports) is serialized into result by the adapter and parsed back
+// according to task_type.
+message TaskResult {
+  string task_id = 1;
+  int32 exit_code = 2;
+  int64 duration_ms = 3;
+  string artifact_path = 4;
+  bytes result = 5;
+}
+
+message StopResult {
+  repeated TaskResult unfinished = 1;
+}
+
+message SyncDatasetResult {
+  int32 synced_files = 1;
+  int64 duration_ms = 2;
+  string message = 3;
+}
+
+message VerifyDatasetResult {
+  bool ok = 1;
+  repeated string missing_files = 2;
+}
+
+message QueryStatusResult {
+  string program_version = 1;
+  string dataset_version = 2;
+  bool dataset_ready = 3;
+  string current_wave_id = 4;
+  ResourceUsage resource = 5;
+}
+
+message UpdateProgramResult {
+  bool ok = 1;
+  string message = 2;
+}
