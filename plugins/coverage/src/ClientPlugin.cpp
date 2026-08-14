@@ -149,12 +149,22 @@ bool ParseCobertura(const std::string& xml_path, std::vector<std::uint64_t>& poi
 
 }  // namespace
 
+ExcuteEvent::ExcuteEvent(std::function<void()> action) : action_(std::move(action)) {
+}
+
+void ExcuteEvent::execute() {
+    if (action_) {
+        action_();
+    }
+}
+
 std::string ClientPlugin::taskType() const {
     return "coverage";
 }
 
 bool ClientPlugin::init(const std::string& config) {
     const nlohmann::json cfg = nlohmann::json::parse(config);
+    task_threads_ = cfg.value("task_threads", 0);
     dry_run_ = cfg.value("dry_run", true);
     stp_root_ = cfg.value("stp_root", std::string());
     opencppcoverage_ = cfg.value("opencppcoverage", std::string("OpenCppCoverage.exe"));
@@ -168,6 +178,9 @@ bool ClientPlugin::init(const std::string& config) {
     if (!export_dir_.empty()) {
         std::error_code ec;
         std::filesystem::create_directories(export_dir_, ec);
+    }
+    if (task_threads_ > 0) {
+        pool_ = std::make_unique<common::EventManager>(task_threads_);
     }
 
     store_ = CreateCoverageStore();
@@ -209,39 +222,71 @@ bool ClientPlugin::RunOneFile(const std::string& run_id, int wave, const std::st
     return true;
 }
 
+void ClientPlugin::RunFileAction(const coverage::CoverageTask& cov_task,
+                                 const std::string& file) {
+    coverage::FileCoverage entry;
+    entry.set_file(file);
+
+    std::vector<std::uint64_t> points;
+    bool ok = false;
+    if (dry_run_) {
+        points = SyntheticPoints(file);
+        ok = true;
+    } else {
+        ok = RunOneFile(cov_task.run_id(), cov_task.wave_id(), file, points);
+    }
+    // The same (path, line) can appear once per module; dedupe so counts
+    // and the point sets are exact.
+    std::sort(points.begin(), points.end());
+    points.erase(std::unique(points.begin(), points.end()), points.end());
+    if (ok) {
+        store_->saveFileCoverage(cov_task.run_id(), cov_task.wave_id(), file, points);
+    }
+
+    entry.set_ok(ok);
+    entry.set_covered_lines(static_cast<std::int32_t>(points.size()));
+    LOG_INFO("coverage plugin: file " << file << (ok ? " ok" : " failed")
+                                      << " covered_lines=" << points.size());
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    files_.push_back(std::move(entry));
+    --pending_;
+    if (pending_ == 0) {
+        cv_.notify_all();
+    }
+}
+
 bool ClientPlugin::execute(const common::TaskSpec& task, common::TaskResult& result) {
-    coverage::CoverageTask coverage_task;
-    if (!coverage_task.ParseFromString(task.payload())) {
+    coverage::CoverageTask cov_task;
+    if (!cov_task.ParseFromString(task.payload())) {
         result.set_exit_code(-1);
         return false;
     }
 
-    coverage::CoverageResult coverage_result;
-    for (const std::string& file : coverage_task.files()) {
-        coverage::FileCoverage* entry = coverage_result.add_files();
-        entry->set_file(file);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pending_ = static_cast<int>(cov_task.files_size());
+        files_.clear();
+        files_.reserve(static_cast<size_t>(cov_task.files_size()));
+    }
 
-        std::vector<std::uint64_t> points;
-        bool ok = false;
-        if (dry_run_) {
-            points = SyntheticPoints(file);
-            ok = true;
+    for (const std::string& file : cov_task.files()) {
+        auto action = [this, cov_task, file] { RunFileAction(cov_task, file); };
+        if (pool_ != nullptr) {
+            pool_->push(new ExcuteEvent(std::move(action)));
         } else {
-            ok = RunOneFile(coverage_task.run_id(), coverage_task.wave_id(), file, points);
+            action();
         }
-        // The same (path, line) can appear once per module; dedupe so counts
-        // and the point sets are exact.
-        std::sort(points.begin(), points.end());
-        points.erase(std::unique(points.begin(), points.end()), points.end());
-        if (ok) {
-            store_->saveFileCoverage(coverage_task.run_id(), coverage_task.wave_id(), file,
-                                     points);
-        }
+    }
 
-        entry->set_ok(ok);
-        entry->set_covered_lines(static_cast<std::int32_t>(points.size()));
-        LOG_INFO("coverage plugin: file " << file << (ok ? " ok" : " failed")
-                                          << " covered_lines=" << points.size());
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] { return pending_ == 0; });
+    }
+
+    coverage::CoverageResult coverage_result;
+    for (const coverage::FileCoverage& entry : files_) {
+        *coverage_result.add_files() = entry;
     }
     coverage_result.SerializeToString(result.mutable_result());
     result.set_exit_code(0);
