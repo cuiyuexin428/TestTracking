@@ -31,6 +31,9 @@ public:
     // Appends to the given file. Pass an empty path to close the current file.
     void setFile(const std::string& path);
 
+    // Enables or disables console (stdout) output.
+    void setConsoleEnabled(bool enabled);
+
     bool isEnabled(Level level) const;
 
     void log(Level level, const std::string& message);
@@ -42,6 +45,7 @@ private:
     mutable std::mutex mutex_;
     Level level_ = Level::Debug;
     FILE* file_ = nullptr;
+    bool console_ = true;
 };
 
 }  // namespace common

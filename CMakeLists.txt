@@ -24,9 +24,10 @@ add_subdirectory(common)
 add_subdirectory(test)
 add_subdirectory(demo)
 add_subdirectory(scheduler)
+add_subdirectory(client)
+add_subdirectory(plugins)
 
 # Future programs:
-# add_subdirectory(client)
 
 # Keep shared third-party DLLs (protobuf, abseil) next to every executable.
 add_custom_target(deploy_third_party ALL

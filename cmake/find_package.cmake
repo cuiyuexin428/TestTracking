@@ -22,6 +22,7 @@ find_package(absl CONFIG REQUIRED)       # targets: absl::*
 set(THIRD_PARTY_INCLUDE_DIRS
     "${THIRD_PARTY_ROOT}/concurrentqueue"
     "${THIRD_PARTY_ROOT}/nlohmann"
+    "${THIRD_PARTY_ROOT}/tinyxml2"
     CACHE INTERNAL "")
 
 message(STATUS "THIRD_PARTY_ROOT=${THIRD_PARTY_ROOT}")

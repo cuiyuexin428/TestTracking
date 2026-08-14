@@ -59,6 +59,11 @@ void Logger::setFile(const std::string& path) {
     }
 }
 
+void Logger::setConsoleEnabled(bool enabled) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    console_ = enabled;
+}
+
 bool Logger::isEnabled(Level level) const {
     return static_cast<int>(level) >= static_cast<int>(this->level());
 }
@@ -90,8 +95,10 @@ void Logger::log(Level level, const std::string& message) {
          << message << "\n";
 
     std::lock_guard<std::mutex> lock(mutex_);
-    std::fputs(line.str().c_str(), stdout);
-    std::fflush(stdout);
+    if (console_) {
+        std::fputs(line.str().c_str(), stdout);
+        std::fflush(stdout);
+    }
     if (file_ != nullptr) {
         std::fputs(line.str().c_str(), file_);
         std::fflush(file_);

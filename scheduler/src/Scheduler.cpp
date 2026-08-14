@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -16,8 +17,9 @@ namespace {
 
 class ProcessResultEvent : public common::Event {
 public:
-    ProcessResultEvent(common::Plugin* plugin, common::TaskResult result)
-        : plugin_(plugin), result_(std::move(result)) {
+    ProcessResultEvent(common::Plugin* plugin, common::TaskResult result,
+                       std::function<void()> on_done)
+        : plugin_(plugin), result_(std::move(result)), on_done_(std::move(on_done)) {
     }
 
     void execute() override {
@@ -29,11 +31,21 @@ public:
             LOG_ERROR("plugin " << plugin_->taskType()
                                << ": processResult threw unknown exception");
         }
+        try {
+            if (on_done_) {
+                on_done_();
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR("dispatch trigger failed: " << e.what());
+        } catch (...) {
+            LOG_ERROR("dispatch trigger failed: unknown exception");
+        }
     }
 
 private:
     common::Plugin* plugin_;
     common::TaskResult result_;
+    std::function<void()> on_done_;
 };
 
 std::string GenerateRunId() {
@@ -167,8 +179,8 @@ bool Scheduler::LoadPlugins() {
 
         plugins_by_type_[plugin->taskType()] = plugin;
         plugins_.push_back(
-            {std::unique_ptr<common::Plugin, PluginDeleter>(plugin, PluginDeleter{destroy}),
-             std::move(library)});
+            {std::move(library),
+             std::unique_ptr<common::Plugin, PluginDeleter>(plugin, PluginDeleter{destroy})});
         LOG_INFO("plugin loaded: " << name << " task_type=" << plugin->taskType());
     }
     return true;
@@ -182,12 +194,17 @@ void Scheduler::RunProcessing() {
             HandleMessage(msg);
         }
 
-        CreateRunCommand cmd;
-        while (commands_.pop(cmd, std::chrono::milliseconds(0))) {
-            HandleCreateRun(cmd);
-        }
+            CreateRunCommand cmd;
+            while (commands_.pop(cmd, std::chrono::milliseconds(0))) {
+                HandleCreateRun(cmd);
+            }
 
-        const auto now = std::chrono::steady_clock::now();
+            int trigger = 0;
+            while (dispatch_triggers_.pop(trigger, std::chrono::milliseconds(0))) {
+                TriggerDispatch();
+            }
+
+            const auto now = std::chrono::steady_clock::now();
         if (now - last_check >= std::chrono::milliseconds(500)) {
             last_check = now;
             RunTimeoutChecks();
@@ -277,9 +294,9 @@ void Scheduler::HandleResponse(const common::Response& response) {
             LOG_ERROR("result processing pool is not running");
             continue;
         }
-        event_manager_->push(new ProcessResultEvent(pit->second, std::move(task)));
+        event_manager_->push(new ProcessResultEvent(
+            pit->second, std::move(task), [this] { dispatch_triggers_.push(0); }));
     }
-    TriggerDispatch();
 }
 
 bool Scheduler::UpdateClient(const std::string& identity, const common::Heartbeat& heartbeat) {

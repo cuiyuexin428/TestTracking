@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package demo;
+
+// Minimal business schema used by the demo plugin to exercise the opaque
+// payload flow (TaskSpec.payload / TaskResult.result).
+message DemoTask {
+  int32 task_index = 1;
+  string description = 2;
+}
+
+message DemoResult {
+  bool ok = 1;
+  string message = 2;
+}

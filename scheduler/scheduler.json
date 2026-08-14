@@ -4,5 +4,19 @@
     "poll_timeout_ms": 50,
     "process_threads": 4,
     "program_version": ""
+  },
+  "plugins": {
+    "demo": {
+      "dll": "demo.dll",
+      "enabled": false
+    },
+    "coverage": {
+      "dll": "coverage.dll",
+      "enabled": true,
+      "stp_manifest": "C:/WorkSpace/TestTracking/testdata/stp_manifest.txt",
+      "store_dir": "C:/WorkSpace/TestTracking/testdata/coverage_store",
+      "batch_size": 1000,
+      "task_size": 25
+    }
   }
 }

@@ -78,8 +78,10 @@ private:
     };
 
     struct LoadedPlugin {
-        std::unique_ptr<common::Plugin, PluginDeleter> instance;
         std::unique_ptr<common::DynamicLibrary> library;
+        // Declaration order matters: the plugin instance must be destroyed
+        // before the library is unloaded (virtual calls go into the DLL).
+        std::unique_ptr<common::Plugin, PluginDeleter> instance;
     };
 
     struct CreateRunCommand {
@@ -120,6 +122,9 @@ private:
     std::unordered_map<common::Plugin*, RunContext> active_runs_;
 
     common::BlockingQueue<CreateRunCommand> commands_;
+    // Completion events signal "dispatch again" here after the plugin's
+    // processResult has run, so dispatch sees up-to-date plugin state.
+    common::BlockingQueue<int> dispatch_triggers_;
 };
 
 }  // namespace scheduler

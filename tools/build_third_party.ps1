@@ -39,6 +39,7 @@ $VersionZmq      = "4.3.5"
 $VersionAbseil   = "20230802.3"
 $VersionProtobuf = "25.3"
 $VersionJson     = "3.11.3"
+$VersionTinyXml2 = "10.0.0"
 
 $installRoot  = Join-Path $ProjectRoot "third_party"
 $srcRoot      = Join-Path $ProjectRoot "third_party_src"
@@ -248,6 +249,13 @@ $jsonDir = Join-Path $installRoot "nlohmann"
 New-Item -ItemType Directory -Force -Path $jsonDir | Out-Null
 Install-SingleFile "https://raw.githubusercontent.com/nlohmann/json/v$VersionJson/single_include/nlohmann/json.hpp" (Join-Path $downloadsDir "json.hpp") (Join-Path $jsonDir "json.hpp")
 Install-SingleFile "https://raw.githubusercontent.com/nlohmann/json/v$VersionJson/LICENSE.MIT" (Join-Path $downloadsDir "json-LICENSE.MIT") (Join-Path $jsonDir "LICENSE.MIT")
+
+# ---------- tinyxml2 (XML parser, cobertura report parsing) ----------
+$xmlDir = Join-Path $installRoot "tinyxml2"
+New-Item -ItemType Directory -Force -Path $xmlDir | Out-Null
+Install-SingleFile "https://raw.githubusercontent.com/leethomason/tinyxml2/$VersionTinyXml2/tinyxml2.h" (Join-Path $downloadsDir "tinyxml2.h") (Join-Path $xmlDir "tinyxml2.h")
+Install-SingleFile "https://raw.githubusercontent.com/leethomason/tinyxml2/$VersionTinyXml2/tinyxml2.cpp" (Join-Path $downloadsDir "tinyxml2.cpp") (Join-Path $xmlDir "tinyxml2.cpp")
+Install-SingleFile "https://raw.githubusercontent.com/leethomason/tinyxml2/$VersionTinyXml2/LICENSE.txt" (Join-Path $downloadsDir "tinyxml2-LICENSE.txt") (Join-Path $xmlDir "LICENSE.txt")
 
 Write-Host ""
 Write-Host "==== Build complete ===="

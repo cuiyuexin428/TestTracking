@@ -10,11 +10,12 @@ target_include_directories(scheduler PRIVATE
 
 target_link_libraries(scheduler PRIVATE common)
 
-# Keep scheduler.json in a config/ directory next to the executable so the
-# program finds it regardless of the working directory (e.g. IDE launches).
-add_custom_command(TARGET scheduler POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:scheduler>/config
+# Keep scheduler.json in a config/ directory next to the executable. This
+# target runs on every build so config changes always reach the output dir.
+add_custom_target(scheduler_config ALL
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/bin/$<CONFIG>/config
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         ${CMAKE_CURRENT_SOURCE_DIR}/scheduler.json
-        $<TARGET_FILE_DIR:scheduler>/config/scheduler.json
+        ${CMAKE_BINARY_DIR}/bin/$<CONFIG>/config/scheduler.json
 )
+add_dependencies(scheduler scheduler_config)

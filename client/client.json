@@ -1,0 +1,28 @@
+{
+  "scheduler": {
+    "endpoint": "tcp://127.0.0.1:5555",
+    "poll_timeout_ms": 50
+  },
+  "client": {
+    "worker_id": "worker-1",
+    "program_version": "",
+    "dataset_version": "",
+    "dataset_ready": false,
+    "heartbeat_interval_ms": 1000
+  },
+  "plugins": {
+    "demo": {
+      "dll": "demo.dll",
+      "enabled": false
+    },
+    "coverage": {
+      "dll": "coverage.dll",
+      "enabled": true,
+      "dry_run": true,
+      "stp_root": "D:/stp_set",
+      "opencppcoverage": "OpenCppCoverage.exe",
+      "target_exe": "step.exe",
+      "occt_dlls": ["TKernel.dll", "TKSTEP.dll"]
+    }
+  }
+}
