@@ -6,6 +6,8 @@
 
 #include "demo.pb.h"
 
+#include <json.hpp>
+
 #include <chrono>
 #include <mutex>
 #include <string>
@@ -24,12 +26,21 @@ namespace {
 
 class DemoPlugin : public common::TaskPlugin {
 public:
-    std::string taskType() const override {
+    std::string pluginType() const override {
         return "demo";
     }
 
     bool init(const std::string& config) override {
         (void)config;
+        return true;
+    }
+
+    bool validateClient(const common::ClientInfo& client, const std::string& client_message,
+                        common::ValidationResult& result) override {
+        (void)client;
+        (void)client_message;
+        result.accepted = true;
+        result.reason = "demo accepts all";
         return true;
     }
 
@@ -42,7 +53,6 @@ public:
         pending_.clear();
         tasks_by_id_.clear();
         task_client_.clear();
-        client_tasks_.clear();
         completed_ = 0;
         total_ = total;
 
@@ -51,7 +61,7 @@ public:
             task.set_task_index(i);
             task.set_description("demo task " + std::to_string(i));
 
-            common::TaskSpec spec;
+            common::Task spec;
             spec.set_task_id(request.run_id + "-" + std::to_string(i));
             task.SerializeToString(spec.mutable_payload());
 
@@ -62,39 +72,23 @@ public:
         return true;
     }
 
-    bool dispatch(const std::vector<common::ClientInfo>& clients,
-                  std::vector<common::TaskAssignment>& out) override {
+    bool requestTask(const common::ClientInfo& client, const std::string& request_payload,
+                     common::Task& task) override {
+        (void)request_payload;
         std::lock_guard<std::mutex> lock(mutex_);
-        for (const common::ClientInfo& client : clients) {
-            if (pending_.empty()) {
-                break;
-            }
-            if (client.heartbeat.status() != common::Heartbeat::IDLE) {
-                continue;
-            }
-            if (client_tasks_[client.identity] > 0) {
-                continue;  // one task at a time per client
-            }
-
-            common::TaskAssignment assignment;
-            assignment.client_identity = client.identity;
-            assignment.task = pending_.front();
-            pending_.erase(pending_.begin());
-            task_client_[assignment.task.task_id()] = client.identity;
-            ++client_tasks_[client.identity];
-            out.push_back(std::move(assignment));
+        if (pending_.empty()) {
+            return false;
         }
+        task = pending_.front();
+        pending_.erase(pending_.begin());
+        task_client_[task.task_id()] = client.identity;
         return true;
     }
 
     void requeue(const std::vector<std::string>& task_ids) override {
         std::lock_guard<std::mutex> lock(mutex_);
         for (const std::string& task_id : task_ids) {
-            const auto it = task_client_.find(task_id);
-            if (it != task_client_.end()) {
-                --client_tasks_[it->second];
-                task_client_.erase(it);
-            }
+            task_client_.erase(task_id);
             const auto spec_it = tasks_by_id_.find(task_id);
             if (spec_it != tasks_by_id_.end()) {
                 pending_.push_back(spec_it->second);
@@ -111,11 +105,7 @@ public:
         }
 
         std::lock_guard<std::mutex> lock(mutex_);
-        const auto it = task_client_.find(result.task_id());
-        if (it != task_client_.end()) {
-            --client_tasks_[it->second];
-            task_client_.erase(it);
-        }
+        task_client_.erase(result.task_id());
         ++completed_;
         LOG_INFO("demo plugin: result " << result.task_id() << " exit=" << result.exit_code()
                                         << " msg=" << message << " (" << completed_ << "/"
@@ -125,28 +115,53 @@ public:
         }
     }
 
+    bool runFinished() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return total_ > 0 && completed_ >= total_ && pending_.empty();
+    }
+
+    void cancel() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pending_.clear();
+        tasks_by_id_.clear();
+        task_client_.clear();
+        completed_ = 0;
+        total_ = 0;
+        LOG_INFO("demo plugin: run cancelled, task pool cleared");
+    }
+
 private:
     std::mutex mutex_;
-    std::vector<common::TaskSpec> pending_;
-    std::unordered_map<std::string, common::TaskSpec> tasks_by_id_;
+    std::vector<common::Task> pending_;
+    std::unordered_map<std::string, common::Task> tasks_by_id_;
     std::unordered_map<std::string, std::string> task_client_;
-    std::unordered_map<std::string, int> client_tasks_;
     int completed_ = 0;
     int total_ = 0;
 };
 
 class DemoClientPlugin : public common::WorkerPlugin {
 public:
-    std::string taskType() const override {
+    std::string pluginType() const override {
         return "demo";
     }
 
     bool init(const std::string& config) override {
-        (void)config;
+        const nlohmann::json cfg = nlohmann::json::parse(config);
+        sleep_ms_ = cfg.value("task_sleep_ms", 200);
         return true;
     }
 
-    bool execute(const common::TaskSpec& task, common::TaskResult& result) override {
+    bool collectRegistrationInfo(std::string* payload) override {
+        payload->clear();
+        return true;
+    }
+
+    common::RegisterOutcome handleValidationReply(const std::string& reply_payload) override {
+        (void)reply_payload;
+        return common::RegisterOutcome::kReady;
+    }
+
+    bool execute(const common::Task& task, common::TaskResult& result) override {
         demo::DemoTask demo_task;
         if (!demo_task.ParseFromString(task.payload())) {
             result.set_exit_code(-1);
@@ -154,7 +169,7 @@ public:
         }
 
         const auto start = std::chrono::steady_clock::now();
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms_));
         const auto elapsed_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
                                                                   start)
@@ -170,6 +185,9 @@ public:
         demo_result.SerializeToString(result.mutable_result());
         return true;
     }
+
+private:
+    int sleep_ms_ = 200;
 };
 
 }  // namespace

@@ -20,3 +20,22 @@ message FileCoverage {
 message CoverageResult {
   repeated FileCoverage files = 1;
 }
+
+// Registration validation: local deployment info of the client. It is the
+// REGISTER business payload; the framework does not parse it and the
+// coverage server plugin interprets it.
+message CoverageClientInfo {
+  string program_version = 1;
+  string dataset_version = 2;
+  bool deployed = 3;
+}
+
+// Server plugin reply: whether deployment is required plus target versions
+// and source. It is the REGISTER_RESULT business reply; the framework does
+// not parse it and the coverage client plugin interprets it.
+message CoverageValidationReply {
+  bool deploy_required = 1;
+  string target_program_version = 2;
+  string target_dataset_version = 3;
+  string shared_dir = 4;
+}

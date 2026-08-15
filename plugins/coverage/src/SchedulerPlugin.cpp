@@ -13,13 +13,16 @@
 
 namespace coverage_plugin {
 
-std::string SchedulerPlugin::taskType() const {
+std::string SchedulerPlugin::pluginType() const {
     return "coverage";
 }
 
 bool SchedulerPlugin::init(const std::string& config) {
     const nlohmann::json cfg = nlohmann::json::parse(config);
     manifest_path_ = cfg.value("stp_manifest", std::string());
+    expected_program_version_ = cfg.value("expected_program_version", std::string());
+    expected_dataset_version_ = cfg.value("expected_dataset_version", std::string());
+    shared_dir_ = cfg.value("shared_dir", std::string());
     batch_size_ = cfg.value("batch_size", 1000);
     task_size_ = cfg.value("task_size", 25);
     keep_staging_ = cfg.value("keep_staging", false);
@@ -32,6 +35,40 @@ bool SchedulerPlugin::init(const std::string& config) {
         LOG_ERROR("coverage plugin: coverage store init failed");
         return false;
     }
+    return true;
+}
+
+bool SchedulerPlugin::validateClient(const common::ClientInfo& client,
+                                     const std::string& client_message,
+                                     common::ValidationResult& result) {
+    (void)client;
+
+    coverage::CoverageClientInfo info;
+    if (!info.ParseFromString(client_message)) {
+        result.accepted = false;
+        result.reason = "unparseable coverage client info";
+        return true;
+    }
+
+    const bool version_ok =
+        (expected_program_version_.empty() ||
+         info.program_version() == expected_program_version_) &&
+        (expected_dataset_version_.empty() ||
+         info.dataset_version() == expected_dataset_version_);
+    if (info.deployed() && version_ok) {
+        result.accepted = true;
+        result.reason = "ok";
+        return true;
+    }
+
+    coverage::CoverageValidationReply reply;
+    reply.set_deploy_required(true);
+    reply.set_target_program_version(expected_program_version_);
+    reply.set_target_dataset_version(expected_dataset_version_);
+    reply.set_shared_dir(shared_dir_);
+    reply.SerializeToString(&result.reply_payload);
+    result.accepted = false;
+    result.reason = "deploy required";
     return true;
 }
 
@@ -71,7 +108,6 @@ bool SchedulerPlugin::plan(const common::RunRequest& request,
     pending_.clear();
     wave_task_ids_.clear();
     task_client_.clear();
-    client_tasks_.clear();
     tasks_by_id_.clear();
     cumulative_.clear();
     current_wave_ = 0;
@@ -80,7 +116,7 @@ bool SchedulerPlugin::plan(const common::RunRequest& request,
 
     for (size_t start = 0; start < files.size(); start += static_cast<size_t>(batch_size_)) {
         const size_t end = std::min(start + static_cast<size_t>(batch_size_), files.size());
-        std::vector<common::TaskSpec> wave_tasks;
+        std::vector<common::Task> wave_tasks;
         const size_t wave_index = waves_.size();
         for (size_t t = start; t < end; t += static_cast<size_t>(task_size_)) {
             const size_t tend = std::min(t + static_cast<size_t>(task_size_), end);
@@ -91,7 +127,7 @@ bool SchedulerPlugin::plan(const common::RunRequest& request,
                 task.add_files(files[i].first);
             }
 
-            common::TaskSpec spec;
+            common::Task spec;
             spec.set_task_id(run_id_ + "-w" + std::to_string(wave_index) + "-t" +
                              std::to_string(wave_tasks.size()));
             task.SerializeToString(spec.mutable_payload());
@@ -101,7 +137,7 @@ bool SchedulerPlugin::plan(const common::RunRequest& request,
     }
 
     pending_ = waves_[0];
-    for (const common::TaskSpec& task : pending_) {
+    for (const common::Task& task : pending_) {
         wave_task_ids_.insert(task.task_id());
         tasks_by_id_[task.task_id()] = task;
     }
@@ -111,39 +147,23 @@ bool SchedulerPlugin::plan(const common::RunRequest& request,
     return true;
 }
 
-bool SchedulerPlugin::dispatch(const std::vector<common::ClientInfo>& clients,
-                               std::vector<common::TaskAssignment>& out) {
+bool SchedulerPlugin::requestTask(const common::ClientInfo& client,
+                                  const std::string& request_payload, common::Task& task) {
+    (void)request_payload;
     std::lock_guard<std::mutex> lock(mutex_);
-    for (const common::ClientInfo& client : clients) {
-        if (pending_.empty()) {
-            break;
-        }
-        if (client.heartbeat.status() != common::Heartbeat::IDLE) {
-            continue;
-        }
-        if (client_tasks_[client.identity] > 0) {
-            continue;  // one task at a time per client
-        }
-
-        common::TaskAssignment assignment;
-        assignment.client_identity = client.identity;
-        assignment.task = pending_.front();
-        pending_.erase(pending_.begin());
-        task_client_[assignment.task.task_id()] = client.identity;
-        ++client_tasks_[client.identity];
-        out.push_back(std::move(assignment));
+    if (pending_.empty()) {
+        return false;
     }
+    task = pending_.front();
+    pending_.erase(pending_.begin());
+    task_client_[task.task_id()] = client.identity;
     return true;
 }
 
 void SchedulerPlugin::requeue(const std::vector<std::string>& task_ids) {
     std::lock_guard<std::mutex> lock(mutex_);
     for (const std::string& task_id : task_ids) {
-        const auto it = task_client_.find(task_id);
-        if (it != task_client_.end()) {
-            --client_tasks_[it->second];
-            task_client_.erase(it);
-        }
+        task_client_.erase(task_id);
         const auto spec_it = tasks_by_id_.find(task_id);
         if (spec_it != tasks_by_id_.end()) {
             pending_.push_back(spec_it->second);
@@ -168,18 +188,32 @@ void SchedulerPlugin::processResult(const common::TaskResult& result) {
 
     std::lock_guard<std::mutex> lock(mutex_);
     wave_task_ids_.erase(result.task_id());
+    task_client_.erase(result.task_id());
     LOG_INFO("coverage plugin: result " << result.task_id() << " covered_lines="
                                         << covered_lines);
-
-    const auto task_it = task_client_.find(result.task_id());
-    if (task_it != task_client_.end()) {
-        --client_tasks_[task_it->second];
-        task_client_.erase(task_it);
-    }
 
     if (wave_task_ids_.empty()) {
         SettleWave();
     }
+}
+
+bool SchedulerPlugin::runFinished() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return waves_.empty() || current_wave_ >= waves_.size();
+}
+
+void SchedulerPlugin::cancel() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    waves_.clear();
+    pending_.clear();
+    wave_task_ids_.clear();
+    task_client_.clear();
+    tasks_by_id_.clear();
+    cumulative_.clear();
+    current_wave_ = 0;
+    total_files_ = 0;
+    selected_count_ = 0;
+    LOG_INFO("coverage plugin: run cancelled, task pool cleared");
 }
 
 void SchedulerPlugin::SettleWave() {
@@ -227,7 +261,7 @@ void SchedulerPlugin::SettleWave() {
     if (current_wave_ < waves_.size()) {
         pending_ = waves_[current_wave_];
         wave_task_ids_.clear();
-        for (const common::TaskSpec& task : pending_) {
+        for (const common::Task& task : pending_) {
             wave_task_ids_.insert(task.task_id());
         }
         LOG_INFO("coverage plugin: wave " << current_wave_ << " started, " << pending_.size()

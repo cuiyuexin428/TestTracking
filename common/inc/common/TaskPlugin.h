@@ -8,57 +8,74 @@
 
 namespace common {
 
-// A client as seen by the plugin: the framework-managed ROUTER identity plus
-// the client's self-reported heartbeat.
+// Client information: the framework-managed ROUTER identity plus the
+// client's plugin type and self-reported heartbeat.
 struct ClientInfo {
     std::string identity;
+    std::string plugin_type;
     Heartbeat heartbeat;
 };
 
-// A run request submitted by the user.
+// Run request.
 struct RunRequest {
     std::string run_id;
     std::string dataset_version;
-    std::string params;  // plugin-specific run parameters
+    std::string params;
 };
 
-// A task assigned to a specific client by the plugin.
-struct TaskAssignment {
-    std::string client_identity;
-    TaskSpec task;  // task_id + opaque business payload
+// Registration validation result. reply_payload is the opaque business
+// reply, which the framework does not parse.
+struct ValidationResult {
+    bool accepted = false;
+    std::string reply_payload;
+    std::string reason;
 };
 
-// Abstract base class for task plugins. The scheduler-side plugin owns its
-// task pool and decides which client gets which task; the framework triggers
-// dispatch, transports assignments, tracks in-flight tasks, and hands back
-// tasks of offline clients via requeue().
+// Server plugin base class. plugin_type anchors the server plugin and the
+// client plugin: the framework routes REGISTER / REQUEST_TASK / TASK_REPORT
+// by plugin_type and passes business payloads through untouched.
 class TaskPlugin {
 public:
     virtual ~TaskPlugin() = default;
 
-    // Unique task type key, e.g. "stp"; must match RunWaveCommand.task_type.
-    virtual std::string taskType() const = 0;
+    // Unique plugin type key, matching the client plugin.
+    virtual std::string pluginType() const = 0;
 
-    // Called once after loading; config is this plugin's JSON section text.
+    // Load config and check business prerequisites (program/data/manifest/
+    // shared directory, etc.).
     virtual bool init(const std::string& config) = 0;
 
-    // Plan a run. The plugin keeps the generated task pool internally.
-    // clients is a snapshot; no tasks are sent here.
+    // Initialization-phase validation, called on REGISTER.
+    virtual bool validateClient(const ClientInfo& client,
+                                const std::string& client_message,
+                                ValidationResult& result) = 0;
+
+    // Plan a run (freely, e.g. waves); the plugin keeps the task pool
+    // internally.
     virtual bool plan(const RunRequest& request,
                       const std::vector<ClientInfo>& clients) = 0;
 
-    // Called when there may be work to send (run init, client list change,
-    // completion, requeue). The plugin picks eligible idle clients from the
-    // snapshot and fills out. May return empty when nothing can be sent.
-    virtual bool dispatch(const std::vector<ClientInfo>& clients,
-                          std::vector<TaskAssignment>& out) = 0;
+    // Called on client REQUEST_TASK: fill task and return true when a task
+    // is available, false otherwise. request_payload is opaque business data
+    // carried by the client request.
+    virtual bool requestTask(const ClientInfo& client,
+                             const std::string& request_payload,
+                             Task& task) = 0;
 
-    // Tasks that were in flight to a now-offline client are returned here so
-    // the plugin can put them back into its pool.
-    virtual void requeue(const std::vector<std::string>& task_ids) = 0;
-
-    // Process one finished task (parse business result, persist, ...).
+    // Process a task execution report.
     virtual void processResult(const TaskResult& result) = 0;
+
+    // Whether the current run has fully completed (no pending work). Called
+    // by the framework to clear the active run context so a new run can
+    // start; business semantics are decided by the plugin.
+    virtual bool runFinished() = 0;
+
+    // Cancel the current run: the plugin discards its task pool (including
+    // un-dispatched tasks). Called by the framework when a run is stopped.
+    virtual void cancel() = 0;
+
+    // Return in-flight tasks of offline clients to the plugin.
+    virtual void requeue(const std::vector<std::string>& task_ids) = 0;
 };
 
 // DLL entry points (extern "C", exported):

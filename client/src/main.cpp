@@ -9,6 +9,7 @@
 #include <iostream>
 #include <string>
 #include <system_error>
+#include <thread>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -72,18 +73,21 @@ int main(int argc, char* argv[]) {
         common::Logger::instance().setLevel(common::Logger::Level::Info);
 
         client::Client client(config);
-        client.start();
-        LOG_INFO("client started, config=" << config_path << ", type 'quit' to stop");
-
-        std::string line;
-        while (std::getline(std::cin, line)) {
-            if (line == "quit" || line == "exit") {
-                break;
+        // The main thread runs the state machine; a stdin thread provides
+        // the quit control.
+        std::thread stdin_thread([&client] {
+            std::string line;
+            while (std::getline(std::cin, line)) {
+                if (line == "quit" || line == "exit") {
+                    client.stop();
+                    break;
+                }
             }
-            LOG_WARN("unknown command: " << line);
-        }
+        });
+        stdin_thread.detach();
 
-        client.stop();
+        LOG_INFO("client started, config=" << config_path);
+        client.start();  // blocks: INIT + state machine until stop()
         LOG_INFO("client stopped");
     } catch (const std::exception& e) {
         std::fprintf(stderr, "client failed: %s\n", e.what());

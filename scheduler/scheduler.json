@@ -3,7 +3,8 @@
     "router_endpoint": "tcp://*:5555",
     "poll_timeout_ms": 50,
     "process_threads": 4,
-    "program_version": ""
+    "client_timeout_ms": 0,
+    "task_lease_timeout_ms": 0
   },
   "plugins": {
     "demo": {
@@ -16,7 +17,10 @@
       "stp_manifest": "C:/WorkSpace/TestTracking/testdata/stp_manifest.txt",
       "store_dir": "C:/WorkSpace/TestTracking/testdata/coverage_store",
       "batch_size": 1000,
-      "task_size": 25
+      "task_size": 25,
+      "expected_program_version": "",
+      "expected_dataset_version": "",
+      "shared_dir": ""
     }
   }
 }

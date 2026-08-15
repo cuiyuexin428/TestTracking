@@ -1,6 +1,7 @@
 add_executable(client
     src/main.cpp
     src/Client.cpp
+    src/TaskExecutor.cpp
 )
 
 target_include_directories(client PRIVATE

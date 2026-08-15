@@ -25,6 +25,22 @@ namespace coverage_plugin {
 
 namespace {
 
+bool CopyTree(const std::string& from, const std::string& to) {
+    if (from.empty() || to.empty()) {
+        return false;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(to, ec);
+    if (ec) {
+        return false;
+    }
+    std::filesystem::copy(from, to,
+                          std::filesystem::copy_options::recursive |
+                              std::filesystem::copy_options::overwrite_existing,
+                          ec);
+    return !ec;
+}
+
 #ifdef _WIN32
 std::string NormalizePath(std::string path) {
     for (char& c : path) {
@@ -158,7 +174,7 @@ void ExcuteEvent::execute() {
     }
 }
 
-std::string ClientPlugin::taskType() const {
+std::string ClientPlugin::pluginType() const {
     return "coverage";
 }
 
@@ -167,10 +183,14 @@ bool ClientPlugin::init(const std::string& config) {
     task_threads_ = cfg.value("task_threads", 0);
     dry_run_ = cfg.value("dry_run", true);
     stp_root_ = cfg.value("stp_root", std::string());
+    program_dir_ = cfg.value("program_dir", std::string());
     opencppcoverage_ = cfg.value("opencppcoverage", std::string("OpenCppCoverage.exe"));
     target_exe_ = cfg.value("target_exe", std::string());
     export_dir_ = cfg.value("export_dir", std::string());
     keep_reports_ = cfg.value("keep_reports", false);
+    program_version_ = cfg.value("program_version", std::string());
+    dataset_version_ = cfg.value("dataset_version", std::string());
+    deployed_ = cfg.value("deployed", false);
     for (const nlohmann::json& dll : cfg.value("occt_dlls", nlohmann::json::array())) {
         occt_dlls_.push_back(dll.get<std::string>());
     }
@@ -189,6 +209,51 @@ bool ClientPlugin::init(const std::string& config) {
         return false;
     }
     return true;
+}
+
+bool ClientPlugin::collectRegistrationInfo(std::string* payload) {
+    coverage::CoverageClientInfo info;
+    info.set_program_version(program_version_);
+    info.set_dataset_version(dataset_version_);
+    info.set_deployed(deployed_);
+    return info.SerializeToString(payload);
+}
+
+common::RegisterOutcome ClientPlugin::handleValidationReply(const std::string& reply_payload) {
+    coverage::CoverageValidationReply reply;
+    if (!reply.ParseFromString(reply_payload)) {
+        LOG_ERROR("coverage plugin: unparseable validation reply");
+        return common::RegisterOutcome::kFailed;
+    }
+    if (!reply.deploy_required()) {
+        return common::RegisterOutcome::kReady;
+    }
+
+    const std::string shared = reply.shared_dir();
+    if (!shared.empty() && (!program_dir_.empty() || !stp_root_.empty())) {
+        bool ok = true;
+        if (!program_dir_.empty()) {
+            ok = CopyTree(shared + "/program", program_dir_) && ok;
+        }
+        if (!stp_root_.empty()) {
+            ok = CopyTree(shared + "/dataset", stp_root_) && ok;
+        }
+        if (!ok) {
+            LOG_ERROR("coverage plugin: deployment copy failed from " << shared);
+            return common::RegisterOutcome::kFailed;
+        }
+        LOG_INFO("coverage plugin: deployed from " << shared << " program=" << program_dir_
+                                                   << " dataset=" << stp_root_);
+    } else {
+        LOG_WARN("coverage plugin: shared_dir/deploy dirs not configured, simulating deployment");
+    }
+
+    LOG_INFO("coverage plugin: deploy to program=" << reply.target_program_version()
+                                                   << " dataset=" << reply.target_dataset_version());
+    program_version_ = reply.target_program_version();
+    dataset_version_ = reply.target_dataset_version();
+    deployed_ = true;
+    return common::RegisterOutcome::kRetry;
 }
 
 bool ClientPlugin::RunOneFile(const std::string& run_id, int wave, const std::string& file,
@@ -256,7 +321,7 @@ void ClientPlugin::RunFileAction(const coverage::CoverageTask& cov_task,
     }
 }
 
-bool ClientPlugin::execute(const common::TaskSpec& task, common::TaskResult& result) {
+bool ClientPlugin::execute(const common::Task& task, common::TaskResult& result) {
     coverage::CoverageTask cov_task;
     if (!cov_task.ParseFromString(task.payload())) {
         result.set_exit_code(-1);

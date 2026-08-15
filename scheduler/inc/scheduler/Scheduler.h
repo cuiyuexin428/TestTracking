@@ -32,11 +32,11 @@ struct PluginDeleter {
 };
 
 // Orchestrator: owns the network service, loads enabled plugins from config,
-// and runs one processing thread that handles messages, executes user
-// commands, and performs timeout checks. All plugin calls (plan/dispatch/
-// requeue/processResult) happen on that single thread, so plugins never need
-// internal locking. Framework code depends only on the abstract
-// common::TaskPlugin interface; concrete plugins are separate DLLs.
+// and runs one processing thread that handles messages and executes user
+// commands. The framework only routes by plugin_type; business payloads are
+// passed through to plugins untouched. Clients pull tasks themselves:
+// REGISTER -> validateClient, REQUEST_TASK -> TASK/NO_TASK,
+// TASK_REPORT -> processResult.
 class Scheduler {
 public:
     explicit Scheduler(common::Config& config);
@@ -48,10 +48,13 @@ public:
     void start();
     void stop();
 
-    // Queue a run creation for the plugin with the given task type. The
-    // planning result is reported asynchronously by the processing thread.
-    bool createRun(const std::string& task_type, const std::string& dataset_version,
+    // Queue a run creation for the plugin with the given task type.
+    bool createRun(const std::string& plugin_type, const std::string& dataset_version,
                    const std::string& params);
+
+    // Stop the active run of the given plugin type: send STOP to its clients
+    // and reclaim their in-flight tasks.
+    bool stopRun(const std::string& plugin_type);
 
     // Snapshot of the current client list.
     std::vector<common::ClientInfo> clients() const;
@@ -68,13 +71,14 @@ private:
 
     struct InFlight {
         std::string identity;
-        std::string task_type;
+        std::string plugin_type;
+        std::chrono::steady_clock::time_point sent_at;
+        bool acked = false;  // client confirmed receipt via TASK_ACK
     };
 
     struct RunContext {
         std::string run_id;
-        std::string task_type;
-        int wave = 0;
+        std::string plugin_type;
     };
 
     struct LoadedPlugin {
@@ -85,21 +89,35 @@ private:
     };
 
     struct CreateRunCommand {
-        std::string task_type;
+        std::string plugin_type;
         std::string dataset_version;
         std::string params;
+    };
+
+    struct StopRunCommand {
+        std::string plugin_type;
     };
 
     bool LoadPlugins();
     void RunProcessing();
     void HandleMessage(const IncomingMessage& msg);
+    void HandleRegister(const IncomingMessage& msg);
+    void HandleRequestTask(const IncomingMessage& msg);
+    void HandleTaskReport(const IncomingMessage& msg);
+    void HandleTaskAck(const IncomingMessage& msg);
     void HandleCreateRun(const CreateRunCommand& command);
-    void HandleResponse(const common::Response& response);
-    bool UpdateClient(const std::string& identity, const common::Heartbeat& heartbeat);
+    void HandleStopRun(const StopRunCommand& command);
+    void ReclaimClientTasks(const std::string& identity);
+    void TouchClient(const std::string& identity, const std::string& plugin_type);
+    bool UpdateClient(const std::string& identity, const std::string& plugin_type,
+                      const common::Heartbeat& heartbeat);
     std::vector<common::ClientInfo> SnapshotClients() const;
     void RunTimeoutChecks();
-    void TriggerDispatch();
-    void SendRunWave(common::TaskPlugin* plugin, const common::TaskAssignment& assignment);
+    void SendRegisterResult(const std::string& identity, const std::string& plugin_type,
+                            const std::string& reply_payload);
+    void SendTask(common::TaskPlugin* plugin, const std::string& identity,
+                  const common::Task& task);
+    void SendNoTask(const std::string& identity, const std::string& plugin_type);
 
     common::Config& config_;
     Server server_;
@@ -122,9 +140,7 @@ private:
     std::unordered_map<common::TaskPlugin*, RunContext> active_runs_;
 
     common::BlockingQueue<CreateRunCommand> commands_;
-    // Completion events signal "dispatch again" here after the plugin's
-    // processResult has run, so dispatch sees up-to-date plugin state.
-    common::BlockingQueue<int> dispatch_triggers_;
+    common::BlockingQueue<StopRunCommand> stop_commands_;
 };
 
 }  // namespace scheduler

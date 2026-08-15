@@ -68,7 +68,8 @@ void PrintHelp() {
     std::printf(
         "commands:\n"
         "  help                                     show this help\n"
-        "  run <task_type> <dataset_version> [params]  start a run\n"
+        "  run <plugin_type> <dataset_version> [params]  start a run\n"
+        "  stop <plugin_type>                          stop the active run\n"
         "  clients                                  list connected clients\n"
         "  status                                   plugins and in-flight tasks\n"
         "  quit                                     stop the scheduler\n");
@@ -80,10 +81,9 @@ void PrintClients(const std::vector<common::ClientInfo>& clients) {
         return;
     }
     for (const common::ClientInfo& c : clients) {
-        std::printf("client %s worker=%s status=%s dataset=%s ready=%d\n", c.identity.c_str(),
-                    c.heartbeat.worker_id().c_str(),
-                    c.heartbeat.status() == common::Heartbeat::BUSY ? "busy" : "idle",
-                    c.heartbeat.dataset_version().c_str(), c.heartbeat.dataset_ready() ? 1 : 0);
+        std::printf("client %s type=%s ip=%s status=%s\n", c.identity.c_str(),
+                    c.plugin_type.c_str(), c.heartbeat.ip().c_str(),
+                    c.heartbeat.status() == common::Heartbeat::BUSY ? "busy" : "idle");
     }
 }
 
@@ -121,16 +121,25 @@ int main(int argc, char* argv[]) {
                             sched.inFlightCount());
             } else if (line.rfind("run ", 0) == 0) {
                 std::istringstream in(line.substr(4));
-                std::string task_type;
+                std::string plugin_type;
                 std::string dataset_version;
-                in >> task_type >> dataset_version;
+                in >> plugin_type >> dataset_version;
                 std::string params;
                 std::getline(in, params);
                 params = TrimLeft(params);
-                if (task_type.empty() || dataset_version.empty()) {
-                    LOG_WARN("usage: run <task_type> <dataset_version> [params]");
+                if (plugin_type.empty() || dataset_version.empty()) {
+                    LOG_WARN("usage: run <plugin_type> <dataset_version> [params]");
                 } else {
-                    sched.createRun(task_type, dataset_version, params);
+                    sched.createRun(plugin_type, dataset_version, params);
+                }
+            } else if (line.rfind("stop ", 0) == 0) {
+                std::istringstream in(line.substr(5));
+                std::string plugin_type;
+                in >> plugin_type;
+                if (plugin_type.empty()) {
+                    LOG_WARN("usage: stop <plugin_type>");
+                } else {
+                    sched.stopRun(plugin_type);
                 }
             } else {
                 LOG_WARN("unknown command: " << line);

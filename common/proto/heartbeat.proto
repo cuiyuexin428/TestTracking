@@ -4,19 +4,17 @@ package common;
 
 import "common.proto";
 
+// Status heartbeat from client to scheduler. Mainly for display: users can
+// see which clients exist and whether the count matches their configuration.
+// plugin_type is carried by the Envelope.
 message Heartbeat {
-  string worker_id = 1;
-  int64 timestamp_ms = 2;
+  string ip = 1;  // client-reported IP
 
   enum Status {
     IDLE = 0;
     BUSY = 1;
   }
 
-  Status status = 3;
-  string program_version = 4;
-  string dataset_version = 5;
-  bool dataset_ready = 6;
-  string current_wave_id = 7;  // empty when idle
-  ResourceUsage resource = 8;
+  Status status = 2;
+  ResourceUsage resource = 3;  // health data (memory etc.)
 }

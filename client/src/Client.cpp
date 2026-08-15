@@ -2,11 +2,21 @@
 
 #include "common/Logger.h"
 
+#include <algorithm>
 #include <chrono>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
+#endif
 
 namespace client {
 
@@ -14,11 +24,14 @@ Client::Client(common::Config& config)
     : config_(config),
       dealer_(config.get("scheduler.endpoint", std::string("tcp://127.0.0.1:5555"))),
       worker_id_(config.get("client.worker_id", std::string("worker-1"))),
-      program_version_(config.get("client.program_version", std::string())),
-      dataset_version_(config.get("client.dataset_version", std::string())),
-      dataset_ready_(config.get("client.dataset_ready", false)),
+      ip_(config.get("client.ip", std::string())),
       heartbeat_interval_(config.get("client.heartbeat_interval_ms", 1000)),
-      poll_timeout_(config.get("scheduler.poll_timeout_ms", 50)) {
+      poll_timeout_(config.get("scheduler.poll_timeout_ms", 50)),
+      request_backoff_initial_(config.get("client.request_backoff_initial_ms", 1000)),
+      request_backoff_max_(config.get("client.request_backoff_max_ms", 30000)),
+      request_timeout_(config.get("client.request_timeout_ms", 5000)),
+      register_timeout_ms_(config.get("client.register_timeout_ms", 0)),
+      register_max_attempts_(config.get("client.register_max_attempts", 5)) {
 }
 
 Client::~Client() {
@@ -29,32 +42,50 @@ void Client::start() {
     if (!LoadPlugins()) {
         throw std::runtime_error("Client: plugin loading failed");
     }
+    if (plugin_ == nullptr) {
+        throw std::runtime_error("Client: no enabled plugin");
+    }
+
     dealer_.setOption(ZMQ_IDENTITY, worker_id_.data(), worker_id_.size());
     const int recv_timeout_ms = static_cast<int>(poll_timeout_.count());
     dealer_.setOption(ZMQ_RCVTIMEO, &recv_timeout_ms, sizeof(recv_timeout_ms));
     dealer_.connect();
+
+    // INIT: no threads yet, synchronously complete registration validation.
+    if (!RegisterWithServer()) {
+        throw std::runtime_error("Client: registration failed");
+    }
+    if (stop_requested_.load()) {
+        return;
+    }
+
+    // INIT passed: start the executor on a single EventManager worker.
+    executor_.start(plugin_, [this](const common::TaskResult& result) { OnTaskCompleted(result); });
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        state_ = ClientState::kReady;
+    }
+
     running_.store(true);
-    poll_thread_ = std::thread(&Client::RunPoll, this);
-    executor_thread_ = std::thread(&Client::RunExecutor, this);
+    RunStateMachine();
 }
 
 void Client::stop() {
+    stop_requested_.store(true);
     if (!running_.exchange(false)) {
         return;
     }
-    if (poll_thread_.joinable()) {
-        poll_thread_.join();
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        state_ = ClientState::kStopped;
     }
-    if (executor_thread_.joinable()) {
-        executor_thread_.join();
-    }
-    plugins_.clear();
+    executor_.stop();
 }
 
 bool Client::LoadPlugins() {
     const nlohmann::json* plugins_node = config_.find("plugins");
     if (plugins_node == nullptr || !plugins_node->is_object()) {
-        LOG_WARN("no plugins configured; heartbeats only");
+        LOG_WARN("no plugins configured");
         return true;
     }
 
@@ -117,41 +148,190 @@ bool Client::LoadPlugins() {
             plugin_ = plugin;
         } else {
             LOG_WARN("client plugin " << name
-                                     << " loaded but only the first plugin executes tasks");
+                                     << " loaded but only the first plugin registers/executes");
         }
         plugins_.push_back(
             {std::move(library),
              std::unique_ptr<common::WorkerPlugin, ClientPluginDeleter>(
                  plugin, ClientPluginDeleter{destroy})});
-        LOG_INFO("client plugin loaded: " << name << " task_type=" << plugin->taskType());
+        LOG_INFO("client plugin loaded: " << name << " plugin_type=" << plugin->pluginType());
     }
     return true;
 }
 
-void Client::RunPoll() {
-    auto last_heartbeat = std::chrono::steady_clock::now();
+bool Client::RegisterWithServer() {
+    for (int attempt = 1; attempt <= register_max_attempts_; ++attempt) {
+        if (!SendRegisterOnce()) {
+            return false;
+        }
+        LOG_INFO("register attempt " << attempt << " sent for plugin_type="
+                                     << plugin_->pluginType());
+
+        common::Envelope reply;
+        if (!WaitForRegisterResult(reply)) {
+            LOG_WARN("register attempt " << attempt << " timed out, retrying");
+            continue;
+        }
+        if (!reply.has_register_result()) {
+            LOG_WARN("register attempt " << attempt << ": unexpected reply, retrying");
+            continue;
+        }
+
+        const common::RegisterResult& result = reply.register_result();
+        try {
+            switch (plugin_->handleValidationReply(result.payload())) {
+                case common::RegisterOutcome::kReady:
+                    LOG_INFO("registered: plugin_type=" << plugin_->pluginType());
+                    return true;
+                case common::RegisterOutcome::kRetry:
+                    LOG_WARN("registration reply handled, re-registering");
+                    continue;
+                case common::RegisterOutcome::kFailed:
+                    LOG_ERROR("registration failed: plugin rejected");
+                    return false;
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR("client plugin " << plugin_->pluginType()
+                                       << ": handleValidationReply threw: " << e.what());
+            return false;
+        }
+    }
+    LOG_ERROR("registration failed after " << register_max_attempts_ << " attempts");
+    return false;
+}
+
+bool Client::SendRegisterOnce() {
+    std::string payload;
+    try {
+        if (!plugin_->collectRegistrationInfo(&payload)) {
+            LOG_ERROR("client plugin " << plugin_->pluginType()
+                                       << ": collectRegistrationInfo failed");
+            return false;
+        }
+    } catch (const std::exception& e) {
+        LOG_ERROR("client plugin " << plugin_->pluginType()
+                                   << ": collectRegistrationInfo threw: " << e.what());
+        return false;
+    }
+
+    common::Envelope env;
+    env.set_type(common::REGISTER);
+    env.set_plugin_type(plugin_->pluginType());
+    common::RegisterCommand* reg = env.mutable_register_();
+    reg->set_payload(payload);
+
+    std::string bytes;
+    if (!env.SerializeToString(&bytes)) {
+        LOG_ERROR("client: failed to serialize REGISTER");
+        return false;
+    }
+    try {
+        dealer_.sendMsg(bytes);
+    } catch (const std::exception& e) {
+        LOG_ERROR("client: send REGISTER failed: " << e.what());
+        return false;
+    }
+    return true;
+}
+
+bool Client::WaitForRegisterResult(common::Envelope& out) {
+    const auto start = std::chrono::steady_clock::now();
+    const bool infinite = register_timeout_ms_ <= 0;
+    const auto deadline = start + std::chrono::milliseconds(register_timeout_ms_);
+
+    while (true) {
+        if (stop_requested_.load(std::memory_order_relaxed)) {
+            LOG_WARN("client: stop requested during registration");
+            return false;
+        }
+        if (dealer_.waitReadable(poll_timeout_)) {
+            try {
+                const std::string payload = dealer_.recvMsg();
+                common::Envelope env;
+                if (!env.ParseFromString(payload)) {
+                    LOG_WARN("client: unparseable message during registration");
+                    continue;
+                }
+                if (env.type() == common::REGISTER_RESULT) {
+                    out = std::move(env);
+                    return true;
+                }
+                LOG_WARN("client: unexpected message type " << env.type()
+                                                            << " during registration");
+                continue;
+            } catch (const std::exception& e) {
+                LOG_ERROR("client: recv failed during registration: " << e.what());
+                return false;
+            }
+        }
+        if (!infinite && std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+    }
+}
+
+void Client::RunStateMachine() {
+    last_heartbeat_ = std::chrono::steady_clock::now();
+    next_request_ = last_heartbeat_;
+    backoff_ = request_backoff_initial_;
+
     while (running_.load(std::memory_order_relaxed)) {
         if (dealer_.waitReadable(poll_timeout_)) {
             try {
                 const std::string payload = dealer_.recvMsg();
                 common::Envelope env;
                 if (env.ParseFromString(payload)) {
-                    HandleMessage(env);
+                    HandleEnvelope(env);
                 } else {
                     LOG_WARN("client: unparseable message");
                 }
             } catch (const std::exception& e) {
-                // A zmq failure means the network layer is broken.
                 LOG_ERROR("client: fatal zmq error: " << e.what());
                 std::terminate();
             }
         }
 
         const auto now = std::chrono::steady_clock::now();
-        if (now - last_heartbeat >= heartbeat_interval_) {
-            last_heartbeat = now;
+        if (now - last_heartbeat_ >= heartbeat_interval_) {
+            last_heartbeat_ = now;
             SendHeartbeat();
         }
+
+        ClientState state;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            state = state_;
+        }
+
+        if (state == ClientState::kTaskCompleted) {
+            common::TaskResult result;
+            if (completed_results_.pop(result, std::chrono::milliseconds(0))) {
+                SendTaskReport(result);
+                backoff_ = request_backoff_initial_;
+            }
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                if (completed_results_.empty() && state_ == ClientState::kTaskCompleted) {
+                    state_ = ClientState::kReady;
+                }
+            }
+            next_request_ = now;
+        } else if (state == ClientState::kReady) {
+            if (now >= next_request_) {
+                SendRequestTask();
+                request_sent_at_ = now;
+                {
+                    std::lock_guard<std::mutex> lock(state_mutex_);
+                    state_ = ClientState::kRequesting;
+                }
+            }
+        } else if (state == ClientState::kRequesting) {
+            if (now - request_sent_at_ >= request_timeout_) {
+                SendRequestTask();
+                request_sent_at_ = now;
+            }
+        }
+        // kExecuting: wait for the executor's completion callback.
 
         common::Envelope out;
         while (outgoing_.pop(out, std::chrono::milliseconds(0))) {
@@ -165,60 +345,72 @@ void Client::RunPoll() {
     }
 }
 
-void Client::RunExecutor() {
-    while (running_.load(std::memory_order_relaxed)) {
-        common::TaskSpec task;
-        if (!tasks_.pop(task, std::chrono::milliseconds(100))) {
-            continue;
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            busy_ = true;
-            current_task_id_ = task.task_id();
-        }
-
-        common::TaskResult result;
-        result.set_task_id(task.task_id());
-        bool ok = false;
-        if (plugin_ == nullptr) {
-            LOG_ERROR("client: no plugin to execute task " << task.task_id());
-        } else {
-            try {
-                ok = plugin_->execute(task, result);
-            } catch (const std::exception& e) {
-                LOG_ERROR("client plugin " << plugin_->taskType() << ": execute threw: " << e.what());
-            } catch (...) {
-                LOG_ERROR("client plugin " << plugin_->taskType()
-                                          << ": execute threw unknown exception");
+void Client::HandleEnvelope(const common::Envelope& env) {
+    switch (env.type()) {
+        case common::TASK:
+            if (env.has_task()) {
+                HandleTask(env.task(), env.plugin_type());
+                backoff_ = request_backoff_initial_;
             }
-        }
-        if (!ok) {
-            result.set_exit_code(-1);
-        }
-
-        {
+            break;
+        case common::NO_TASK: {
             std::lock_guard<std::mutex> lock(state_mutex_);
-            busy_ = false;
-            current_task_id_.clear();
+            if (state_ == ClientState::kRequesting) {
+                backoff_ = std::min(backoff_ * 2, request_backoff_max_);
+                next_request_ = std::chrono::steady_clock::now() + backoff_;
+                state_ = ClientState::kReady;
+                LOG_INFO("client: no task, next request in " << backoff_.count() << " ms");
+            }
+            break;
         }
-        SendResponse(result);
+        case common::STOP:
+            HandleStop();
+            break;
+        case common::WAKE:
+            backoff_ = request_backoff_initial_;
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                if (state_ == ClientState::kReady) {
+                    next_request_ = std::chrono::steady_clock::now();
+                }
+            }
+            LOG_INFO("client: wake");
+            break;
+        default:
+            HandleMessage(env);
+            break;
+    }
+}
+
+void Client::HandleStop() {
+    LOG_WARN("client: STOP received, stopping executor");
+    // Drops queued tasks; the server reclaims them from its in_flight table.
+    executor_.stop();
+    // Drop results of the stopped run so they are not reported later.
+    completed_results_.clear();
+    // Restart a fresh executor so tasks of a new run can be executed.
+    executor_.start(plugin_,
+                    [this](const common::TaskResult& result) { OnTaskCompleted(result); });
+    backoff_ = request_backoff_initial_;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        state_ = ClientState::kReady;
+        next_request_ = std::chrono::steady_clock::now();
     }
 }
 
 void Client::HandleMessage(const common::Envelope& env) {
     switch (env.type()) {
-        case common::RUN_WAVE:
-            if (env.has_run_wave()) {
-                HandleRunWave(env.run_wave());
-            }
-            break;
-        case common::STOP:
-            LOG_WARN("client: STOP received, cancellation not implemented yet");
-            break;
-        case common::ACK:
-        case common::RESPONSE:
+        case common::REGISTER_RESULT:
         case common::HEARTBEAT:
+        case common::REQUEST_TASK:
+        case common::TASK_REPORT:
+        case common::REGISTER:
+        case common::TASK:
+        case common::NO_TASK:
+        case common::WAKE:
+        case common::STOP:
+        case common::TASK_ACK:
             LOG_WARN("client: unexpected message type " << env.type());
             break;
         default:
@@ -227,45 +419,93 @@ void Client::HandleMessage(const common::Envelope& env) {
     }
 }
 
-void Client::HandleRunWave(const common::RunWaveCommand& command) {
-    LOG_INFO("client: run " << command.run_id() << " wave " << command.wave_id() << " tasks="
-                            << command.tasks_size());
-    for (const common::TaskSpec& task : command.tasks()) {
-        tasks_.push(task);
+void Client::OnTaskCompleted(const common::TaskResult& result) {
+    completed_results_.push(result);
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    state_ = ClientState::kTaskCompleted;
+}
+
+void Client::HandleTask(const common::TaskCommand& command, const std::string& plugin_type) {
+    LOG_INFO("client: task " << command.task().task_id() << " plugin_type=" << plugin_type
+                             << " run=" << command.run_id());
+    if (plugin_ != nullptr && plugin_type != plugin_->pluginType()) {
+        LOG_WARN("client: plugin_type mismatch, ignoring task " << command.task().task_id());
+        return;
+    }
+    // Task receipt: confirm delivery before execution.
+    common::Envelope ack;
+    ack.set_type(common::TASK_ACK);
+    ack.set_plugin_type(plugin_type);
+    ack.mutable_task_ack()->set_task_id(command.task().task_id());
+    outgoing_.push(std::move(ack));
+
+    executor_.push(command.task());
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (state_ == ClientState::kReady || state_ == ClientState::kRequesting) {
+        state_ = ClientState::kExecuting;
     }
 }
 
 void Client::SendHeartbeat() {
     common::Envelope env;
     env.set_type(common::HEARTBEAT);
+    env.set_plugin_type(plugin_ != nullptr ? plugin_->pluginType() : std::string());
     common::Heartbeat* heartbeat = env.mutable_heartbeat();
-    heartbeat->set_worker_id(worker_id_);
-    heartbeat->set_timestamp_ms(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch())
-            .count());
+    heartbeat->set_ip(ip_);
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        heartbeat->set_status(busy_ ? common::Heartbeat::BUSY : common::Heartbeat::IDLE);
+        heartbeat->set_status(state_ == ClientState::kExecuting ? common::Heartbeat::BUSY
+                                                                : common::Heartbeat::IDLE);
     }
-    heartbeat->set_program_version(program_version_);
-    heartbeat->set_dataset_version(dataset_version_);
-    heartbeat->set_dataset_ready(dataset_ready_);
+    common::ResourceUsage* resource = heartbeat->mutable_resource();
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS pmc{};
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        resource->set_memory_bytes(static_cast<std::int64_t>(pmc.WorkingSetSize));
+    }
+    ULARGE_INTEGER free_bytes{};
+    if (GetDiskFreeSpaceExA(nullptr, &free_bytes, nullptr, nullptr)) {
+        resource->set_disk_free_bytes(static_cast<std::int64_t>(free_bytes.QuadPart));
+    }
+#else
+    (void)resource;
+#endif
 
     std::string bytes;
     if (env.SerializeToString(&bytes)) {
-        dealer_.sendMsg(bytes);
+        try {
+            dealer_.sendMsg(bytes);
+        } catch (const std::exception& e) {
+            LOG_ERROR("client: send heartbeat failed: " << e.what());
+        }
     }
 }
 
-void Client::SendResponse(const common::TaskResult& result) {
+void Client::SendRequestTask() {
+    if (plugin_ == nullptr) {
+        return;
+    }
     common::Envelope env;
-    env.set_type(common::RESPONSE);
-    env.set_request_id(result.task_id());
-    common::Response* response = env.mutable_response();
-    response->set_request_id(result.task_id());
-    response->set_status(common::OK);
-    *response->mutable_run_wave()->add_tasks() = result;
+    env.set_type(common::REQUEST_TASK);
+    env.set_plugin_type(plugin_->pluginType());
+    common::RequestTaskCommand* request = env.mutable_request_task();
+
+    std::string bytes;
+    if (env.SerializeToString(&bytes)) {
+        try {
+            dealer_.sendMsg(bytes);
+        } catch (const std::exception& e) {
+            LOG_ERROR("client: send request_task failed: " << e.what());
+        }
+    }
+}
+
+void Client::SendTaskReport(const common::TaskResult& result) {
+    common::Envelope env;
+    env.set_type(common::TASK_REPORT);
+    env.set_plugin_type(plugin_ != nullptr ? plugin_->pluginType() : std::string());
+    common::TaskReport* report = env.mutable_task_report();
+    *report->mutable_result() = result;
     outgoing_.push(std::move(env));
 }
 

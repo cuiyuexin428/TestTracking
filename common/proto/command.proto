@@ -2,48 +2,66 @@ syntax = "proto3";
 
 package common;
 
-// Stop a run. Broadcast; clients stop accepting new tasks and finish or
-// abort the current task within the grace timeout.
+import "common.proto";
+
+// Client registration/validation request. payload is the opaque business
+// validation message; the framework routes it to the server plugin selected
+// by Envelope.plugin_type and passes it through untouched. The client
+// identity is the ZMQ identity frame; its IP is carried by Heartbeat.
+message RegisterCommand {
+  bytes payload = 1;
+}
+
+// Registration validation result. payload is the opaque business reply
+// (plugin-defined, e.g. deployment instructions); the framework does not
+// know its structure and the client plugin parses it.
+message RegisterResult {
+  bytes payload = 1;
+}
+
+// Client task request. payload is optional opaque business request data
+// passed through to the server plugin.
+message RequestTaskCommand {
+  bytes payload = 1;
+}
+
+// Single-task dispatch: the framework sends exactly one task at a time.
+message TaskCommand {
+  string run_id = 1;
+  Task task = 2;
+}
+
+// No task available. Empty message; fields reserved for later use.
+message NoTaskCommand {}
+
+// Task receipt (client -> scheduler): the client confirms it received the
+// dispatched task. Used with the in-flight lease to reclaim tasks when a
+// client disconnects or a task gets stuck.
+message TaskAck {
+  string task_id = 1;
+}
+
+// Wake a sleeping client (reserved).
+message WakeCommand {}
+
+// Stop execution (server -> client). The server reclaims this client's
+// in-flight tasks from its in_flight table; the client drops queued tasks.
 message StopCommand {
   string run_id = 1;
   string reason = 2;
-  int32 grace_timeout_ms = 3;
 }
 
-// Incrementally sync the dataset from the shared directory. (Long command.)
-message SyncDatasetCommand {
-  string dataset_version = 1;
-  string shared_dir = 2;
-  string manifest = 3;  // manifest path or content, TBD
+// Task execution report. result.payload is the opaque business result.
+message TaskReport {
+  TaskResult result = 1;
 }
 
-// Verify the local dataset mirror.
-message VerifyDatasetCommand {
-  string dataset_version = 1;
-
-  enum Mode {
-    FAST = 0;  // compare metadata only
-    FULL = 1;  // content hash
-  }
-
-  Mode mode = 2;
-}
-
-// Query client status. Empty items means all.
-message QueryStatusCommand {
-  repeated string items = 1;
-}
-
-// Update the deployed test program. Broadcast. (Deferred feature; reserved.)
-message UpdateProgramCommand {
-  string program_version = 1;
-  string package_location = 2;
-  string checksum = 3;
-}
-
-// Immediate acknowledgement that a command was received and accepted.
-message Ack {
-  string request_id = 1;
-  bool accepted = 2;
-  string message = 3;
+// Framework-level task result; the business result is serialized into
+// result and parsed by the plugin selected by plugin_type.
+message TaskResult {
+  string task_id = 1;
+  int32 exit_code = 2;
+  int64 duration_ms = 3;
+  string artifact_path = 4;
+  bytes result = 5;
 }

@@ -36,9 +36,11 @@ private:
 // action finishes, then returns the aggregated result to the framework.
 class ClientPlugin : public common::WorkerPlugin {
 public:
-    std::string taskType() const override;
+    std::string pluginType() const override;
     bool init(const std::string& config) override;
-    bool execute(const common::TaskSpec& task, common::TaskResult& result) override;
+    bool collectRegistrationInfo(std::string* payload) override;
+    common::RegisterOutcome handleValidationReply(const std::string& reply_payload) override;
+    bool execute(const common::Task& task, common::TaskResult& result) override;
 
 private:
     void RunFileAction(const coverage::CoverageTask& cov_task, const std::string& file);
@@ -50,11 +52,17 @@ private:
     int task_threads_ = 0;
     bool dry_run_ = true;
     std::string stp_root_;
+    std::string program_dir_;  // local deployment dir for the test program
     std::string opencppcoverage_;
     std::string target_exe_;
     std::string export_dir_;
     bool keep_reports_ = false;  // validation only: keep cobertura XMLs
     std::vector<std::string> occt_dlls_;
+
+    // Local deployment state (registration business message content).
+    std::string program_version_;
+    std::string dataset_version_;
+    bool deployed_ = false;
 
     // Shared per-task state, protected for concurrent file actions.
     std::mutex mutex_;

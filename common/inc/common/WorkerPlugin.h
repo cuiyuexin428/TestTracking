@@ -6,23 +6,37 @@
 
 namespace common {
 
-// Abstract base class for client-side task executors. One DLL per task type,
-// loaded by the client framework. The framework only depends on this
-// interface; concrete executors are separate DLLs.
+// Result of processing a registration validation reply. The reply is an
+// opaque business message; the plugin decides what to do next.
+enum class RegisterOutcome {
+    kReady,   // validation passed, enter READY
+    kRetry,   // reply handled (e.g. deployed), re-send REGISTER
+    kFailed,  // cannot be satisfied, give up
+};
+
+// Client plugin base class. plugin_type anchors the client plugin and the
+// server plugin: the client framework routes tasks to the matching plugin.
 class WorkerPlugin {
 public:
     virtual ~WorkerPlugin() = default;
 
-    // Unique task type key, e.g. "stp"; must match RunWaveCommand.task_type.
-    virtual std::string taskType() const = 0;
+    // Unique plugin type key, matching the server plugin.
+    virtual std::string pluginType() const = 0;
 
-    // Called once after loading; config is this plugin's JSON section text.
+    // Load config and check the local deployment.
     virtual bool init(const std::string& config) = 0;
 
-    // Execute one task. The plugin parses task.payload() (its own business
-    // proto), runs the test program, and fills result fields (exit_code,
-    // duration_ms, artifact_path, result bytes).
-    virtual bool execute(const TaskSpec& task, TaskResult& result) = 0;
+    // Initialization phase: check the local deployment and produce the
+    // opaque registration business message.
+    virtual bool collectRegistrationInfo(std::string* payload) = 0;
+
+    // Handle the server plugin reply (e.g. deployment instructions). The
+    // reply is opaque; the plugin decides whether the client is ready,
+    // needs to re-register, or cannot be satisfied.
+    virtual RegisterOutcome handleValidationReply(const std::string& reply_payload) = 0;
+
+    // Execute one task and fill the execution report.
+    virtual bool execute(const Task& task, TaskResult& result) = 0;
 };
 
 // DLL entry points (extern "C", exported):

@@ -50,8 +50,28 @@ public:
         cv_.notify_all();
     }
 
+    // Number of queued items. Safe to call from any thread.
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.size();
+    }
+
+    // Whether the queue is empty. Safe to call from any thread.
+    bool empty() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.empty();
+    }
+
+    // Drops all queued items. Safe to call from any thread.
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        while (!queue_.empty()) {
+            queue_.pop();
+        }
+    }
+
 private:
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::queue<T> queue_;
 };
