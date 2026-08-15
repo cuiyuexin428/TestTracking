@@ -1,6 +1,6 @@
 #pragma once
 
-#include "common/Plugin.h"
+#include "common/TaskPlugin.h"
 #include "coverage/CoverageStore.h"
 
 #include <cstdint>
@@ -17,7 +17,7 @@ namespace coverage_plugin {
 // Scheduler-side coverage plugin: batches the stp file set into tasks,
 // gates dispatch to the current wave, and settles each wave with a line-level
 // greedy selection over the collected coverage point sets.
-class SchedulerPlugin : public common::Plugin {
+class SchedulerPlugin : public common::TaskPlugin {
 public:
     std::string taskType() const override;
     bool init(const std::string& config) override;

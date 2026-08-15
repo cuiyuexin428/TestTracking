@@ -1,7 +1,7 @@
 #pragma once
 
 #include "common/BlockingQueue.h"
-#include "common/ClientPlugin.h"
+#include "common/WorkerPlugin.h"
 #include "common/Config.h"
 #include "common/DynamicLibrary.h"
 #include "common/zmq_helper.h"
@@ -22,7 +22,7 @@ namespace client {
 struct ClientPluginDeleter {
     common::DestroyClientPluginFn destroy = nullptr;
 
-    void operator()(common::ClientPlugin* plugin) const {
+    void operator()(common::WorkerPlugin* plugin) const {
         if (plugin != nullptr && destroy != nullptr) {
             destroy(plugin);
         }
@@ -32,7 +32,7 @@ struct ClientPluginDeleter {
 // Client framework: one DEALER socket owned by a poll thread (receives
 // commands, sends heartbeats/results), one executor thread that runs tasks
 // through the configured client plugin. Framework code depends only on the
-// abstract common::ClientPlugin interface.
+// abstract common::WorkerPlugin interface.
 class Client {
 public:
     explicit Client(common::Config& config);
@@ -49,7 +49,7 @@ private:
         std::unique_ptr<common::DynamicLibrary> library;
         // Declaration order matters: the plugin instance must be destroyed
         // before the library is unloaded (virtual calls go into the DLL).
-        std::unique_ptr<common::ClientPlugin, ClientPluginDeleter> instance;
+        std::unique_ptr<common::WorkerPlugin, ClientPluginDeleter> instance;
     };
 
     bool LoadPlugins();
@@ -63,7 +63,7 @@ private:
     common::Config& config_;
     common::ZmqDealer dealer_;
     std::vector<LoadedPlugin> plugins_;
-    common::ClientPlugin* plugin_ = nullptr;
+    common::WorkerPlugin* plugin_ = nullptr;
 
     std::atomic<bool> running_{false};
     std::thread poll_thread_;

@@ -17,7 +17,7 @@ namespace {
 
 class ProcessResultEvent : public common::Event {
 public:
-    ProcessResultEvent(common::Plugin* plugin, common::TaskResult result,
+    ProcessResultEvent(common::TaskPlugin* plugin, common::TaskResult result,
                        std::function<void()> on_done)
         : plugin_(plugin), result_(std::move(result)), on_done_(std::move(on_done)) {
     }
@@ -43,7 +43,7 @@ public:
     }
 
 private:
-    common::Plugin* plugin_;
+    common::TaskPlugin* plugin_;
     common::TaskResult result_;
     std::function<void()> on_done_;
 };
@@ -145,7 +145,7 @@ bool Scheduler::LoadPlugins() {
             return false;
         }
 
-        common::Plugin* plugin = nullptr;
+        common::TaskPlugin* plugin = nullptr;
         try {
             plugin = create();
         } catch (const std::exception& e) {
@@ -180,7 +180,7 @@ bool Scheduler::LoadPlugins() {
         plugins_by_type_[plugin->taskType()] = plugin;
         plugins_.push_back(
             {std::move(library),
-             std::unique_ptr<common::Plugin, PluginDeleter>(plugin, PluginDeleter{destroy})});
+             std::unique_ptr<common::TaskPlugin, PluginDeleter>(plugin, PluginDeleter{destroy})});
         LOG_INFO("plugin loaded: " << name << " task_type=" << plugin->taskType());
     }
     return true;
@@ -246,7 +246,7 @@ void Scheduler::HandleCreateRun(const CreateRunCommand& command) {
     request.dataset_version = command.dataset_version;
     request.params = command.params;
 
-    common::Plugin* plugin = it->second;
+    common::TaskPlugin* plugin = it->second;
     try {
         if (!plugin->plan(request, SnapshotClients())) {
             LOG_ERROR("createRun: plan failed for " << command.task_type);
@@ -412,7 +412,7 @@ void Scheduler::TriggerDispatch() {
     }
 }
 
-void Scheduler::SendRunWave(common::Plugin* plugin, const common::TaskAssignment& assignment) {
+void Scheduler::SendRunWave(common::TaskPlugin* plugin, const common::TaskAssignment& assignment) {
     const auto it = active_runs_.find(plugin);
     if (it == active_runs_.end()) {
         LOG_ERROR("no active run for plugin " << plugin->taskType());

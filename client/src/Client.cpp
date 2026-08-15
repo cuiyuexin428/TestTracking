@@ -81,7 +81,7 @@ bool Client::LoadPlugins() {
             return false;
         }
 
-        common::ClientPlugin* plugin = nullptr;
+        common::WorkerPlugin* plugin = nullptr;
         try {
             plugin = create();
         } catch (const std::exception& e) {
@@ -121,7 +121,7 @@ bool Client::LoadPlugins() {
         }
         plugins_.push_back(
             {std::move(library),
-             std::unique_ptr<common::ClientPlugin, ClientPluginDeleter>(
+             std::unique_ptr<common::WorkerPlugin, ClientPluginDeleter>(
                  plugin, ClientPluginDeleter{destroy})});
         LOG_INFO("client plugin loaded: " << name << " task_type=" << plugin->taskType());
     }

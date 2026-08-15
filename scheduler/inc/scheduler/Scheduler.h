@@ -4,7 +4,7 @@
 #include "common/Config.h"
 #include "common/DynamicLibrary.h"
 #include "common/EventManager.h"
-#include "common/Plugin.h"
+#include "common/TaskPlugin.h"
 #include "communication.pb.h"
 #include "scheduler/Server.h"
 
@@ -24,7 +24,7 @@ namespace scheduler {
 struct PluginDeleter {
     common::DestroyPluginFn destroy = nullptr;
 
-    void operator()(common::Plugin* plugin) const {
+    void operator()(common::TaskPlugin* plugin) const {
         if (plugin != nullptr && destroy != nullptr) {
             destroy(plugin);
         }
@@ -36,7 +36,7 @@ struct PluginDeleter {
 // commands, and performs timeout checks. All plugin calls (plan/dispatch/
 // requeue/processResult) happen on that single thread, so plugins never need
 // internal locking. Framework code depends only on the abstract
-// common::Plugin interface; concrete plugins are separate DLLs.
+// common::TaskPlugin interface; concrete plugins are separate DLLs.
 class Scheduler {
 public:
     explicit Scheduler(common::Config& config);
@@ -81,7 +81,7 @@ private:
         std::unique_ptr<common::DynamicLibrary> library;
         // Declaration order matters: the plugin instance must be destroyed
         // before the library is unloaded (virtual calls go into the DLL).
-        std::unique_ptr<common::Plugin, PluginDeleter> instance;
+        std::unique_ptr<common::TaskPlugin, PluginDeleter> instance;
     };
 
     struct CreateRunCommand {
@@ -99,12 +99,12 @@ private:
     std::vector<common::ClientInfo> SnapshotClients() const;
     void RunTimeoutChecks();
     void TriggerDispatch();
-    void SendRunWave(common::Plugin* plugin, const common::TaskAssignment& assignment);
+    void SendRunWave(common::TaskPlugin* plugin, const common::TaskAssignment& assignment);
 
     common::Config& config_;
     Server server_;
     std::vector<LoadedPlugin> plugins_;
-    std::unordered_map<std::string, common::Plugin*> plugins_by_type_;
+    std::unordered_map<std::string, common::TaskPlugin*> plugins_by_type_;
 
     std::atomic<bool> running_{false};
     std::thread processing_;
@@ -119,7 +119,7 @@ private:
     std::unordered_map<std::string, InFlight> in_flight_;
 
     // Touched only by the processing thread.
-    std::unordered_map<common::Plugin*, RunContext> active_runs_;
+    std::unordered_map<common::TaskPlugin*, RunContext> active_runs_;
 
     common::BlockingQueue<CreateRunCommand> commands_;
     // Completion events signal "dispatch again" here after the plugin's

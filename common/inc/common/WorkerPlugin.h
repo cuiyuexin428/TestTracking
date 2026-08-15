@@ -9,9 +9,9 @@ namespace common {
 // Abstract base class for client-side task executors. One DLL per task type,
 // loaded by the client framework. The framework only depends on this
 // interface; concrete executors are separate DLLs.
-class ClientPlugin {
+class WorkerPlugin {
 public:
-    virtual ~ClientPlugin() = default;
+    virtual ~WorkerPlugin() = default;
 
     // Unique task type key, e.g. "stp"; must match RunWaveCommand.task_type.
     virtual std::string taskType() const = 0;
@@ -26,9 +26,9 @@ public:
 };
 
 // DLL entry points (extern "C", exported):
-//   __declspec(dllexport) common::ClientPlugin* CreateClientPlugin();
-//   __declspec(dllexport) void DestroyClientPlugin(common::ClientPlugin* plugin);
-using CreateClientPluginFn = ClientPlugin* (*)();
-using DestroyClientPluginFn = void (*)(ClientPlugin*);
+//   __declspec(dllexport) common::WorkerPlugin* CreateClientPlugin();
+//   __declspec(dllexport) void DestroyClientPlugin(common::WorkerPlugin* plugin);
+using CreateClientPluginFn = WorkerPlugin* (*)();
+using DestroyClientPluginFn = void (*)(WorkerPlugin*);
 
 }  // namespace common

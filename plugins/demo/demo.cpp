@@ -1,8 +1,8 @@
 // Minimal concrete plugin used to exercise the framework end to end:
 // scheduler side plans/dispatches tasks, client side executes them.
-#include "common/ClientPlugin.h"
 #include "common/Logger.h"
-#include "common/Plugin.h"
+#include "common/TaskPlugin.h"
+#include "common/WorkerPlugin.h"
 
 #include "demo.pb.h"
 
@@ -22,7 +22,7 @@
 
 namespace {
 
-class DemoPlugin : public common::Plugin {
+class DemoPlugin : public common::TaskPlugin {
 public:
     std::string taskType() const override {
         return "demo";
@@ -135,7 +135,7 @@ private:
     int total_ = 0;
 };
 
-class DemoClientPlugin : public common::ClientPlugin {
+class DemoClientPlugin : public common::WorkerPlugin {
 public:
     std::string taskType() const override {
         return "demo";
@@ -174,18 +174,18 @@ public:
 
 }  // namespace
 
-extern "C" DEMO_EXPORT common::Plugin* CreatePlugin() {
+extern "C" DEMO_EXPORT common::TaskPlugin* CreatePlugin() {
     return new DemoPlugin;
 }
 
-extern "C" DEMO_EXPORT void DestroyPlugin(common::Plugin* plugin) {
+extern "C" DEMO_EXPORT void DestroyPlugin(common::TaskPlugin* plugin) {
     delete plugin;
 }
 
-extern "C" DEMO_EXPORT common::ClientPlugin* CreateClientPlugin() {
+extern "C" DEMO_EXPORT common::WorkerPlugin* CreateClientPlugin() {
     return new DemoClientPlugin;
 }
 
-extern "C" DEMO_EXPORT void DestroyClientPlugin(common::ClientPlugin* plugin) {
+extern "C" DEMO_EXPORT void DestroyClientPlugin(common::WorkerPlugin* plugin) {
     delete plugin;
 }

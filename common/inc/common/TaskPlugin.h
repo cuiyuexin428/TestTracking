@@ -32,9 +32,9 @@ struct TaskAssignment {
 // task pool and decides which client gets which task; the framework triggers
 // dispatch, transports assignments, tracks in-flight tasks, and hands back
 // tasks of offline clients via requeue().
-class Plugin {
+class TaskPlugin {
 public:
-    virtual ~Plugin() = default;
+    virtual ~TaskPlugin() = default;
 
     // Unique task type key, e.g. "stp"; must match RunWaveCommand.task_type.
     virtual std::string taskType() const = 0;
@@ -62,9 +62,9 @@ public:
 };
 
 // DLL entry points (extern "C", exported):
-//   __declspec(dllexport) common::Plugin* CreatePlugin();
-//   __declspec(dllexport) void DestroyPlugin(common::Plugin* plugin);
-using CreatePluginFn = Plugin* (*)();
-using DestroyPluginFn = void (*)(Plugin*);
+//   __declspec(dllexport) common::TaskPlugin* CreatePlugin();
+//   __declspec(dllexport) void DestroyPlugin(common::TaskPlugin* plugin);
+using CreatePluginFn = TaskPlugin* (*)();
+using DestroyPluginFn = void (*)(TaskPlugin*);
 
 }  // namespace common

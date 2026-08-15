@@ -7,18 +7,18 @@
 #define COVERAGE_EXPORT __attribute__((visibility("default")))
 #endif
 
-extern "C" COVERAGE_EXPORT common::Plugin* CreatePlugin() {
+extern "C" COVERAGE_EXPORT common::TaskPlugin* CreatePlugin() {
     return new coverage_plugin::SchedulerPlugin;
 }
 
-extern "C" COVERAGE_EXPORT void DestroyPlugin(common::Plugin* plugin) {
+extern "C" COVERAGE_EXPORT void DestroyPlugin(common::TaskPlugin* plugin) {
     delete plugin;
 }
 
-extern "C" COVERAGE_EXPORT common::ClientPlugin* CreateClientPlugin() {
+extern "C" COVERAGE_EXPORT common::WorkerPlugin* CreateClientPlugin() {
     return new coverage_plugin::ClientPlugin;
 }
 
-extern "C" COVERAGE_EXPORT void DestroyClientPlugin(common::ClientPlugin* plugin) {
+extern "C" COVERAGE_EXPORT void DestroyClientPlugin(common::WorkerPlugin* plugin) {
     delete plugin;
 }

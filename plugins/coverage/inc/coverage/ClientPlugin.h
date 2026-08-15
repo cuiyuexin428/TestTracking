@@ -1,6 +1,6 @@
 #pragma once
 
-#include "common/ClientPlugin.h"
+#include "common/WorkerPlugin.h"
 #include "common/Event.h"
 #include "common/EventManager.h"
 #include "coverage/CoverageStore.h"
@@ -34,7 +34,7 @@ private:
 // is entirely plugin-owned: it uses its own EventManager pool (task_threads
 // from config; 0 means serial execution). execute() blocks until every file
 // action finishes, then returns the aggregated result to the framework.
-class ClientPlugin : public common::ClientPlugin {
+class ClientPlugin : public common::WorkerPlugin {
 public:
     std::string taskType() const override;
     bool init(const std::string& config) override;

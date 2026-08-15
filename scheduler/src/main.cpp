@@ -1,6 +1,6 @@
 #include "common/Config.h"
 #include "common/Logger.h"
-#include "common/Plugin.h"
+#include "common/TaskPlugin.h"
 #include "scheduler/Scheduler.h"
 
 #include <cstdio>
