@@ -37,6 +37,7 @@ public:
                   const std::string& client_identity, const std::string& payload);
     void AckTask(const std::string& task_id);
     void ReportTask(const std::string& task_id, const common::TaskResult& result);
+    void ReclaimTasks(const std::vector<std::string>& task_ids);
 
 private:
     struct PgParam {

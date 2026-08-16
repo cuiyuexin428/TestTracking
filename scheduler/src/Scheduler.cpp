@@ -538,16 +538,21 @@ void Scheduler::HandleStopRun(const StopRunCommand& command) {
 
 void Scheduler::ReclaimClientTasks(const std::string& identity) {
     std::unordered_map<std::string, std::vector<std::string>> by_type;
+    std::vector<std::string> all_ids;
     {
         std::lock_guard<std::mutex> lock(in_flight_mutex_);
         for (auto it = in_flight_.begin(); it != in_flight_.end();) {
             if (it->second.identity == identity) {
                 by_type[it->second.plugin_type].push_back(it->first);
+                all_ids.push_back(it->first);
                 it = in_flight_.erase(it);
             } else {
                 ++it;
             }
         }
+    }
+    if (storage_.enabled()) {
+        storage_.ReclaimTasks(all_ids);
     }
     for (const auto& item : by_type) {
         const auto pit = plugins_by_type_.find(item.first);
@@ -660,6 +665,7 @@ void Scheduler::RunTimeoutChecks() {
 
     if (lease_timeout_ms > 0) {
         std::unordered_map<std::string, std::vector<std::string>> by_type;
+        std::vector<std::string> lease_ids;
         {
             std::lock_guard<std::mutex> lock(in_flight_mutex_);
             for (auto it = in_flight_.begin(); it != in_flight_.end();) {
@@ -668,11 +674,15 @@ void Scheduler::RunTimeoutChecks() {
                                              << (it->second.acked ? " (acked)"
                                                                   : " (not acked)"));
                     by_type[it->second.plugin_type].push_back(it->first);
+                    lease_ids.push_back(it->first);
                     it = in_flight_.erase(it);
                 } else {
                     ++it;
                 }
             }
+        }
+        if (storage_.enabled()) {
+            storage_.ReclaimTasks(lease_ids);
         }
         for (const auto& item : by_type) {
             const auto pit = plugins_by_type_.find(item.first);

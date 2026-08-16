@@ -278,7 +278,7 @@ public:
 框架表：
 
 - `runs(run_id PK, plugin_type, dataset_version, params, status, created_at, finished_at)`
-- `tasks(task_id PK, run_id, client_identity, status, sent_at, acked_at, reported_at, exit_code, duration_ms, artifact_path, result BYTEA, payload BYTEA)`——payload 为任务内容，为后续重启恢复任务池预留
+- `tasks(task_id PK, run_id, client_identity, status, sent_at, acked_at, reported_at, exit_code, duration_ms, artifact_path, result BYTEA, payload BYTEA)`——payload 为任务内容，为后续重启恢复任务池预留；`status` 状态流转：`dispatched → acked → reported`，被回收（掉线/租约超时/STOP）时标记 `reclaimed`
 
 业务表（coverage 插件）：
 

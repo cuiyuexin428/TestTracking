@@ -129,8 +129,32 @@ void Storage::ReportTask(const std::string& task_id, const common::TaskResult& r
          {{task_id, false},
           {std::to_string(result.exit_code()), false},
           {std::to_string(result.duration_ms()), false},
-          {result.artifact_path(), false},
-          {result_bytes, true}});
+         {result.artifact_path(), false},
+         {result_bytes, true}});
+}
+
+void Storage::ReclaimTasks(const std::vector<std::string>& task_ids) {
+    if (task_ids.empty()) {
+        return;
+    }
+    // Build a PostgreSQL array literal with minimal escaping.
+    std::string array_literal = "{";
+    for (size_t i = 0; i < task_ids.size(); ++i) {
+        if (i > 0) {
+            array_literal += ",";
+        }
+        std::string escaped;
+        for (char c : task_ids[i]) {
+            if (c == '\\' || c == '"') {
+                escaped += '\\';
+            }
+            escaped += c;
+        }
+        array_literal += "\"" + escaped + "\"";
+    }
+    array_literal += "}";
+    Exec("UPDATE tasks SET status='reclaimed' WHERE task_id = ANY($1::text[])",
+         {{array_literal, false}});
 }
 
 }  // namespace scheduler
