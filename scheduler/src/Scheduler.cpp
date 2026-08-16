@@ -286,6 +286,10 @@ void Scheduler::HandleRegister(const IncomingMessage& msg) {
     }
 
     TouchClient(msg.identity, plugin_type);
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex_);
+        clients_[msg.identity].registered = result.accepted;
+    }
     SendRegisterResult(msg.identity, plugin_type, result.reply_payload);
     LOG_INFO("register: client " << msg.identity << " plugin_type=" << plugin_type
                                  << (result.accepted ? " accepted" : " rejected"));
@@ -303,6 +307,18 @@ void Scheduler::HandleRequestTask(const IncomingMessage& msg) {
     }
 
     TouchClient(msg.identity, plugin_type);
+
+    // Only registered clients may pull tasks.
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex_);
+        const auto cit = clients_.find(msg.identity);
+        if (cit == clients_.end() || !cit->second.registered) {
+            LOG_WARN("request_task: unregistered client " << msg.identity
+                                                          << ", no task granted");
+            SendNoTask(msg.identity, plugin_type);
+            return;
+        }
+    }
 
     // One task in flight per client: never grant a second task.
     bool has_inflight = false;
@@ -366,10 +382,17 @@ void Scheduler::HandleTaskReport(const IncomingMessage& msg) {
         std::lock_guard<std::mutex> lock(in_flight_mutex_);
         const auto it = in_flight_.find(report.result().task_id());
         if (it == in_flight_.end()) {
-            LOG_WARN("completion for unknown task " << report.result().task_id());
-        } else {
-            in_flight_.erase(it);
+            LOG_WARN("completion for unknown task " << report.result().task_id()
+                                                    << " from " << msg.identity << ", dropped");
+            return;
         }
+        if (it->second.identity != msg.identity) {
+            LOG_WARN("completion for task " << report.result().task_id() << " from "
+                                            << msg.identity << " (assigned to "
+                                            << it->second.identity << "), dropped");
+            return;
+        }
+        in_flight_.erase(it);
     }
 
     if (event_manager_ == nullptr) {
@@ -668,6 +691,15 @@ void Scheduler::SendTask(common::TaskPlugin* plugin, const std::string& identity
         return;
     }
     const RunContext& run = it->second;
+
+    {
+        std::lock_guard<std::mutex> lock(in_flight_mutex_);
+        if (in_flight_.count(task.task_id()) > 0) {
+            LOG_ERROR("task " << task.task_id()
+                              << " already in flight, duplicate dispatch dropped");
+            return;
+        }
+    }
 
     common::Envelope env;
     env.set_type(common::TASK);

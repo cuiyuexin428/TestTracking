@@ -67,6 +67,7 @@ private:
     struct ClientEntry {
         common::ClientInfo info;
         std::chrono::steady_clock::time_point last_seen;
+        bool registered = false;  // REGISTER accepted by the server plugin
     };
 
     struct InFlight {

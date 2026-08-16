@@ -106,6 +106,7 @@ bool SchedulerPlugin::plan(const common::RunRequest& request,
     run_id_ = request.run_id;
     waves_.clear();
     pending_.clear();
+    pending_ids_.clear();
     wave_task_ids_.clear();
     task_client_.clear();
     tasks_by_id_.clear();
@@ -139,6 +140,7 @@ bool SchedulerPlugin::plan(const common::RunRequest& request,
     pending_ = waves_[0];
     for (const common::Task& task : pending_) {
         wave_task_ids_.insert(task.task_id());
+        pending_ids_.insert(task.task_id());
         tasks_by_id_[task.task_id()] = task;
     }
     LOG_INFO("coverage plugin: planned " << total_files_ << " files, " << waves_.size()
@@ -156,6 +158,7 @@ bool SchedulerPlugin::requestTask(const common::ClientInfo& client,
     }
     task = pending_.front();
     pending_.erase(pending_.begin());
+    pending_ids_.erase(task.task_id());
     task_client_[task.task_id()] = client.identity;
     return true;
 }
@@ -166,7 +169,11 @@ void SchedulerPlugin::requeue(const std::vector<std::string>& task_ids) {
         task_client_.erase(task_id);
         const auto spec_it = tasks_by_id_.find(task_id);
         if (spec_it != tasks_by_id_.end()) {
-            pending_.push_back(spec_it->second);
+            if (pending_ids_.insert(task_id).second) {
+                pending_.push_back(spec_it->second);
+            } else {
+                LOG_WARN("coverage plugin: task already pending, skip requeue " << task_id);
+            }
         }
         LOG_WARN("coverage plugin: requeued " << task_id);
     }
@@ -206,6 +213,7 @@ void SchedulerPlugin::cancel() {
     std::lock_guard<std::mutex> lock(mutex_);
     waves_.clear();
     pending_.clear();
+    pending_ids_.clear();
     wave_task_ids_.clear();
     task_client_.clear();
     tasks_by_id_.clear();
@@ -261,8 +269,10 @@ void SchedulerPlugin::SettleWave() {
     if (current_wave_ < waves_.size()) {
         pending_ = waves_[current_wave_];
         wave_task_ids_.clear();
+        pending_ids_.clear();
         for (const common::Task& task : pending_) {
             wave_task_ids_.insert(task.task_id());
+            pending_ids_.insert(task.task_id());
         }
         LOG_INFO("coverage plugin: wave " << current_wave_ << " started, " << pending_.size()
                                           << " tasks");

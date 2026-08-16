@@ -50,6 +50,7 @@ private:
     std::vector<std::vector<common::Task>> waves_;
     size_t current_wave_ = 0;
     std::vector<common::Task> pending_;
+    std::unordered_set<std::string> pending_ids_;
     std::unordered_set<std::string> wave_task_ids_;
     std::unordered_map<std::string, std::string> task_client_;
     std::unordered_map<std::string, common::Task> tasks_by_id_;

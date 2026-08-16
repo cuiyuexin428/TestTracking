@@ -13,6 +13,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -51,6 +52,7 @@ public:
 
         std::lock_guard<std::mutex> lock(mutex_);
         pending_.clear();
+        pending_ids_.clear();
         tasks_by_id_.clear();
         task_client_.clear();
         completed_ = 0;
@@ -66,6 +68,7 @@ public:
             task.SerializeToString(spec.mutable_payload());
 
             tasks_by_id_[spec.task_id()] = spec;
+            pending_ids_.insert(spec.task_id());
             pending_.push_back(std::move(spec));
         }
         LOG_INFO("demo plugin: planned " << total_ << " tasks for run " << request.run_id);
@@ -81,6 +84,7 @@ public:
         }
         task = pending_.front();
         pending_.erase(pending_.begin());
+        pending_ids_.erase(task.task_id());
         task_client_[task.task_id()] = client.identity;
         return true;
     }
@@ -91,7 +95,11 @@ public:
             task_client_.erase(task_id);
             const auto spec_it = tasks_by_id_.find(task_id);
             if (spec_it != tasks_by_id_.end()) {
-                pending_.push_back(spec_it->second);
+                if (pending_ids_.insert(task_id).second) {
+                    pending_.push_back(spec_it->second);
+                } else {
+                    LOG_INFO("demo plugin: task already pending, skip requeue " << task_id);
+                }
             }
             LOG_INFO("demo plugin: requeued " << task_id);
         }
@@ -123,6 +131,7 @@ public:
     void cancel() override {
         std::lock_guard<std::mutex> lock(mutex_);
         pending_.clear();
+        pending_ids_.clear();
         tasks_by_id_.clear();
         task_client_.clear();
         completed_ = 0;
@@ -133,6 +142,7 @@ public:
 private:
     std::mutex mutex_;
     std::vector<common::Task> pending_;
+    std::unordered_set<std::string> pending_ids_;
     std::unordered_map<std::string, common::Task> tasks_by_id_;
     std::unordered_map<std::string, std::string> task_client_;
     int completed_ = 0;

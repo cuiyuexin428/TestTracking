@@ -3,7 +3,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
-#include <queue>
+#include <deque>
 #include <utility>
 
 namespace common {
@@ -18,7 +18,17 @@ public:
     void push(T item) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            queue_.push(std::move(item));
+            queue_.push_back(std::move(item));
+        }
+        cv_.notify_one();
+    }
+
+    // Pushes to the front; used to retry a head message without reordering
+    // the rest of the queue.
+    void pushFront(T item) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            queue_.push_front(std::move(item));
         }
         cv_.notify_one();
     }
@@ -28,7 +38,7 @@ public:
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait(lock, [this] { return !queue_.empty(); });
         T item = std::move(queue_.front());
-        queue_.pop();
+        queue_.pop_front();
         return item;
     }
 
@@ -41,7 +51,7 @@ public:
             return false;
         }
         item = std::move(queue_.front());
-        queue_.pop();
+        queue_.pop_front();
         return true;
     }
 
@@ -66,14 +76,14 @@ public:
     void clear() {
         std::lock_guard<std::mutex> lock(mutex_);
         while (!queue_.empty()) {
-            queue_.pop();
+            queue_.pop_front();
         }
     }
 
 private:
     mutable std::mutex mutex_;
     std::condition_variable cv_;
-    std::queue<T> queue_;
+    std::deque<T> queue_;
 };
 
 }  // namespace common

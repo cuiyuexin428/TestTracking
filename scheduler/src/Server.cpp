@@ -51,6 +51,12 @@ void Server::RunLoop() {
                     } else {
                         LOG_WARN("server: dropped unparseable message from " << parts[0]);
                     }
+                } else {
+                    LOG_WARN("server: dropped malformed message (" << parts.size()
+                                                                   << " parts) from "
+                                                                   << (parts.empty()
+                                                                           ? std::string("unknown")
+                                                                           : parts[0]));
                 }
             }
             if (outgoing_.pop(out, std::chrono::milliseconds(0))) {
@@ -62,8 +68,10 @@ void Server::RunLoop() {
                 if (router_.waitWritable(std::chrono::milliseconds(0))) {
                     router_.sendMsgParts({out.identity, bytes});
                 } else {
-                    // Send queue full (HWM); requeue and retry on the next round.
-                    outgoing_.push(std::move(out));
+                    // Send queue full (HWM): keep this message at the head so
+                    // ordering is preserved and it is retried next round.
+                    outgoing_.pushFront(std::move(out));
+                    break;
                 }
             }
         } catch (const std::exception& e) {
