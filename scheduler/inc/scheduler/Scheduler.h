@@ -7,6 +7,7 @@
 #include "common/TaskPlugin.h"
 #include "communication.pb.h"
 #include "scheduler/Server.h"
+#include "scheduler/Storage.h"
 
 #include <atomic>
 #include <chrono>
@@ -122,6 +123,7 @@ private:
 
     common::Config& config_;
     Server server_;
+    Storage storage_;
     std::vector<LoadedPlugin> plugins_;
     std::unordered_map<std::string, common::TaskPlugin*> plugins_by_type_;
 

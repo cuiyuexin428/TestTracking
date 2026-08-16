@@ -57,6 +57,17 @@ void Scheduler::start() {
     if (!LoadPlugins()) {
         throw std::runtime_error("Scheduler: plugin loading failed");
     }
+    const std::string db_conn = config_.get("server.db_conn", std::string());
+    if (!db_conn.empty()) {
+        if (!storage_.init(db_conn)) {
+            throw std::runtime_error("Scheduler: storage init failed");
+        }
+        // Mark runs that were left running by a previous scheduler process.
+        for (const std::string& run_id : storage_.LoadUnfinishedRunIds()) {
+            LOG_WARN("storage: run " << run_id << " was interrupted, marked interrupted");
+            storage_.FinishRun(run_id, "interrupted");
+        }
+    }
     server_.start();
     const int process_threads = config_.get("server.process_threads", 4);
     event_manager_ = std::make_unique<common::EventManager>(process_threads);
@@ -399,6 +410,9 @@ void Scheduler::HandleTaskReport(const IncomingMessage& msg) {
         LOG_ERROR("result processing pool is not running");
         return;
     }
+    if (storage_.enabled()) {
+        storage_.ReportTask(report.result().task_id(), report.result());
+    }
     event_manager_->push(new ProcessResultEvent(pit->second, report.result()));
 }
 
@@ -413,6 +427,9 @@ void Scheduler::HandleTaskAck(const IncomingMessage& msg) {
         return;
     }
     it->second.acked = true;
+    if (storage_.enabled()) {
+        storage_.AckTask(ack.task_id());
+    }
     LOG_INFO("task " << ack.task_id() << " acked by " << msg.identity);
 }
 
@@ -460,6 +477,10 @@ void Scheduler::HandleCreateRun(const CreateRunCommand& command) {
     }
 
     active_runs_[plugin] = {request.run_id, command.plugin_type};
+    if (storage_.enabled()) {
+        storage_.SaveRun(request.run_id, command.plugin_type, request.dataset_version,
+                         request.params);
+    }
     LOG_INFO("run started: " << request.run_id << " plugin_type=" << command.plugin_type);
 }
 
@@ -509,6 +530,9 @@ void Scheduler::HandleStopRun(const StopRunCommand& command) {
     }
 
     active_runs_.erase(run_it);
+    if (storage_.enabled()) {
+        storage_.FinishRun(run_id, "stopped");
+    }
     LOG_INFO("run stopped: " << run_id << " plugin_type=" << command.plugin_type);
 }
 
@@ -598,6 +622,9 @@ void Scheduler::RunTimeoutChecks() {
         if (finished) {
             LOG_INFO("run finished: " << it->second.run_id
                                       << " plugin_type=" << it->second.plugin_type);
+            if (storage_.enabled()) {
+                storage_.FinishRun(it->second.run_id, "finished");
+            }
             it = active_runs_.erase(it);
         } else {
             ++it;
@@ -713,6 +740,9 @@ void Scheduler::SendTask(common::TaskPlugin* plugin, const std::string& identity
         std::lock_guard<std::mutex> lock(in_flight_mutex_);
         in_flight_[task.task_id()] = {identity, run.plugin_type,
                                       std::chrono::steady_clock::now(), false};
+    }
+    if (storage_.enabled()) {
+        storage_.SaveTask(task.task_id(), run.run_id, identity, task.payload());
     }
     LOG_INFO("task " << task.task_id() << " -> client " << identity);
 }

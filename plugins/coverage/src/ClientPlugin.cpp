@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -188,6 +189,7 @@ bool ClientPlugin::init(const std::string& config) {
     target_exe_ = cfg.value("target_exe", std::string());
     export_dir_ = cfg.value("export_dir", std::string());
     keep_reports_ = cfg.value("keep_reports", false);
+    store_cov_ = cfg.value("store_cov", false);
     program_version_ = cfg.value("program_version", std::string());
     dataset_version_ = cfg.value("dataset_version", std::string());
     deployed_ = cfg.value("deployed", false);
@@ -203,7 +205,7 @@ bool ClientPlugin::init(const std::string& config) {
         pool_ = std::make_unique<common::EventManager>(task_threads_);
     }
 
-    store_ = CreateCoverageStore();
+    store_ = CreateCoverageStore(config);
     if (!store_->init(config)) {
         LOG_ERROR("coverage plugin: coverage store init failed");
         return false;
@@ -258,17 +260,20 @@ common::RegisterOutcome ClientPlugin::handleValidationReply(const std::string& r
 
 bool ClientPlugin::RunOneFile(const std::string& run_id, int wave, const std::string& file,
                               std::vector<std::uint64_t>& points) {
-    (void)run_id;
-    (void)wave;
     const std::string stp_path = stp_root_ + "/" + file;
     const std::string xml_path =
         NormalizePath(export_dir_ + "/" + std::to_string(Fnv1a64(file)) + ".xml");
+    const std::string cov_path =
+        NormalizePath(export_dir_ + "/" + std::to_string(Fnv1a64(file)) + ".cov");
 
     std::string command = "\"" + opencppcoverage_ + "\" --quiet";
     for (const std::string& module : occt_dlls_) {
         command += " --modules=" + NormalizePath(module);
     }
     command += " --export_type=cobertura:" + xml_path;
+    if (store_cov_) {
+        command += " --export_type=binary:" + cov_path;
+    }
     command += " -- \"" + NormalizePath(target_exe_) + "\" \"" + NormalizePath(stp_path) + "\"";
 
     const int exit_code = RunCommand(command);
@@ -279,6 +284,20 @@ bool ClientPlugin::RunOneFile(const std::string& run_id, int wave, const std::st
     if (!ParseCobertura(xml_path, points)) {
         LOG_WARN("coverage plugin: failed to parse " << xml_path);
         return false;
+    }
+    if (store_cov_) {
+        std::ifstream cov_in(cov_path, std::ios::binary | std::ios::ate);
+        if (cov_in.is_open()) {
+            const std::streamsize size = cov_in.tellg();
+            std::string data(static_cast<size_t>(size), '\0');
+            cov_in.seekg(0);
+            cov_in.read(&data[0], size);
+            store_->saveFileCov(run_id, wave, file, data, static_cast<std::int64_t>(size));
+            std::error_code ec;
+            std::filesystem::remove(cov_path, ec);
+        } else {
+            LOG_WARN("coverage plugin: failed to read cov " << cov_path);
+        }
     }
     if (!keep_reports_) {
         std::error_code ec;

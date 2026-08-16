@@ -17,6 +17,7 @@ add_library(coverage SHARED
 target_include_directories(coverage PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/inc
     ${CMAKE_CURRENT_BINARY_DIR}
+    ${PG_INCLUDE_DIR}
 )
 
-target_link_libraries(coverage PRIVATE common)
+target_link_libraries(coverage PRIVATE common ${PG_LIBRARY})

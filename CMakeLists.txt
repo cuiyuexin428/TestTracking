@@ -44,3 +44,25 @@ add_dependencies(test_common deploy_third_party)
 add_dependencies(test_zmq deploy_third_party)
 add_dependencies(test_config deploy_third_party)
 add_dependencies(test_messages deploy_third_party)
+
+# Deploy libpq and its dependencies next to every executable so DB-backed
+# storage works without PATH setup.
+add_custom_target(deploy_libpq ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${PG_BIN_DIR}/libpq.dll"
+        "${PG_BIN_DIR}/libintl-9.dll"
+        "${PG_BIN_DIR}/libiconv-2.dll"
+        "${PG_BIN_DIR}/libwinpthread-1.dll"
+        "${PG_BIN_DIR}/libssl-3-x64.dll"
+        "${PG_BIN_DIR}/libcrypto-3-x64.dll"
+        "${CMAKE_BINARY_DIR}/bin/$<CONFIG>/"
+)
+add_dependencies(deploy_libpq common)
+add_dependencies(scheduler deploy_libpq)
+add_dependencies(demo_server deploy_libpq)
+add_dependencies(demo_client deploy_libpq)
+add_dependencies(client deploy_libpq)
+add_dependencies(test_common deploy_libpq)
+add_dependencies(test_zmq deploy_libpq)
+add_dependencies(test_config deploy_libpq)
+add_dependencies(test_messages deploy_libpq)

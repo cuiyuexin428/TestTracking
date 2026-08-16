@@ -30,7 +30,7 @@ bool SchedulerPlugin::init(const std::string& config) {
         LOG_ERROR("coverage plugin: stp_manifest is required");
         return false;
     }
-    store_ = CreateCoverageStore();
+    store_ = CreateCoverageStore(config);
     if (!store_->init(config)) {
         LOG_ERROR("coverage plugin: coverage store init failed");
         return false;
@@ -258,6 +258,11 @@ void SchedulerPlugin::SettleWave() {
     selected_count_ += selected.size();
 
     store_->appendSelected(run_id_, selected);
+    std::vector<std::uint64_t> cumulative_vec(cumulative_.begin(), cumulative_.end());
+    store_->saveCumulative(run_id_, static_cast<int>(current_wave_), cumulative_vec);
+    store_->saveRunSummary(run_id_, static_cast<int>(total_files_),
+                           static_cast<int>(selected_count_),
+                           static_cast<std::int64_t>(cumulative_.size()));
     if (!keep_staging_) {
         store_->clearWave(run_id_, static_cast<int>(current_wave_));
     }

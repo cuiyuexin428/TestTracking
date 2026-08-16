@@ -57,6 +57,7 @@ private:
     std::string target_exe_;
     std::string export_dir_;
     bool keep_reports_ = false;  // validation only: keep cobertura XMLs
+    bool store_cov_ = false;     // keep OpenCppCoverage .cov binaries in the store
     std::vector<std::string> occt_dlls_;
 
     // Local deployment state (registration business message content).

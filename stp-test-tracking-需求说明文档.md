@@ -273,22 +273,29 @@ public:
 - 方案 B（上报落库）：客户端把结果发给调度端、调度端统一写。优点：一致性集中、客户端无 DB 依赖；缺点：大结果走网络。
 - 推荐：**业务大结果用 A（CoverageStore DB 实现），框架 runs/tasks/进度快照用 B（调度端写）**。
 
-### 14.3 表结构草案
+### 14.3 表结构（已落地，PostgreSQL）
 
 框架表：
 
 - `runs(run_id PK, plugin_type, dataset_version, params, status, created_at, finished_at)`
-- `tasks(task_id PK, run_id FK, status, client_identity, sent_at, acked_at, reported_at, exit_code, duration_ms, artifact_path, result BYTEA)`
-- `progress_snapshots(run_id, wave_index, finished_tasks, total_tasks, taken_at)`
+- `tasks(task_id PK, run_id, client_identity, status, sent_at, acked_at, reported_at, exit_code, duration_ms, artifact_path, result BYTEA, payload BYTEA)`——payload 为任务内容，为后续重启恢复任务池预留
 
 业务表（coverage 插件）：
 
-- `coverage_wave_points(run_id, wave_id, file, points JSON/BYTEA, PK(run_id, wave_id, file))`
-- `coverage_selected(run_id, file, selected_at)`
+- `coverage_wave_points(run_id, wave_id, file, points BYTEA, PK(run_id, wave_id, file))`——本波点集，结算后清空
+- `coverage_cov_files(run_id, wave_id, file, cov BYTEA, size_bytes)`——每个 stp 文件的 `.cov` 二进制（审计与备选总覆盖率计算），保留到 run 结束
+- `coverage_cumulative(run_id, wave_id, points BYTEA, PK(run_id, wave_id))`——每波结算后的累计点集，作为下一波起始覆盖率
+- `coverage_selected(run_id, file, selected_at, PK(run_id, file))`
+- `coverage_run_summary(run_id PK, total_files, selected_files, cumulative_points, finished_at)`
+
+进度不做快照表，用 `tasks` 表实时聚合。
+
+配置：`store_type: "postgres"` + `db_conn` 连接串（插件段）；`server.db_conn` 启用框架 runs/tasks 落库；`store_cov` 控制是否生成并入库 `.cov`（默认 false，注意体积：每个 .cov 约 1MB+）。
 
 ### 14.4 实施步骤
 
-1. 框架持久化接口抽象（存储接口定义，内存/文件实现先保留）。
-2. CoverageStore 增加 DB 后端（先 SQLite，再 PostgreSQL）。
-3. 调度端 runs/tasks 落库与启动恢复（恢复未完成 run 的任务池）。
-4. 用真实 stp 环境验证。
+1. ✅ 部署本地 PostgreSQL（免安装 zip，libpq 接入，CMake 自动部署依赖 DLL）。
+2. ✅ CoverageStore 增加 PostgreSQL 后端（wave_points / cov_files / cumulative / selected / run_summary 五张表，接口不变，文件实现保留）。
+3. ✅ 调度端 runs/tasks 落库 + 启动时把遗留 running run 标记为 interrupted。
+4. ✅ 真实 stp 环境验证（8 文件真实执行 + 双客户端并发 + 重启恢复，全部通过）。
+5. ⏳ 重启后任务池自动恢复（需插件 restore 接口，利用 tasks.payload）。

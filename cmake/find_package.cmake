@@ -26,3 +26,19 @@ set(THIRD_PARTY_INCLUDE_DIRS
     CACHE INTERNAL "")
 
 message(STATUS "THIRD_PARTY_ROOT=${THIRD_PARTY_ROOT}")
+
+# PostgreSQL client library (libpq) for DB-backed storage. Points at a local
+# PostgreSQL install (e.g. the unpacked binary zip used for development).
+set(PG_ROOT "D:/workTask/pg/pgsql" CACHE PATH
+    "PostgreSQL install root containing include/ lib/ bin/")
+set(PG_INCLUDE_DIR "${PG_ROOT}/include" CACHE PATH "libpq headers directory")
+set(PG_LIBRARY "${PG_ROOT}/lib/libpq.lib" CACHE FILEPATH "libpq import library")
+set(PG_BIN_DIR "${PG_ROOT}/bin" CACHE PATH "PostgreSQL bin directory (libpq.dll and deps)")
+
+if(NOT EXISTS "${PG_INCLUDE_DIR}/libpq-fe.h" OR NOT EXISTS "${PG_LIBRARY}")
+    message(FATAL_ERROR
+        "libpq not found under ${PG_ROOT}; set PG_ROOT to a PostgreSQL install "
+        "containing include/libpq-fe.h and lib/libpq.lib")
+endif()
+
+message(STATUS "PG_ROOT=${PG_ROOT}")
