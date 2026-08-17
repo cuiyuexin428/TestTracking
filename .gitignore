@@ -25,3 +25,6 @@ Desktop.ini
 
 # Generated test/validation data (manifests, coverage staging)
 /testdata/
+
+# Generated standalone client package (tools/pack_client.ps1)
+/client_package/
