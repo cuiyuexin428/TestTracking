@@ -69,7 +69,7 @@ private:
     void HandleStop();
     void OnTaskCompleted(const common::TaskResult& result);
     void SendHeartbeat();
-    bool SendRequestTask();
+    bool SendRequestTask(int count);
     void SendTaskReport(const common::TaskResult& result);
 
     common::Config& config_;

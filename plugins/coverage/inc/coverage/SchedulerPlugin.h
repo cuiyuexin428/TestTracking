@@ -51,6 +51,10 @@ private:
     size_t current_wave_ = 0;
     std::vector<common::Task> pending_;
     std::unordered_set<std::string> pending_ids_;
+    // Reclaimed tasks (offline/lease) are re-sent before new tasks so the
+    // current wave can settle sooner.
+    std::vector<common::Task> priority_pending_;
+    std::unordered_set<std::string> priority_ids_;
     std::unordered_set<std::string> wave_task_ids_;
     std::unordered_map<std::string, std::string> task_client_;
     std::unordered_map<std::string, common::Task> tasks_by_id_;

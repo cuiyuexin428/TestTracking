@@ -23,5 +23,6 @@ message Envelope {
     WakeCommand wake = 10;
     StopCommand stop = 11;
     TaskAck task_ack = 12;
+    TaskRejectCommand task_reject = 13;
   }
 }

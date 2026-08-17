@@ -177,6 +177,14 @@ bool Client::RegisterWithServer() {
         }
 
         const common::RegisterResult& result = reply.register_result();
+        if (!result.plugin_found()) {
+            LOG_ERROR("client: registration rejected: server has no plugin for "
+                      << plugin_->pluginType());
+            return false;
+        }
+        if (!result.accepted() && !result.reason().empty()) {
+            LOG_WARN("client: registration reply reason=" << result.reason());
+        }
         try {
             switch (plugin_->handleValidationReply(result.payload())) {
                 case common::RegisterOutcome::kReady:
@@ -303,19 +311,17 @@ void Client::RunStateMachine() {
             backoff_ = request_backoff_initial_;
         }
 
-        // Pull one task per free slot. The server grants one task per
-        // request (registration gate only), so the client controls capacity.
+        // Ask for all free slots in one request; the server grants up to
+        // count tasks in a single reply. At most one request is outstanding.
         int free_slots = 0;
         {
             std::lock_guard<std::mutex> lock(counters_mutex_);
             free_slots = task_slots_ - in_flight_ - outstanding_requests_;
         }
-        if (free_slots > 0 && now >= next_request_) {
-            for (int i = 0; i < free_slots; ++i) {
-                if (SendRequestTask()) {
-                    std::lock_guard<std::mutex> lock(counters_mutex_);
-                    ++outstanding_requests_;
-                }
+        if (free_slots > 0 && outstanding_requests_ == 0 && now >= next_request_) {
+            if (SendRequestTask(free_slots)) {
+                std::lock_guard<std::mutex> lock(counters_mutex_);
+                outstanding_requests_ = 1;
             }
         }
 
@@ -403,6 +409,7 @@ void Client::HandleMessage(const common::Envelope& env) {
         case common::TASK_REPORT:
         case common::REGISTER:
         case common::TASK_ACK:
+        case common::TASK_REJECT:
             LOG_WARN("client: unexpected message type " << env.type());
             break;
         default:
@@ -418,31 +425,43 @@ void Client::OnTaskCompleted(const common::TaskResult& result) {
 }
 
 void Client::HandleTask(const common::TaskCommand& command, const std::string& plugin_type) {
-    LOG_INFO("client: task " << command.task().task_id() << " plugin_type=" << plugin_type
-                             << " run=" << command.run_id());
+    LOG_INFO("client: task batch run=" << command.run_id()
+                                       << " tasks=" << command.tasks_size()
+                                       << " plugin_type=" << plugin_type);
     // Defensive: after a successful registration the client and server agree
     // on plugin_type, so this path should be unreachable.
     if (plugin_ != nullptr && plugin_type != plugin_->pluginType()) {
-        LOG_WARN("client: plugin_type mismatch, ignoring task " << command.task().task_id());
+        LOG_WARN("client: plugin_type mismatch, rejecting " << command.tasks_size()
+                                                            << " tasks");
+        for (const common::Task& task : command.tasks()) {
+            common::Envelope reject;
+            reject.set_type(common::TASK_REJECT);
+            reject.set_plugin_type(plugin_type);
+            reject.mutable_task_reject()->set_task_id(task.task_id());
+            reject.mutable_task_reject()->set_reason("plugin_type mismatch");
+            outgoing_.push(std::move(reject));
+        }
         std::lock_guard<std::mutex> lock(counters_mutex_);
         if (outstanding_requests_ > 0) {
             --outstanding_requests_;
         }
         return;
     }
-    // Task receipt: confirm delivery before execution.
-    common::Envelope ack;
-    ack.set_type(common::TASK_ACK);
-    ack.set_plugin_type(plugin_type);
-    ack.mutable_task_ack()->set_task_id(command.task().task_id());
-    outgoing_.push(std::move(ack));
 
-    executor_.push(command.task());
+    // Task receipt: confirm delivery before execution.
+    for (const common::Task& task : command.tasks()) {
+        common::Envelope ack;
+        ack.set_type(common::TASK_ACK);
+        ack.set_plugin_type(plugin_type);
+        ack.mutable_task_ack()->set_task_id(task.task_id());
+        outgoing_.push(std::move(ack));
+        executor_.push(task);
+    }
     std::lock_guard<std::mutex> lock(counters_mutex_);
     if (outstanding_requests_ > 0) {
         --outstanding_requests_;
     }
-    ++in_flight_;
+    in_flight_ += command.tasks_size();
 }
 
 void Client::SendHeartbeat() {
@@ -486,14 +505,15 @@ void Client::SendHeartbeat() {
     }
 }
 
-bool Client::SendRequestTask() {
-    if (plugin_ == nullptr) {
+bool Client::SendRequestTask(int count) {
+    if (plugin_ == nullptr || count <= 0) {
         return false;
     }
     common::Envelope env;
     env.set_type(common::REQUEST_TASK);
     env.set_plugin_type(plugin_->pluginType());
     common::RequestTaskCommand* request = env.mutable_request_task();
+    request->set_count(count);
 
     std::string bytes;
     if (!env.SerializeToString(&bytes)) {

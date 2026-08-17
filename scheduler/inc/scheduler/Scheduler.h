@@ -107,6 +107,7 @@ private:
     void HandleRequestTask(const IncomingMessage& msg);
     void HandleTaskReport(const IncomingMessage& msg);
     void HandleTaskAck(const IncomingMessage& msg);
+    void HandleTaskReject(const IncomingMessage& msg);
     void HandleCreateRun(const CreateRunCommand& command);
     void HandleStopRun(const StopRunCommand& command);
     void ReclaimClientTasks(const std::string& identity);
@@ -116,9 +117,10 @@ private:
     std::vector<common::ClientInfo> SnapshotClients() const;
     void RunTimeoutChecks();
     void SendRegisterResult(const std::string& identity, const std::string& plugin_type,
+                            bool plugin_found, bool accepted, const std::string& reason,
                             const std::string& reply_payload);
-    void SendTask(common::TaskPlugin* plugin, const std::string& identity,
-                  const common::Task& task);
+    void SendTasks(common::TaskPlugin* plugin, const std::string& identity,
+                   const std::vector<common::Task>& tasks);
     void SendNoTask(const std::string& identity, const std::string& plugin_type);
 
     common::Config& config_;

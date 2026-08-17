@@ -2,9 +2,11 @@ syntax = "proto3";
 
 package common;
 
-// Framework/business boundary: the framework only reads the envelope header
-// (type / plugin_type); all payloads are opaque business data that the
-// framework passes through untouched.
+// Framework/business boundary: framework fields (type / plugin_type / run_id /
+// task_id / count / exit_code / plugin_found / reason / ...) are read and
+// managed by the framework; business payloads (Task.payload /
+// TaskResult.result / register payloads) are opaque bytes that the framework
+// passes through untouched.
 
 // Envelope message types.
 enum MessageType {
@@ -25,6 +27,7 @@ enum MessageType {
 
   // Client -> scheduler.
   TASK_ACK = 10;       // task receipt: client confirms it received the task
+  TASK_REJECT = 11;    // task rejection: client cannot execute the task
 }
 
 // The task unit transported by the framework. plugin_type anchors both the

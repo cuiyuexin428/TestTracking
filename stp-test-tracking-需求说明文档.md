@@ -175,11 +175,12 @@ public:
 | 消息 | 方向 | 框架字段 | 业务字段 |
 | --- | --- | --- | --- |
 | REGISTER | 客户端 → 服务端 | plugin_type（信封）、identity（ZMQ 帧） | 业务验证消息（bytes，不透明） |
-| REGISTER_RESULT | 服务端 → 客户端 | plugin_type（信封） | 业务回执（bytes，不透明，插件定义） |
+| REGISTER_RESULT | 服务端 → 客户端 | plugin_type（信封）、plugin_found、accepted、reason | 业务回执（bytes，不透明，插件定义） |
 | HEARTBEAT | 客户端 → 服务端 | plugin_type（信封）、IP、状态、资源占用 | — |
-| REQUEST_TASK | 客户端 → 服务端 | plugin_type（信封） | —（可选附加状态） |
-| TASK（单任务） | 服务端 → 客户端 | plugin_type（信封）、run_id、task_id | 任务 payload（bytes，不透明） |
+| REQUEST_TASK | 客户端 → 服务端 | plugin_type（信封）、count（期望任务数） | —（可选附加状态） |
+| TASK（批量，1..count 个任务） | 服务端 → 客户端 | plugin_type（信封）、run_id、每个任务 task_id | 每个任务 payload（bytes，不透明） |
 | TASK_ACK | 客户端 → 服务端 | plugin_type（信封）、task_id | — |
+| TASK_REJECT | 客户端 → 服务端 | plugin_type（信封）、task_id、reason | — |
 | NO_TASK | 服务端 → 客户端 | — | — |
 | TASK_REPORT | 客户端 → 服务端 | task_id、exit_code、耗时、产物路径 | 结果 payload（bytes，不透明） |
 | WAKE（可选） | 服务端 → 客户端 | — | — |
@@ -322,7 +323,7 @@ public:
 
 | 模块 | 类/文件 | 功能 | 待改进项目 | 完成情况 |
 | --- | --- | --- | --- | --- |
-| 客户端主体（状态机） | Client | 主线程状态机：注册 → READY → 拉取任务 → 执行 → 逐条上报结果；心跳与退避 | 1) 单任务状态枚举改为计数驱动：空闲槽位 = N - 在飞数 - 未应答请求数<br>2) 收到 TASK 后逐任务 ACK、逐任务推入执行池（批量 list 解析待第 3 步）<br>3) 收到 NO_TASK 整组退避<br>4) 去掉 REQUEST_TASK 超时重发（一个请求一个回复）<br>5) 心跳 BUSY 改为"在飞数 > 0" | 本轮进行中（计数驱动状态机已实现；批量请求待第 3 步） |
+| 客户端主体（状态机） | Client | 主线程状态机：注册 → READY → 拉取任务 → 执行 → 逐条上报结果；心跳与退避 | 已完成：计数驱动（空闲槽位 = N - 在飞数，同时最多 1 个未应答 REQUEST_TASK，count = 空闲槽位数）；收到 TASK 列表后逐任务 ACK、逐任务推入执行池；NO_TASK 整组退避；无超时重发；心跳 BUSY = 在飞数 > 0 | 本轮已实现 |
 | 执行池 | TaskExecutor | 框架级并发执行任务：一个 worker 执行一个任务，完成后回调上报 | 1) 1 线程改为 N 线程可配置，复用 common::EventManager(N)<br>2) 每任务一个 Event<br>3) STOP 语义保持：执行中的任务等完成后结果丢弃，未执行任务丢弃 | 本轮已实现（N 线程可配置） |
 | 客户端通信组件（新增） | ClientComm（暂定名） | 与服务端服务模块对称：一个线程 + input/output 两个队列，负责 socket 收发 | 状态机不再直接碰 socket<br>心跳时机由状态机决定，组件只负责发出<br>注册阶段保持同步完成后再启动 | 规划中（第二步，不在本轮） |
 
@@ -331,14 +332,14 @@ public:
 | 模块 | 类/文件 | 功能 | 待改进项目 | 完成情况 |
 | --- | --- | --- | --- | --- |
 | 服务模块 | Server | 一个线程循环维护 input/output 队列：收注册/心跳/请求任务/任务回执/任务结果；发任务/无任务/命令 | 1) 修复 HWM 满时 break 导致收发循环退出的 bug（应为 continue）<br>2) 支持一个 TASK 信封携带最多 count 个任务<br>3) 出站吞吐优化（poll 同时等收发，避免每轮先等收再发一条） | 未开始 |
-| 调度模块 | Scheduler | 从服务模块取消息、拆信封；in-flight 记账/租约/回收/STOP；调用插件；管理 run 生命周期 | 1) 去掉"每客户端最多 1 个在飞"门禁，改为按请求 count 循环调用插件 requestTask 批量授予，服务端不设上限<br>2) 注册门禁保留，count <= 0 回 NO_TASK<br>3) 旧 run 完成时补 storage_.FinishRun<br>4) 明确两段式记账：派发 → ACK 后标记已确认 → 结果回来后进入插件结果处理池 | 部分完成（已去掉每客户端 1 个在飞门禁；批量授予待协议批量字段） |
+| 调度模块 | Scheduler | 从服务模块取消息、拆信封；in-flight 记账/租约/回收/STOP；调用插件；管理 run 生命周期 | 已完成：去掉每客户端 1 个在飞门禁，按请求 count 循环调用插件 requestTask 批量授予，服务端不设上限；注册门禁保留，count <= 0 回 NO_TASK；TASK_REJECT 回收并 requeue<br>待处理：旧 run 完成时补 storage_.FinishRun；明确两段式记账 | 部分完成（批量授予已实现；FinishRun 补写与两段式记账待处理） |
 | 持久化 | Storage | runs/tasks 落库、重启标记 interrupted、任务 reclaim | 1) 非 Windows 平台实现（当前 void* conn_ + PQ 调用无法编译）<br>2) ReclaimTasks 数组转义健壮性 | 已实现（Windows），待验证 |
 
 #### 通信协议
 
 | 模块 | 类/文件 | 功能 | 待改进项目 | 完成情况 |
 | --- | --- | --- | --- | --- |
-| 消息定义 | command.proto / communication.proto / common.proto | Envelope 信封、框架命令、任务与结果载体 | 1) RequestTaskCommand 增加 count 字段（期望任务数）<br>2) TaskCommand 单 Task 改为 repeated Task tasks，数量由 tasks_size 隐含，客户端按 list 解析<br>3) 逐任务 TASK_ACK、逐任务 TASK_REPORT 保持不变<br>4) 更新 common.proto 注释：区分框架字段（run_id/task_id/exit_code/count 等）与业务 opaque payload | 未开始 |
+| 消息定义 | command.proto / communication.proto / common.proto | Envelope 信封、框架命令、任务与结果载体 | 已完成：RequestTaskCommand.count；TaskCommand repeated tasks（数量由 tasks_size 隐含）；逐任务 TASK_ACK/TASK_REPORT；RegisterResult 增加 plugin_found/accepted/reason（注册拒绝语义）；新增 TaskRejectCommand（NACK）；common.proto 注释分层更新 | 本轮已实现 |
 
 #### 插件框架
 
@@ -364,8 +365,22 @@ public:
 
 ### 15.3 本轮实施顺序
 
-1. 客户端框架：TaskExecutor N 线程池 + 计数驱动状态机（本轮从这里开始）；
-2. 覆盖率客户端插件瘦身（删除自建并发）；
-3. 协议批量字段（RequestTaskCommand.count、TaskCommand.repeated tasks）；
-4. 服务端批量授予与门禁调整（去掉每客户端 1 个在飞限制，服务端不设上限）；
+1. ✅ 客户端框架：TaskExecutor N 线程池 + 计数驱动状态机（已完成）；
+2. ✅ 覆盖率客户端插件瘦身（删除自建并发，已完成）；
+3. ✅ 协议批量字段（RequestTaskCommand.count、TaskCommand.repeated tasks、注册拒绝语义、TASK_REJECT，已完成）；
+4. ✅ 服务端批量授予与门禁调整（去掉每客户端 1 个在飞限制，服务端不设上限，已完成）；
 5. e2e 回归：demo 主流程、覆盖率多波次、STOP 路径、批量并发。
+
+### 15.4 已知问题与线上前边界场景（v0.7.1）
+
+**已知问题（记录在案，暂不兜底）**
+
+- Server 发送队列 HWM 满时的 `break` 分支（scheduler/src/Server.cpp）：当前未处理。处理原则：不为此加兜底逻辑；若线上真实发生，视为 P0，优先回查服务线程/框架设计根因——正常设计下服务线程只做收发搬移，不应让 ZMQ 队列堆积。
+
+**线上运行前必须处理的边界场景**
+
+| 场景 | 现状 | 需要实现 | 归属 | 状态 |
+| --- | --- | --- | --- | --- |
+| 1. 客户端异常关闭 | 已有 TASK_ACK 回执；客户端下线后 ReclaimClientTasks 把任务 requeue 到普通队尾 | 已完成：所有被回收任务一律进入覆盖率插件的优先发送任务队列，先于普通任务派发；requeue 接口不变 | 覆盖率服务插件 | 已实现 |
+| 2. 服务端 STOP | 客户端丢弃所持任务；插件 cancel 清空内存；无检查点，进度不可恢复 | 客户端停止执行即可，无需逐条回执；服务端基于 reclaim 落库；服务端持久化运行检查点（当前波次、剩余任务池、累计点集/已选文件），启动时自动恢复 | 调度 / 覆盖率插件 | 未开始 |
+| 3. 服务端崩溃 | 重启仅把 running run 标记为 interrupted，任务池不恢复 | 依赖场景 2 的检查点与插件 restore 接口，启动时恢复未完成 run | 调度 + 覆盖率插件 | 未开始 |

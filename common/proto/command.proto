@@ -14,21 +14,32 @@ message RegisterCommand {
 
 // Registration validation result. payload is the opaque business reply
 // (plugin-defined, e.g. deployment instructions); the framework does not
-// know its structure and the client plugin parses it.
+// know its structure and the client plugin parses it. plugin_found and
+// reason are framework-level: plugin_found=false means the scheduler has no
+// plugin for Envelope.plugin_type and the client must abort registration;
+// reason is for logging/display only.
 message RegisterResult {
   bytes payload = 1;
+  bool plugin_found = 2;
+  string reason = 3;
+  bool accepted = 4;
 }
 
-// Client task request. payload is optional opaque business request data
-// passed through to the server plugin.
+// Client task request. count is the desired number of tasks: the scheduler
+// returns up to count tasks in one reply (count <= 0 is answered with
+// NO_TASK). payload is optional opaque business request data passed through
+// to the server plugin.
 message RequestTaskCommand {
   bytes payload = 1;
+  int32 count = 2;
 }
 
-// Single-task dispatch: the framework sends exactly one task at a time.
+// Task dispatch: one or more tasks in a single reply. The framework grants
+// up to RequestTaskCommand.count tasks; the client ACKs and executes each
+// task independently.
 message TaskCommand {
   string run_id = 1;
-  Task task = 2;
+  repeated Task tasks = 2;
 }
 
 // No task available. Empty message; fields reserved for later use.
@@ -39,6 +50,14 @@ message NoTaskCommand {}
 // client disconnects or a task gets stuck.
 message TaskAck {
   string task_id = 1;
+}
+
+// Task rejection (client -> scheduler): the client received a task it cannot
+// execute (defensive path). The scheduler removes the task from in-flight
+// tracking and requeues it to the server plugin.
+message TaskRejectCommand {
+  string task_id = 1;
+  string reason = 2;
 }
 
 // Wake a sleeping client (reserved).

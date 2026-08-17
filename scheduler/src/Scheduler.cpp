@@ -244,6 +244,11 @@ void Scheduler::HandleMessage(const IncomingMessage& msg) {
                 HandleTaskAck(msg);
             }
             break;
+        case common::TASK_REJECT:
+            if (env.has_task_reject()) {
+                HandleTaskReject(msg);
+            }
+            break;
         case common::REGISTER_RESULT:
         case common::TASK:
         case common::NO_TASK:
@@ -263,7 +268,8 @@ void Scheduler::HandleRegister(const IncomingMessage& msg) {
     const auto it = plugins_by_type_.find(plugin_type);
     if (it == plugins_by_type_.end()) {
         LOG_ERROR("register: no plugin for plugin_type " << plugin_type);
-        SendRegisterResult(msg.identity, plugin_type, std::string());
+        SendRegisterResult(msg.identity, plugin_type, false, false,
+                           "no plugin for plugin_type " + plugin_type, std::string());
         return;
     }
 
@@ -283,16 +289,19 @@ void Scheduler::HandleRegister(const IncomingMessage& msg) {
     try {
         if (!plugin->validateClient(client, reg.payload(), result)) {
             LOG_ERROR("plugin " << plugin_type << ": validateClient failed");
-            SendRegisterResult(msg.identity, plugin_type, result.reply_payload);
+            SendRegisterResult(msg.identity, plugin_type, true, false, result.reason,
+                               result.reply_payload);
             return;
         }
     } catch (const std::exception& e) {
         LOG_ERROR("plugin " << plugin_type << ": validateClient threw: " << e.what());
-        SendRegisterResult(msg.identity, plugin_type, std::string());
+        SendRegisterResult(msg.identity, plugin_type, true, false, "validateClient threw",
+                           std::string());
         return;
     } catch (...) {
         LOG_ERROR("plugin " << plugin_type << ": validateClient threw unknown exception");
-        SendRegisterResult(msg.identity, plugin_type, std::string());
+        SendRegisterResult(msg.identity, plugin_type, true, false,
+                           "validateClient threw unknown exception", std::string());
         return;
     }
 
@@ -301,7 +310,8 @@ void Scheduler::HandleRegister(const IncomingMessage& msg) {
         std::lock_guard<std::mutex> lock(clients_mutex_);
         clients_[msg.identity].registered = result.accepted;
     }
-    SendRegisterResult(msg.identity, plugin_type, result.reply_payload);
+    SendRegisterResult(msg.identity, plugin_type, true, result.accepted, result.reason,
+                       result.reply_payload);
     LOG_INFO("register: client " << msg.identity << " plugin_type=" << plugin_type
                                  << (result.accepted ? " accepted" : " rejected"));
 }
@@ -343,20 +353,37 @@ void Scheduler::HandleRequestTask(const IncomingMessage& msg) {
         }
     }
 
-    common::Task task;
-    bool has_task = false;
-    try {
-        has_task = plugin->requestTask(client, request.payload(), task);
-    } catch (const std::exception& e) {
-        LOG_ERROR("plugin " << plugin_type << ": requestTask threw: " << e.what());
-    } catch (...) {
-        LOG_ERROR("plugin " << plugin_type << ": requestTask threw unknown exception");
+    const int count = request.count();
+    if (count <= 0) {
+        LOG_WARN("request_task: invalid count " << count << " from " << msg.identity);
+        SendNoTask(msg.identity, plugin_type);
+        return;
     }
 
-    if (has_task) {
-        SendTask(plugin, msg.identity, task);
-    } else {
+    std::vector<common::Task> tasks;
+    tasks.reserve(static_cast<size_t>(count));
+    for (int i = 0; i < count; ++i) {
+        common::Task task;
+        bool has_task = false;
+        try {
+            has_task = plugin->requestTask(client, request.payload(), task);
+        } catch (const std::exception& e) {
+            LOG_ERROR("plugin " << plugin_type << ": requestTask threw: " << e.what());
+            break;
+        } catch (...) {
+            LOG_ERROR("plugin " << plugin_type << ": requestTask threw unknown exception");
+            break;
+        }
+        if (!has_task) {
+            break;
+        }
+        tasks.push_back(std::move(task));
+    }
+
+    if (tasks.empty()) {
         SendNoTask(msg.identity, plugin_type);
+    } else {
+        SendTasks(plugin, msg.identity, tasks);
     }
 }
 
@@ -683,23 +710,75 @@ void Scheduler::RunTimeoutChecks() {
 }
 
 void Scheduler::SendRegisterResult(const std::string& identity, const std::string& plugin_type,
+                                   bool plugin_found, bool accepted, const std::string& reason,
                                    const std::string& reply_payload) {
     common::Envelope env;
     env.set_type(common::REGISTER_RESULT);
     env.set_plugin_type(plugin_type);
     common::RegisterResult* result = env.mutable_register_result();
+    result->set_plugin_found(plugin_found);
+    result->set_accepted(accepted);
+    result->set_reason(reason);
     result->set_payload(reply_payload);
     server_.sendTo(identity, env);
 }
 
-void Scheduler::SendTask(common::TaskPlugin* plugin, const std::string& identity,
-                         const common::Task& task) {
+void Scheduler::HandleTaskReject(const IncomingMessage& msg) {
+    const common::TaskRejectCommand& reject = msg.envelope.task_reject();
+    TouchClient(msg.identity, msg.envelope.plugin_type());
+
+    std::string plugin_type;
+    std::vector<std::string> task_ids;
+    {
+        std::lock_guard<std::mutex> lock(in_flight_mutex_);
+        const auto it = in_flight_.find(reject.task_id());
+        if (it == in_flight_.end()) {
+            LOG_WARN("reject for unknown task " << reject.task_id() << " from "
+                                                << msg.identity);
+            return;
+        }
+        if (it->second.identity != msg.identity) {
+            LOG_WARN("reject for task " << reject.task_id() << " from " << msg.identity
+                                        << " (assigned to " << it->second.identity
+                                        << "), dropped");
+            return;
+        }
+        plugin_type = it->second.plugin_type;
+        task_ids.push_back(it->first);
+        in_flight_.erase(it);
+    }
+
+    if (storage_.enabled()) {
+        storage_.ReclaimTasks(task_ids);
+    }
+    const auto pit = plugins_by_type_.find(plugin_type);
+    if (pit != plugins_by_type_.end()) {
+        LOG_WARN("task rejected by client " << msg.identity << ": " << reject.task_id()
+                                            << " reason=" << reject.reason()
+                                            << ", requeue to plugin " << plugin_type);
+        try {
+            pit->second->requeue(task_ids);
+        } catch (const std::exception& e) {
+            LOG_ERROR("plugin " << plugin_type << ": requeue threw: " << e.what());
+        } catch (...) {
+            LOG_ERROR("plugin " << plugin_type << ": requeue threw unknown exception");
+        }
+    }
+}
+
+void Scheduler::SendTasks(common::TaskPlugin* plugin, const std::string& identity,
+                          const std::vector<common::Task>& tasks) {
     const auto it = active_runs_.find(plugin);
     if (it == active_runs_.end()) {
-        LOG_ERROR("no active run for plugin " << plugin->pluginType()
-                                              << ", returning task to the plugin");
+        LOG_ERROR("no active run for plugin " << plugin->pluginType() << ", returning "
+                                              << tasks.size() << " tasks to the plugin");
+        std::vector<std::string> task_ids;
+        task_ids.reserve(tasks.size());
+        for (const common::Task& task : tasks) {
+            task_ids.push_back(task.task_id());
+        }
         try {
-            plugin->requeue({task.task_id()});
+            plugin->requeue(task_ids);
         } catch (const std::exception& e) {
             LOG_ERROR("plugin " << plugin->pluginType()
                                 << ": requeue on send failure threw: " << e.what());
@@ -711,32 +790,41 @@ void Scheduler::SendTask(common::TaskPlugin* plugin, const std::string& identity
     }
     const RunContext& run = it->second;
 
-    {
-        std::lock_guard<std::mutex> lock(in_flight_mutex_);
-        if (in_flight_.count(task.task_id()) > 0) {
-            LOG_ERROR("task " << task.task_id()
-                              << " already in flight, duplicate dispatch dropped");
-            return;
-        }
-    }
-
     common::Envelope env;
     env.set_type(common::TASK);
     env.set_plugin_type(run.plugin_type);
     common::TaskCommand* cmd = env.mutable_task();
     cmd->set_run_id(run.run_id);
-    *cmd->mutable_task() = task;
 
-    server_.sendTo(identity, env);
+    std::vector<common::Task> accepted;
+    accepted.reserve(tasks.size());
     {
         std::lock_guard<std::mutex> lock(in_flight_mutex_);
-        in_flight_[task.task_id()] = {identity, run.plugin_type,
-                                      std::chrono::steady_clock::now(), false};
+        for (const common::Task& task : tasks) {
+            if (in_flight_.count(task.task_id()) > 0) {
+                LOG_ERROR("task " << task.task_id()
+                                  << " already in flight, duplicate dispatch dropped");
+                continue;
+            }
+            *cmd->add_tasks() = task;
+            in_flight_[task.task_id()] = {identity, run.plugin_type,
+                                          std::chrono::steady_clock::now(), false};
+            accepted.push_back(task);
+        }
     }
+    if (accepted.empty()) {
+        return;
+    }
+
+    server_.sendTo(identity, env);
     if (storage_.enabled()) {
-        storage_.SaveTask(task.task_id(), run.run_id, identity, task.payload());
+        for (const common::Task& task : accepted) {
+            storage_.SaveTask(task.task_id(), run.run_id, identity, task.payload());
+        }
     }
-    LOG_INFO("task " << task.task_id() << " -> client " << identity);
+    for (const common::Task& task : accepted) {
+        LOG_INFO("task " << task.task_id() << " -> client " << identity);
+    }
 }
 
 void Scheduler::SendNoTask(const std::string& identity, const std::string& plugin_type) {

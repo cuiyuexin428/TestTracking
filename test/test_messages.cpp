@@ -26,9 +26,12 @@ int main() {
 
     common::TaskCommand* cmd = env.mutable_task();
     cmd->set_run_id("run-1");
-    common::Task* task = cmd->mutable_task();
-    task->set_task_id("task-1");
-    task->set_payload("payload-bytes");
+    common::Task* task1 = cmd->add_tasks();
+    task1->set_task_id("task-1");
+    task1->set_payload("payload-bytes");
+    common::Task* task2 = cmd->add_tasks();
+    task2->set_task_id("task-2");
+    task2->set_payload("payload-2");
 
     std::string bytes;
     rc |= Check(env.SerializeToString(&bytes), "serialize envelope");
@@ -39,8 +42,24 @@ int main() {
     rc |= Check(parsed.plugin_type() == "coverage", "plugin_type preserved");
     rc |= Check(parsed.has_task(), "task present");
     rc |= Check(parsed.task().run_id() == "run-1", "run_id preserved");
-    rc |= Check(parsed.task().task().task_id() == "task-1", "task_id preserved");
-    rc |= Check(parsed.task().task().payload() == "payload-bytes", "payload preserved");
+    rc |= Check(parsed.task().tasks_size() == 2, "task count preserved");
+    rc |= Check(parsed.task().tasks(0).task_id() == "task-1", "task_id preserved");
+    rc |= Check(parsed.task().tasks(0).payload() == "payload-bytes", "payload preserved");
+    rc |= Check(parsed.task().tasks(1).task_id() == "task-2", "second task_id preserved");
+
+    // REQUEST_TASK: desired task count.
+    common::Envelope req;
+    req.set_type(common::REQUEST_TASK);
+    req.set_plugin_type("coverage");
+    common::RequestTaskCommand* request = req.mutable_request_task();
+    request->set_count(4);
+
+    std::string req_bytes;
+    rc |= Check(req.SerializeToString(&req_bytes), "serialize request task");
+    common::Envelope req_parsed;
+    rc |= Check(req_parsed.ParseFromString(req_bytes), "parse request task");
+    rc |= Check(req_parsed.has_request_task(), "request task present");
+    rc |= Check(req_parsed.request_task().count() == 4, "request count preserved");
 
     // REGISTER: opaque business payload, routed by envelope plugin_type.
     common::Envelope reg;
@@ -71,6 +90,16 @@ int main() {
     rc |= Check(result_parsed.register_result().payload() == "deploy-instructions",
                 "register result payload preserved");
 
+    result_env.mutable_register_result()->set_plugin_found(true);
+    result_env.mutable_register_result()->set_accepted(false);
+    result_env.mutable_register_result()->set_reason("deploy required");
+    rc |= Check(result_env.SerializeToString(&result_bytes), "serialize register result fields");
+    rc |= Check(result_parsed.ParseFromString(result_bytes), "parse register result fields");
+    rc |= Check(result_parsed.register_result().plugin_found(), "register result plugin_found");
+    rc |= Check(!result_parsed.register_result().accepted(), "register result accepted");
+    rc |= Check(result_parsed.register_result().reason() == "deploy required",
+                "register result reason");
+
     // STOP: server-initiated stop.
     common::Envelope stop;
     stop.set_type(common::STOP);
@@ -100,6 +129,23 @@ int main() {
     rc |= Check(ack_parsed.has_task_ack(), "task ack present");
     rc |= Check(ack_parsed.plugin_type() == "coverage", "task ack plugin_type");
     rc |= Check(ack_parsed.task_ack().task_id() == "task-1", "task ack task_id");
+
+    // TASK_REJECT: client cannot execute the task.
+    common::Envelope reject;
+    reject.set_type(common::TASK_REJECT);
+    reject.set_plugin_type("coverage");
+    reject.mutable_task_reject()->set_task_id("task-1");
+    reject.mutable_task_reject()->set_reason("plugin_type mismatch");
+
+    std::string reject_bytes;
+    rc |= Check(reject.SerializeToString(&reject_bytes), "serialize task reject");
+    common::Envelope reject_parsed;
+    rc |= Check(reject_parsed.ParseFromString(reject_bytes), "parse task reject");
+    rc |= Check(reject_parsed.has_task_reject(), "task reject present");
+    rc |= Check(reject_parsed.plugin_type() == "coverage", "task reject plugin_type");
+    rc |= Check(reject_parsed.task_reject().task_id() == "task-1", "task reject task_id");
+    rc |= Check(reject_parsed.task_reject().reason() == "plugin_type mismatch",
+                "task reject reason");
 
     // TASK_REPORT: execution report with opaque business result.
     common::Envelope report;

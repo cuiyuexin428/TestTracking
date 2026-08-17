@@ -107,6 +107,8 @@ bool SchedulerPlugin::plan(const common::RunRequest& request,
     waves_.clear();
     pending_.clear();
     pending_ids_.clear();
+    priority_pending_.clear();
+    priority_ids_.clear();
     wave_task_ids_.clear();
     task_client_.clear();
     tasks_by_id_.clear();
@@ -153,6 +155,13 @@ bool SchedulerPlugin::requestTask(const common::ClientInfo& client,
                                   const std::string& request_payload, common::Task& task) {
     (void)request_payload;
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!priority_pending_.empty()) {
+        task = priority_pending_.front();
+        priority_pending_.erase(priority_pending_.begin());
+        priority_ids_.erase(task.task_id());
+        task_client_[task.task_id()] = client.identity;
+        return true;
+    }
     if (pending_.empty()) {
         return false;
     }
@@ -168,14 +177,17 @@ void SchedulerPlugin::requeue(const std::vector<std::string>& task_ids) {
     for (const std::string& task_id : task_ids) {
         task_client_.erase(task_id);
         const auto spec_it = tasks_by_id_.find(task_id);
-        if (spec_it != tasks_by_id_.end()) {
-            if (pending_ids_.insert(task_id).second) {
-                pending_.push_back(spec_it->second);
-            } else {
-                LOG_WARN("coverage plugin: task already pending, skip requeue " << task_id);
-            }
+        if (spec_it == tasks_by_id_.end()) {
+            LOG_WARN("coverage plugin: cannot requeue unknown task " << task_id);
+            continue;
         }
-        LOG_WARN("coverage plugin: requeued " << task_id);
+        if (priority_ids_.count(task_id) == 0 && pending_ids_.count(task_id) == 0) {
+            priority_pending_.push_back(spec_it->second);
+            priority_ids_.insert(task_id);
+            LOG_WARN("coverage plugin: requeued to priority " << task_id);
+        } else {
+            LOG_WARN("coverage plugin: task already queued, skip requeue " << task_id);
+        }
     }
 }
 
@@ -214,6 +226,8 @@ void SchedulerPlugin::cancel() {
     waves_.clear();
     pending_.clear();
     pending_ids_.clear();
+    priority_pending_.clear();
+    priority_ids_.clear();
     wave_task_ids_.clear();
     task_client_.clear();
     tasks_by_id_.clear();
