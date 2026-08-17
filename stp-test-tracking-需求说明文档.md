@@ -351,7 +351,7 @@ public:
 
 | 模块 | 类/文件 | 功能 | 待改进项目 | 完成情况 |
 | --- | --- | --- | --- | --- |
-| 客户端插件 | CoverageClientPlugin（含 ExcuteEvent） | 执行任务：跑 OpenCppCoverage、解析 cobertura、写 CoverageStore、组装 FileCoverage 结果 | 1) 删除自建 EventManager 池、ExcuteEvent、pending_/files_/mutex_/cv_<br>2) task_threads 配置上移为客户端框架配置<br>3) execute 变为纯任务逻辑：单文件任务直跑，文件列表任务顺序执行 | 本轮（客户端框架之后），未动工 |
+| 客户端插件 | CoverageClientPlugin | 执行任务：跑 OpenCppCoverage、解析 cobertura、写 CoverageStore、组装 FileCoverage 结果 | 已完成：删除自建 EventManager 池、ExcuteEvent 与共享状态（pending_/files_/mutex_/cv_）；task_threads 上移为客户端框架配置；execute 为纯任务逻辑，文件列表顺序执行 | 本轮已实现 |
 | 服务端插件 | CoverageSchedulerPlugin | 波次/批次/任务池管理、注册校验、按请求给任务、波次结算与贪心选择 | 1) 任务粒度（单文件 vs 批）由插件内部决策，框架不感知<br>2) 清理 task_client_ 等死状态<br>3) MakePoint 路径哈希改 64 位（Fnv1a64），消除 4 万文件规模碰撞风险 | 保持/微调 |
 | 覆盖率存储 | CoverageStore（File/PostgreSQL 后端） | 波次点集、cov 工件、cumulative、selected、summary | PostgreSQL 后端跨平台（当前仅 Windows） | 已实现（Windows），待验证 |
 

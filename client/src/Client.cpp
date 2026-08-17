@@ -75,7 +75,7 @@ void Client::stop() {
     }
     executor_.stop();
     {
-        std::lock_guard<std::mutex> lock(state_mutex_);
+        std::lock_guard<std::mutex> lock(counters_mutex_);
         in_flight_ = 0;
         outstanding_requests_ = 0;
     }
@@ -307,25 +307,34 @@ void Client::RunStateMachine() {
         // request (registration gate only), so the client controls capacity.
         int free_slots = 0;
         {
-            std::lock_guard<std::mutex> lock(state_mutex_);
+            std::lock_guard<std::mutex> lock(counters_mutex_);
             free_slots = task_slots_ - in_flight_ - outstanding_requests_;
         }
         if (free_slots > 0 && now >= next_request_) {
             for (int i = 0; i < free_slots; ++i) {
-                SendRequestTask();
-                std::lock_guard<std::mutex> lock(state_mutex_);
-                ++outstanding_requests_;
+                if (SendRequestTask()) {
+                    std::lock_guard<std::mutex> lock(counters_mutex_);
+                    ++outstanding_requests_;
+                }
             }
         }
 
-        common::Envelope out;
-        while (outgoing_.pop(out, std::chrono::milliseconds(0))) {
-            std::string bytes;
-            if (out.SerializeToString(&bytes)) {
-                dealer_.sendMsg(bytes);
-            } else {
-                LOG_ERROR("client: failed to serialize outgoing envelope");
+        try {
+            common::Envelope out;
+            while (outgoing_.pop(out, std::chrono::milliseconds(0))) {
+                std::string bytes;
+                if (out.SerializeToString(&bytes)) {
+                    dealer_.sendMsg(bytes);
+                } else {
+                    LOG_ERROR("client: failed to serialize outgoing envelope");
+                }
             }
+        } catch (const std::exception& e) {
+            LOG_ERROR("client: fatal zmq error: " << e.what());
+            std::terminate();
+        } catch (...) {
+            LOG_ERROR("client: fatal zmq unknown error");
+            std::terminate();
         }
     }
 }
@@ -339,7 +348,7 @@ void Client::HandleEnvelope(const common::Envelope& env) {
             }
             break;
         case common::NO_TASK: {
-            std::lock_guard<std::mutex> lock(state_mutex_);
+            std::lock_guard<std::mutex> lock(counters_mutex_);
             if (outstanding_requests_ > 0) {
                 --outstanding_requests_;
                 if (outstanding_requests_ == 0) {
@@ -356,7 +365,7 @@ void Client::HandleEnvelope(const common::Envelope& env) {
         case common::WAKE:
             backoff_ = request_backoff_initial_;
             {
-                std::lock_guard<std::mutex> lock(state_mutex_);
+                std::lock_guard<std::mutex> lock(counters_mutex_);
                 next_request_ = std::chrono::steady_clock::now();
             }
             LOG_INFO("client: wake");
@@ -379,7 +388,7 @@ void Client::HandleStop() {
                     task_slots_);
     backoff_ = request_backoff_initial_;
     {
-        std::lock_guard<std::mutex> lock(state_mutex_);
+        std::lock_guard<std::mutex> lock(counters_mutex_);
         in_flight_ = 0;
         outstanding_requests_ = 0;
         next_request_ = std::chrono::steady_clock::now();
@@ -393,10 +402,6 @@ void Client::HandleMessage(const common::Envelope& env) {
         case common::REQUEST_TASK:
         case common::TASK_REPORT:
         case common::REGISTER:
-        case common::TASK:
-        case common::NO_TASK:
-        case common::WAKE:
-        case common::STOP:
         case common::TASK_ACK:
             LOG_WARN("client: unexpected message type " << env.type());
             break;
@@ -408,16 +413,18 @@ void Client::HandleMessage(const common::Envelope& env) {
 
 void Client::OnTaskCompleted(const common::TaskResult& result) {
     completed_results_.push(result);
-    std::lock_guard<std::mutex> lock(state_mutex_);
+    std::lock_guard<std::mutex> lock(counters_mutex_);
     --in_flight_;
 }
 
 void Client::HandleTask(const common::TaskCommand& command, const std::string& plugin_type) {
     LOG_INFO("client: task " << command.task().task_id() << " plugin_type=" << plugin_type
                              << " run=" << command.run_id());
+    // Defensive: after a successful registration the client and server agree
+    // on plugin_type, so this path should be unreachable.
     if (plugin_ != nullptr && plugin_type != plugin_->pluginType()) {
         LOG_WARN("client: plugin_type mismatch, ignoring task " << command.task().task_id());
-        std::lock_guard<std::mutex> lock(state_mutex_);
+        std::lock_guard<std::mutex> lock(counters_mutex_);
         if (outstanding_requests_ > 0) {
             --outstanding_requests_;
         }
@@ -431,7 +438,7 @@ void Client::HandleTask(const common::TaskCommand& command, const std::string& p
     outgoing_.push(std::move(ack));
 
     executor_.push(command.task());
-    std::lock_guard<std::mutex> lock(state_mutex_);
+    std::lock_guard<std::mutex> lock(counters_mutex_);
     if (outstanding_requests_ > 0) {
         --outstanding_requests_;
     }
@@ -445,7 +452,7 @@ void Client::SendHeartbeat() {
     common::Heartbeat* heartbeat = env.mutable_heartbeat();
     heartbeat->set_ip(ip_);
     {
-        std::lock_guard<std::mutex> lock(state_mutex_);
+        std::lock_guard<std::mutex> lock(counters_mutex_);
         heartbeat->set_status(in_flight_ > 0 ? common::Heartbeat::BUSY
                                              : common::Heartbeat::IDLE);
     }
@@ -464,18 +471,24 @@ void Client::SendHeartbeat() {
 #endif
 
     std::string bytes;
-    if (env.SerializeToString(&bytes)) {
-        try {
-            dealer_.sendMsg(bytes);
-        } catch (const std::exception& e) {
-            LOG_ERROR("client: send heartbeat failed: " << e.what());
-        }
+    if (!env.SerializeToString(&bytes)) {
+        LOG_ERROR("client: failed to serialize HEARTBEAT");
+        return;
+    }
+    try {
+        dealer_.sendMsg(bytes);
+    } catch (const std::exception& e) {
+        LOG_ERROR("client: fatal zmq error: " << e.what());
+        std::terminate();
+    } catch (...) {
+        LOG_ERROR("client: fatal zmq unknown error");
+        std::terminate();
     }
 }
 
-void Client::SendRequestTask() {
+bool Client::SendRequestTask() {
     if (plugin_ == nullptr) {
-        return;
+        return false;
     }
     common::Envelope env;
     env.set_type(common::REQUEST_TASK);
@@ -483,13 +496,20 @@ void Client::SendRequestTask() {
     common::RequestTaskCommand* request = env.mutable_request_task();
 
     std::string bytes;
-    if (env.SerializeToString(&bytes)) {
-        try {
-            dealer_.sendMsg(bytes);
-        } catch (const std::exception& e) {
-            LOG_ERROR("client: send request_task failed: " << e.what());
-        }
+    if (!env.SerializeToString(&bytes)) {
+        LOG_ERROR("client: failed to serialize REQUEST_TASK");
+        return false;
     }
+    try {
+        dealer_.sendMsg(bytes);
+    } catch (const std::exception& e) {
+        LOG_ERROR("client: fatal zmq error: " << e.what());
+        std::terminate();
+    } catch (...) {
+        LOG_ERROR("client: fatal zmq unknown error");
+        std::terminate();
+    }
+    return true;
 }
 
 void Client::SendTaskReport(const common::TaskResult& result) {

@@ -166,22 +166,12 @@ bool ParseCobertura(const std::string& xml_path, std::vector<std::uint64_t>& poi
 
 }  // namespace
 
-ExcuteEvent::ExcuteEvent(std::function<void()> action) : action_(std::move(action)) {
-}
-
-void ExcuteEvent::execute() {
-    if (action_) {
-        action_();
-    }
-}
-
 std::string ClientPlugin::pluginType() const {
     return "coverage";
 }
 
 bool ClientPlugin::init(const std::string& config) {
     const nlohmann::json cfg = nlohmann::json::parse(config);
-    task_threads_ = cfg.value("task_threads", 0);
     dry_run_ = cfg.value("dry_run", true);
     stp_root_ = cfg.value("stp_root", std::string());
     program_dir_ = cfg.value("program_dir", std::string());
@@ -200,9 +190,6 @@ bool ClientPlugin::init(const std::string& config) {
     if (!export_dir_.empty()) {
         std::error_code ec;
         std::filesystem::create_directories(export_dir_, ec);
-    }
-    if (task_threads_ > 0) {
-        pool_ = std::make_unique<common::EventManager>(task_threads_);
     }
 
     store_ = CreateCoverageStore(config);
@@ -306,40 +293,6 @@ bool ClientPlugin::RunOneFile(const std::string& run_id, int wave, const std::st
     return true;
 }
 
-void ClientPlugin::RunFileAction(const coverage::CoverageTask& cov_task,
-                                 const std::string& file) {
-    coverage::FileCoverage entry;
-    entry.set_file(file);
-
-    std::vector<std::uint64_t> points;
-    bool ok = false;
-    if (dry_run_) {
-        points = SyntheticPoints(file);
-        ok = true;
-    } else {
-        ok = RunOneFile(cov_task.run_id(), cov_task.wave_id(), file, points);
-    }
-    // The same (path, line) can appear once per module; dedupe so counts
-    // and the point sets are exact.
-    std::sort(points.begin(), points.end());
-    points.erase(std::unique(points.begin(), points.end()), points.end());
-    if (ok) {
-        store_->saveFileCoverage(cov_task.run_id(), cov_task.wave_id(), file, points);
-    }
-
-    entry.set_ok(ok);
-    entry.set_covered_lines(static_cast<std::int32_t>(points.size()));
-    LOG_INFO("coverage plugin: file " << file << (ok ? " ok" : " failed")
-                                      << " covered_lines=" << points.size());
-
-    std::lock_guard<std::mutex> lock(mutex_);
-    files_.push_back(std::move(entry));
-    --pending_;
-    if (pending_ == 0) {
-        cv_.notify_all();
-    }
-}
-
 bool ClientPlugin::execute(const common::Task& task, common::TaskResult& result) {
     coverage::CoverageTask cov_task;
     if (!cov_task.ParseFromString(task.payload())) {
@@ -347,32 +300,39 @@ bool ClientPlugin::execute(const common::Task& task, common::TaskResult& result)
         return false;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        pending_ = static_cast<int>(cov_task.files_size());
-        files_.clear();
-        files_.reserve(static_cast<size_t>(cov_task.files_size()));
-    }
-
-    for (const std::string& file : cov_task.files()) {
-        auto action = [this, cov_task, file] { RunFileAction(cov_task, file); };
-        if (pool_ != nullptr) {
-            pool_->push(new ExcuteEvent(std::move(action)));
-        } else {
-            action();
-        }
-    }
-
-    {
-        std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait(lock, [this] { return pending_ == 0; });
-    }
-
     coverage::CoverageResult coverage_result;
-    for (const coverage::FileCoverage& entry : files_) {
+    for (const std::string& file : cov_task.files()) {
+        coverage::FileCoverage entry;
+        entry.set_file(file);
+
+        std::vector<std::uint64_t> points;
+        bool ok = false;
+        if (dry_run_) {
+            points = SyntheticPoints(file);
+            ok = true;
+        } else {
+            ok = RunOneFile(cov_task.run_id(), cov_task.wave_id(), file, points);
+        }
+        // The same (path, line) can appear once per module; dedupe so counts
+        // and the point sets are exact.
+        std::sort(points.begin(), points.end());
+        points.erase(std::unique(points.begin(), points.end()), points.end());
+        if (ok) {
+            store_->saveFileCoverage(cov_task.run_id(), cov_task.wave_id(), file, points);
+        }
+
+        entry.set_ok(ok);
+        entry.set_covered_lines(static_cast<std::int32_t>(points.size()));
+        LOG_INFO("coverage plugin: file " << file << (ok ? " ok" : " failed")
+                                          << " covered_lines=" << points.size());
         *coverage_result.add_files() = entry;
     }
-    coverage_result.SerializeToString(result.mutable_result());
+
+    if (!coverage_result.SerializeToString(result.mutable_result())) {
+        LOG_ERROR("coverage plugin: failed to serialize task result " << task.task_id());
+        result.set_exit_code(-1);
+        return false;
+    }
     result.set_exit_code(0);
     return true;
 }

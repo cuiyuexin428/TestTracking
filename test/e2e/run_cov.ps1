@@ -43,12 +43,11 @@ Set-Content -Path "$ws\scheduler.json" -Value $schedCfg -Encoding UTF8
 
 $clientCfg = @{
     scheduler = @{ endpoint = $endpoint; poll_timeout_ms = 50 }
-    client = @{ worker_id = 'worker-e2e'; heartbeat_interval_ms = 500; request_backoff_initial_ms = 200 }
+    client = @{ worker_id = 'worker-e2e'; heartbeat_interval_ms = 500; request_backoff_initial_ms = 200; task_threads = 2 }
     plugins = @{
         demo = @{ dll = 'demo.dll'; enabled = $false }
         coverage = @{
             dll = 'coverage.dll'; enabled = $true
-            task_threads = 2
             dry_run = $true
             store_dir = $storeDir
             program_version = '0.9'

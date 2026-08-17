@@ -13,7 +13,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace client {
@@ -70,7 +69,7 @@ private:
     void HandleStop();
     void OnTaskCompleted(const common::TaskResult& result);
     void SendHeartbeat();
-    void SendRequestTask();
+    bool SendRequestTask();
     void SendTaskReport(const common::TaskResult& result);
 
     common::Config& config_;
@@ -85,7 +84,7 @@ private:
     common::BlockingQueue<common::Envelope> outgoing_;
 
     // Shared with the executor thread.
-    mutable std::mutex state_mutex_;
+    mutable std::mutex counters_mutex_;
     int in_flight_ = 0;
     int outstanding_requests_ = 0;
     int task_slots_ = 1;

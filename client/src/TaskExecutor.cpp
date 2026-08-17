@@ -37,6 +37,9 @@ void TaskExecutor::start(common::WorkerPlugin* plugin, CompletionCallback on_com
         throw std::invalid_argument("TaskExecutor: thread_count must be >= 1");
     }
     std::lock_guard<std::mutex> lock(mutex_);
+    if (pool_ != nullptr) {
+        throw std::logic_error("TaskExecutor: already started");
+    }
     plugin_ = plugin;
     on_completed_ = std::move(on_completed);
     cancelled_.store(false);

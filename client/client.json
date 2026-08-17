@@ -16,7 +16,6 @@
     "coverage": {
       "dll": "coverage.dll",
       "enabled": true,
-      "task_threads": 0,
       "dry_run": true,
       "store_dir": "coverage_store",
       "stp_root": "D:/stp_set",
