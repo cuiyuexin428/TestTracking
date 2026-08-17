@@ -50,6 +50,15 @@ public:
     // Scheduler side: upserts the run summary (total/selected/cumulative).
     virtual void saveRunSummary(const std::string& run_id, int total_files,
                                 int selected_files, std::int64_t cumulative_points) = 0;
+
+    // Scheduler side: persists/loads the run checkpoint blob (plugin-defined
+    // serialized state) used to resume after STOP or crash.
+    virtual void saveCheckpoint(const std::string& run_id, const std::string& blob) = 0;
+    virtual bool loadCheckpoint(const std::string& run_id, std::string* blob) = 0;
+
+    // Scheduler side: loads the cumulative point set saved after a settled
+    // wave; empty when the wave does not exist.
+    virtual std::vector<std::uint64_t> loadCumulative(const std::string& run_id, int wave) = 0;
 };
 
 // Creates the default (file-based) store implementation.

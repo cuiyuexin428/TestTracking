@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -62,10 +63,42 @@ void Scheduler::start() {
         if (!storage_.init(db_conn)) {
             throw std::runtime_error("Scheduler: storage init failed");
         }
-        // Mark runs that were left running by a previous scheduler process.
-        for (const std::string& run_id : storage_.LoadUnfinishedRunIds()) {
-            LOG_WARN("storage: run " << run_id << " was interrupted, marked interrupted");
-            storage_.FinishRun(run_id, "interrupted");
+        // Try to resume runs left running/stopped by a previous process;
+        // runs that cannot be restored are marked interrupted.
+        std::unordered_set<std::string> restored_plugins;
+        for (const Storage::RunRecord& run : storage_.LoadUnfinishedRuns()) {
+            const auto pit = plugins_by_type_.find(run.plugin_type);
+            if (pit == plugins_by_type_.end()) {
+                LOG_WARN("storage: run " << run.run_id << " plugin_type=" << run.plugin_type
+                                         << " has no loaded plugin, marked interrupted");
+                storage_.FinishRun(run.run_id, "interrupted");
+                continue;
+            }
+            if (!restored_plugins.insert(run.plugin_type).second) {
+                LOG_WARN("storage: run " << run.run_id << " skipped, plugin "
+                                         << run.plugin_type << " already restored");
+                storage_.FinishRun(run.run_id, "interrupted");
+                continue;
+            }
+            bool restored = false;
+            try {
+                restored = pit->second->restore(run.run_id);
+            } catch (const std::exception& e) {
+                LOG_ERROR("plugin " << run.plugin_type << ": restore threw: " << e.what());
+            } catch (...) {
+                LOG_ERROR("plugin " << run.plugin_type
+                                    << ": restore threw unknown exception");
+            }
+            if (restored) {
+                storage_.ResumeRun(run.run_id);
+                active_runs_[pit->second] = {run.run_id, run.plugin_type};
+                LOG_INFO("run restored: " << run.run_id
+                                          << " plugin_type=" << run.plugin_type);
+            } else {
+                LOG_WARN("storage: run " << run.run_id
+                                         << " cannot be restored, marked interrupted");
+                storage_.FinishRun(run.run_id, "interrupted");
+            }
         }
     }
     server_.start();
@@ -528,6 +561,17 @@ void Scheduler::HandleStopRun(const StopRunCommand& command) {
         ReclaimClientTasks(identity);
         server_.sendTo(identity, env);
         LOG_INFO("stop sent to client " << identity);
+    }
+
+    try {
+        if (!plugin->saveCheckpoint(run_id)) {
+            LOG_ERROR("plugin " << command.plugin_type << ": saveCheckpoint failed");
+        }
+    } catch (const std::exception& e) {
+        LOG_ERROR("plugin " << command.plugin_type << ": saveCheckpoint threw: " << e.what());
+    } catch (...) {
+        LOG_ERROR("plugin " << command.plugin_type
+                            << ": saveCheckpoint threw unknown exception");
     }
 
     try {

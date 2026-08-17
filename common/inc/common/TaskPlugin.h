@@ -76,6 +76,16 @@ public:
 
     // Return in-flight tasks of offline clients to the plugin.
     virtual void requeue(const std::vector<std::string>& task_ids) = 0;
+
+    // Persist the current run state so it can be resumed after a stop or
+    // crash. Called by the framework before cancel() on STOP; plugins may
+    // also save continuously. Return false if nothing could be saved.
+    virtual bool saveCheckpoint(const std::string& run_id) = 0;
+
+    // Rebuild the run state from a previously saved checkpoint. Called by
+    // the framework at scheduler startup for unfinished runs. Return false
+    // when the run cannot be resumed.
+    virtual bool restore(const std::string& run_id) = 0;
 };
 
 // DLL entry points (extern "C", exported):

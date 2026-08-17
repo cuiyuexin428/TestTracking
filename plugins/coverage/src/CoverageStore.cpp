@@ -167,6 +167,53 @@ public:
         }
     }
 
+    void saveCheckpoint(const std::string& run_id, const std::string& blob) override {
+        const std::filesystem::path dir(store_dir_);
+        std::error_code ec;
+        std::filesystem::create_directories(dir / run_id, ec);
+        std::ofstream out((dir / run_id / "checkpoint.bin").string(), std::ios::binary);
+        if (out.is_open()) {
+            out.write(blob.data(), static_cast<std::streamsize>(blob.size()));
+        }
+    }
+
+    bool loadCheckpoint(const std::string& run_id, std::string* blob) override {
+        std::ifstream in((std::filesystem::path(store_dir_) / run_id / "checkpoint.bin").string(),
+                         std::ios::binary | std::ios::ate);
+        if (!in.is_open()) {
+            return false;
+        }
+        const std::streamsize size = in.tellg();
+        blob->assign(static_cast<size_t>(size), '\0');
+        in.seekg(0);
+        if (size > 0) {
+            in.read(&(*blob)[0], size);
+        }
+        return true;
+    }
+
+    std::vector<std::uint64_t> loadCumulative(const std::string& run_id, int wave) override {
+        std::vector<std::uint64_t> out;
+        if (wave < 0) {
+            return out;
+        }
+        std::ifstream in((std::filesystem::path(store_dir_) / run_id /
+                          ("cumulative-" + std::to_string(wave) + ".json"))
+                             .string());
+        if (!in.is_open()) {
+            return out;
+        }
+        const nlohmann::json json = nlohmann::json::parse(in, nullptr, false);
+        if (json.is_discarded() || !json.contains("points")) {
+            return out;
+        }
+        out.reserve(json["points"].size());
+        for (const nlohmann::json& point : json["points"]) {
+            out.push_back(point.get<std::uint64_t>());
+        }
+        return out;
+    }
+
 private:
     std::string store_dir_;
 };
@@ -358,6 +405,77 @@ public:
                 {std::to_string(cumulative_points), false}});
     }
 
+    void saveCheckpoint(const std::string& run_id, const std::string& blob) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        PgExec(conn_,
+               "INSERT INTO coverage_checkpoints(run_id, blob) VALUES($1,$2) "
+               "ON CONFLICT (run_id) DO UPDATE SET blob=EXCLUDED.blob, updated_at=now()",
+               {{run_id, false}, {blob, true}});
+    }
+
+    bool loadCheckpoint(const std::string& run_id, std::string* blob) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const char* sql = "SELECT blob FROM coverage_checkpoints WHERE run_id=$1";
+        const std::vector<PgParam> params = {{run_id, false}};
+        std::vector<const char*> values;
+        std::vector<int> lengths;
+        std::vector<int> formats;
+        for (const PgParam& p : params) {
+            values.push_back(p.value.data());
+            lengths.push_back(static_cast<int>(p.value.size()));
+            formats.push_back(0);
+        }
+        PGresult* result =
+            PQexecParams(conn_, sql, static_cast<int>(params.size()), nullptr, values.data(),
+                         lengths.data(), formats.data(), 0);
+        bool ok = false;
+        if (result != nullptr && PQresultStatus(result) == PGRES_TUPLES_OK &&
+            PQntuples(result) > 0) {
+            *blob = DecodeByteaText(PQgetvalue(result, 0, 0), PQgetlength(result, 0, 0));
+            ok = true;
+        } else {
+            LOG_ERROR("coverage store: loadCheckpoint failed: "
+                      << (result ? PQresultErrorMessage(result) : PQerrorMessage(conn_)));
+        }
+        PQclear(result);
+        return ok;
+    }
+
+    std::vector<std::uint64_t> loadCumulative(const std::string& run_id, int wave) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<std::uint64_t> out;
+        if (wave < 0) {
+            return out;
+        }
+        const char* sql =
+            "SELECT points FROM coverage_cumulative WHERE run_id=$1 AND wave_id=$2";
+        const std::vector<PgParam> params = {{run_id, false}, {std::to_string(wave), false}};
+        std::vector<const char*> values;
+        std::vector<int> lengths;
+        std::vector<int> formats;
+        for (const PgParam& p : params) {
+            values.push_back(p.value.data());
+            lengths.push_back(static_cast<int>(p.value.size()));
+            formats.push_back(0);
+        }
+        PGresult* result =
+            PQexecParams(conn_, sql, static_cast<int>(params.size()), nullptr, values.data(),
+                         lengths.data(), formats.data(), 0);
+        if (result != nullptr && PQresultStatus(result) == PGRES_TUPLES_OK &&
+            PQntuples(result) > 0) {
+            const std::string blob =
+                DecodeByteaText(PQgetvalue(result, 0, 0), PQgetlength(result, 0, 0));
+            for (std::uint64_t p : UnpackPoints(blob)) {
+                out.push_back(p);
+            }
+        } else {
+            LOG_ERROR("coverage store: loadCumulative failed: "
+                      << (result ? PQresultErrorMessage(result) : PQerrorMessage(conn_)));
+        }
+        PQclear(result);
+        return out;
+    }
+
 private:
     void EnsureSchema() {
         const char* ddl =
@@ -375,7 +493,10 @@ private:
             " selected_at timestamptz DEFAULT now(), PRIMARY KEY (run_id, file));"
             "CREATE TABLE IF NOT EXISTS coverage_run_summary ("
             " run_id text PRIMARY KEY, total_files int, selected_files int,"
-            " cumulative_points bigint, finished_at timestamptz);";
+            " cumulative_points bigint, finished_at timestamptz);"
+            "CREATE TABLE IF NOT EXISTS coverage_checkpoints ("
+            " run_id text PRIMARY KEY, blob bytea NOT NULL,"
+            " updated_at timestamptz DEFAULT now());";
         PGresult* result = PQexec(conn_, ddl);
         if (result == nullptr || PQresultStatus(result) != PGRES_COMMAND_OK) {
             LOG_ERROR("coverage store: schema init failed: "

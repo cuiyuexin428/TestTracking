@@ -91,20 +91,32 @@ void Storage::FinishRun(const std::string& run_id, const std::string& status) {
          {{run_id, false}, {status, false}});
 }
 
-std::vector<std::string> Storage::LoadUnfinishedRunIds() {
+std::vector<Storage::RunRecord> Storage::LoadUnfinishedRuns() {
     std::lock_guard<std::mutex> lock(mutex_);
-    std::vector<std::string> ids;
+    std::vector<RunRecord> runs;
     if (conn_ == nullptr) {
-        return ids;
+        return runs;
     }
-    PGresult* result = PQexec(conn_, "SELECT run_id FROM runs WHERE status='running'");
+    PGresult* result =
+        PQexec(conn_, "SELECT run_id, plugin_type, dataset_version, params FROM runs "
+                      "WHERE status IN ('running','stopped') ORDER BY created_at DESC");
     if (result != nullptr && PQresultStatus(result) == PGRES_TUPLES_OK) {
         for (int i = 0; i < PQntuples(result); ++i) {
-            ids.emplace_back(PQgetvalue(result, i, 0));
+            RunRecord run;
+            run.run_id = PQgetvalue(result, i, 0);
+            run.plugin_type = PQgetvalue(result, i, 1);
+            run.dataset_version = PQgetvalue(result, i, 2);
+            run.params = PQgetvalue(result, i, 3);
+            runs.push_back(std::move(run));
         }
     }
     PQclear(result);
-    return ids;
+    return runs;
+}
+
+void Storage::ResumeRun(const std::string& run_id) {
+    Exec("UPDATE runs SET status='running', finished_at=NULL WHERE run_id=$1",
+         {{run_id, false}});
 }
 
 void Storage::SaveTask(const std::string& task_id, const std::string& run_id,

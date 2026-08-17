@@ -32,8 +32,12 @@ public:
     bool runFinished() override;
     void cancel() override;
     void requeue(const std::vector<std::string>& task_ids) override;
+    bool saveCheckpoint(const std::string& run_id) override;
+    bool restore(const std::string& run_id) override;
 
 private:
+    bool BuildWaves(const std::string& run_id);
+    void SaveCheckpointLocked();
     void SettleWave();
 
     std::mutex mutex_;

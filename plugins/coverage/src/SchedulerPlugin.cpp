@@ -72,11 +72,7 @@ bool SchedulerPlugin::validateClient(const common::ClientInfo& client,
     return true;
 }
 
-bool SchedulerPlugin::plan(const common::RunRequest& request,
-                           const std::vector<common::ClientInfo>& clients) {
-    (void)clients;
-    std::lock_guard<std::mutex> lock(mutex_);
-
+bool SchedulerPlugin::BuildWaves(const std::string& run_id) {
     std::vector<std::pair<std::string, std::uint64_t>> files;
     std::ifstream in(manifest_path_);
     if (!in.is_open()) {
@@ -103,8 +99,41 @@ bool SchedulerPlugin::plan(const common::RunRequest& request,
     std::sort(files.begin(), files.end(),
               [](const auto& a, const auto& b) { return a.second < b.second; });
 
-    run_id_ = request.run_id;
     waves_.clear();
+    for (size_t start = 0; start < files.size(); start += static_cast<size_t>(batch_size_)) {
+        const size_t end = std::min(start + static_cast<size_t>(batch_size_), files.size());
+        std::vector<common::Task> wave_tasks;
+        const size_t wave_index = waves_.size();
+        for (size_t t = start; t < end; t += static_cast<size_t>(task_size_)) {
+            const size_t tend = std::min(t + static_cast<size_t>(task_size_), end);
+            coverage::CoverageTask task;
+            task.set_run_id(run_id);
+            task.set_wave_id(static_cast<std::int32_t>(wave_index));
+            for (size_t i = t; i < tend; ++i) {
+                task.add_files(files[i].first);
+            }
+
+            common::Task spec;
+            spec.set_task_id(run_id + "-w" + std::to_string(wave_index) + "-t" +
+                             std::to_string(wave_tasks.size()));
+            task.SerializeToString(spec.mutable_payload());
+            wave_tasks.push_back(std::move(spec));
+        }
+        waves_.push_back(std::move(wave_tasks));
+    }
+    total_files_ = files.size();
+    return true;
+}
+
+bool SchedulerPlugin::plan(const common::RunRequest& request,
+                           const std::vector<common::ClientInfo>& clients) {
+    (void)clients;
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    run_id_ = request.run_id;
+    if (!BuildWaves(run_id_)) {
+        return false;
+    }
     pending_.clear();
     pending_ids_.clear();
     priority_pending_.clear();
@@ -114,30 +143,7 @@ bool SchedulerPlugin::plan(const common::RunRequest& request,
     tasks_by_id_.clear();
     cumulative_.clear();
     current_wave_ = 0;
-    total_files_ = files.size();
     selected_count_ = 0;
-
-    for (size_t start = 0; start < files.size(); start += static_cast<size_t>(batch_size_)) {
-        const size_t end = std::min(start + static_cast<size_t>(batch_size_), files.size());
-        std::vector<common::Task> wave_tasks;
-        const size_t wave_index = waves_.size();
-        for (size_t t = start; t < end; t += static_cast<size_t>(task_size_)) {
-            const size_t tend = std::min(t + static_cast<size_t>(task_size_), end);
-            coverage::CoverageTask task;
-            task.set_run_id(request.run_id);
-            task.set_wave_id(static_cast<std::int32_t>(wave_index));
-            for (size_t i = t; i < tend; ++i) {
-                task.add_files(files[i].first);
-            }
-
-            common::Task spec;
-            spec.set_task_id(run_id_ + "-w" + std::to_string(wave_index) + "-t" +
-                             std::to_string(wave_tasks.size()));
-            task.SerializeToString(spec.mutable_payload());
-            wave_tasks.push_back(std::move(spec));
-        }
-        waves_.push_back(std::move(wave_tasks));
-    }
 
     pending_ = waves_[0];
     for (const common::Task& task : pending_) {
@@ -145,6 +151,7 @@ bool SchedulerPlugin::plan(const common::RunRequest& request,
         pending_ids_.insert(task.task_id());
         tasks_by_id_[task.task_id()] = task;
     }
+    SaveCheckpointLocked();
     LOG_INFO("coverage plugin: planned " << total_files_ << " files, " << waves_.size()
                                          << " waves, " << pending_.size()
                                          << " tasks in first wave");
@@ -191,6 +198,131 @@ void SchedulerPlugin::requeue(const std::vector<std::string>& task_ids) {
     }
 }
 
+void SchedulerPlugin::SaveCheckpointLocked() {
+    if (run_id_.empty()) {
+        return;
+    }
+    coverage::CoverageCheckpoint ckpt;
+    ckpt.set_current_wave(static_cast<std::int32_t>(current_wave_));
+    ckpt.set_total_files(static_cast<std::int32_t>(total_files_));
+    ckpt.set_selected_files(static_cast<std::int32_t>(selected_count_));
+    for (const std::string& task_id : wave_task_ids_) {
+        if (priority_ids_.count(task_id) > 0) {
+            continue;
+        }
+        const auto it = tasks_by_id_.find(task_id);
+        if (it == tasks_by_id_.end()) {
+            continue;
+        }
+        std::string bytes;
+        it->second.SerializeToString(&bytes);
+        ckpt.add_remaining_tasks(bytes);
+    }
+    for (const std::string& task_id : priority_ids_) {
+        const auto it = tasks_by_id_.find(task_id);
+        if (it == tasks_by_id_.end()) {
+            continue;
+        }
+        std::string bytes;
+        it->second.SerializeToString(&bytes);
+        ckpt.add_priority_tasks(bytes);
+    }
+    std::string blob;
+    if (!ckpt.SerializeToString(&blob)) {
+        LOG_ERROR("coverage plugin: failed to serialize checkpoint for run " << run_id_);
+        return;
+    }
+    store_->saveCheckpoint(run_id_, blob);
+}
+
+bool SchedulerPlugin::saveCheckpoint(const std::string& run_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (run_id_ != run_id) {
+        LOG_WARN("coverage plugin: saveCheckpoint run mismatch, current=" << run_id_
+                                                                         << " asked=" << run_id);
+        return false;
+    }
+    SaveCheckpointLocked();
+    return true;
+}
+
+bool SchedulerPlugin::restore(const std::string& run_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::string blob;
+    if (!store_->loadCheckpoint(run_id, &blob)) {
+        LOG_WARN("coverage plugin: no checkpoint for run " << run_id);
+        return false;
+    }
+    coverage::CoverageCheckpoint ckpt;
+    if (!ckpt.ParseFromString(blob)) {
+        LOG_ERROR("coverage plugin: unparseable checkpoint for run " << run_id);
+        return false;
+    }
+    if (!BuildWaves(run_id)) {
+        LOG_ERROR("coverage plugin: restore failed to rebuild waves for run " << run_id);
+        return false;
+    }
+
+    run_id_ = run_id;
+    pending_.clear();
+    pending_ids_.clear();
+    priority_pending_.clear();
+    priority_ids_.clear();
+    wave_task_ids_.clear();
+    task_client_.clear();
+    tasks_by_id_.clear();
+    cumulative_.clear();
+    current_wave_ = static_cast<size_t>(ckpt.current_wave());
+    total_files_ = static_cast<size_t>(ckpt.total_files());
+    selected_count_ = static_cast<size_t>(ckpt.selected_files());
+
+    if (current_wave_ >= waves_.size()) {
+        LOG_INFO("coverage plugin: run " << run_id << " checkpoint marks run finished");
+        return true;
+    }
+
+    for (const std::string& bytes : ckpt.remaining_tasks()) {
+        common::Task task;
+        if (!task.ParseFromString(bytes)) {
+            LOG_ERROR("coverage plugin: unparseable remaining task in checkpoint");
+            return false;
+        }
+        pending_.push_back(task);
+        pending_ids_.insert(task.task_id());
+        wave_task_ids_.insert(task.task_id());
+        tasks_by_id_[task.task_id()] = task;
+    }
+    for (const std::string& bytes : ckpt.priority_tasks()) {
+        common::Task task;
+        if (!task.ParseFromString(bytes)) {
+            LOG_ERROR("coverage plugin: unparseable priority task in checkpoint");
+            return false;
+        }
+        priority_pending_.push_back(task);
+        priority_ids_.insert(task.task_id());
+        wave_task_ids_.insert(task.task_id());
+        tasks_by_id_[task.task_id()] = task;
+    }
+    for (size_t wave = current_wave_ + 1; wave < waves_.size(); ++wave) {
+        for (const common::Task& task : waves_[wave]) {
+            tasks_by_id_[task.task_id()] = task;
+        }
+    }
+
+    if (current_wave_ < waves_.size() && wave_task_ids_.empty()) {
+        LOG_ERROR("coverage plugin: checkpoint for run " << run_id
+                                                         << " has no remaining tasks in an "
+                                                            "active wave, restore rejected");
+        return false;
+    }
+    const std::vector<std::uint64_t> points =
+        store_->loadCumulative(run_id, static_cast<int>(current_wave_) - 1);
+    cumulative_.insert(points.begin(), points.end());
+    LOG_INFO("coverage plugin: run restored " << run_id << " wave=" << current_wave_
+                                              << " remaining=" << wave_task_ids_.size());
+    return true;
+}
+
 void SchedulerPlugin::processResult(const common::TaskResult& result) {
     coverage::CoverageResult coverage_result;
     int covered_lines = 0;
@@ -214,6 +346,7 @@ void SchedulerPlugin::processResult(const common::TaskResult& result) {
     if (wave_task_ids_.empty()) {
         SettleWave();
     }
+    SaveCheckpointLocked();
 }
 
 bool SchedulerPlugin::runFinished() {
@@ -292,6 +425,7 @@ void SchedulerPlugin::SettleWave() {
         for (const common::Task& task : pending_) {
             wave_task_ids_.insert(task.task_id());
             pending_ids_.insert(task.task_id());
+            tasks_by_id_[task.task_id()] = task;
         }
         LOG_INFO("coverage plugin: wave " << current_wave_ << " started, " << pending_.size()
                                           << " tasks");

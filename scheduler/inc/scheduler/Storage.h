@@ -16,6 +16,13 @@ namespace scheduler {
 // Writes are best-effort; failures are logged, never fatal. Thread-safe.
 class Storage {
 public:
+    struct RunRecord {
+        std::string run_id;
+        std::string plugin_type;
+        std::string dataset_version;
+        std::string params;
+    };
+
     Storage() = default;
     ~Storage();
 
@@ -32,7 +39,8 @@ public:
     void SaveRun(const std::string& run_id, const std::string& plugin_type,
                  const std::string& dataset_version, const std::string& params);
     void FinishRun(const std::string& run_id, const std::string& status);
-    std::vector<std::string> LoadUnfinishedRunIds();
+    std::vector<RunRecord> LoadUnfinishedRuns();
+    void ResumeRun(const std::string& run_id);
     void SaveTask(const std::string& task_id, const std::string& run_id,
                   const std::string& client_identity, const std::string& payload);
     void AckTask(const std::string& task_id);

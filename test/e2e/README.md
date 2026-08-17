@@ -7,6 +7,7 @@
 | `run_e2e.ps1` | demo 主流程：注册 → 请求任务 → 执行 → 上报 → run finished |
 | `run_stop.ps1` | STOP 路径：运行中 stop → 回收/cancel → 再次 run 完成 |
 | `run_cov.ps1` | coverage 多波次：版本不符被拒 → 共享目录部署 → 重注册 → 80 文件 2 波次 greedy 结算 → selected.txt 80 行 |
+| `run_recover.ps1` | 恢复路径：运行中 stop → 检查点落库 → 重启调度端自动恢复 → 再次执行完成（需本地 PostgreSQL，默认连接 127.0.0.1:5432/testtracking） |
 
 ## 运行
 

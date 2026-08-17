@@ -345,7 +345,7 @@ public:
 
 | 模块 | 类/文件 | 功能 | 待改进项目 | 完成情况 |
 | --- | --- | --- | --- | --- |
-| 服务端插件规范 | TaskPlugin | init/validateClient/plan/requestTask/processResult/runFinished/cancel/requeue | 接口不变：requestTask 仍一次给一个任务，批量由调度模块循环调用<br>补充并发调用契约注释（processResult 在结果池线程，其余在调度线程） | 保持 |
+| 服务端插件规范 | TaskPlugin | init/validateClient/plan/requestTask/processResult/runFinished/cancel/requeue/saveCheckpoint/restore | 已完成：requestTask 一次给一个任务，批量由调度模块循环调用；saveCheckpoint/restore 支撑停止与崩溃恢复<br>待处理：补充并发调用契约注释（processResult 在结果池线程，其余在调度线程） | 保持/微调 |
 | 客户端插件规范 | WorkerPlugin | init/collectRegistrationInfo/handleValidationReply/execute | 明确契约：execute 与框架一个 worker 一一对应，插件不得自行管理线程/并发 | 保持 |
 
 #### 覆盖率插件
@@ -382,5 +382,5 @@ public:
 | 场景 | 现状 | 需要实现 | 归属 | 状态 |
 | --- | --- | --- | --- | --- |
 | 1. 客户端异常关闭 | 已有 TASK_ACK 回执；客户端下线后 ReclaimClientTasks 把任务 requeue 到普通队尾 | 已完成：所有被回收任务一律进入覆盖率插件的优先发送任务队列，先于普通任务派发；requeue 接口不变 | 覆盖率服务插件 | 已实现 |
-| 2. 服务端 STOP | 客户端丢弃所持任务；插件 cancel 清空内存；无检查点，进度不可恢复 | 客户端停止执行即可，无需逐条回执；服务端基于 reclaim 落库；服务端持久化运行检查点（当前波次、剩余任务池、累计点集/已选文件），启动时自动恢复 | 调度 / 覆盖率插件 | 未开始 |
-| 3. 服务端崩溃 | 重启仅把 running run 标记为 interrupted，任务池不恢复 | 依赖场景 2 的检查点与插件 restore 接口，启动时恢复未完成 run | 调度 + 覆盖率插件 | 未开始 |
+| 2. 服务端 STOP | 客户端丢弃所持任务；插件 cancel 清空内存；无检查点，进度不可恢复 | 已完成：客户端停止执行即可，无需逐条回执；服务端基于 reclaim 落库；覆盖率插件按结果/波次/STOP 持续保存检查点（当前波次、剩余任务池、累计点集/已选文件）；调度端启动时自动恢复未完成 run | 调度 / 覆盖率插件 | 已实现 |
+| 3. 服务端崩溃 | 重启仅把 running run 标记为 interrupted，任务池不恢复 | 已完成：依赖场景 2 的检查点与插件 restore 接口，启动时自动恢复未完成 run；无法恢复的 run 标记 interrupted | 调度 + 覆盖率插件 | 已实现 |

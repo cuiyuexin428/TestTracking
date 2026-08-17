@@ -21,6 +21,17 @@ message CoverageResult {
   repeated FileCoverage files = 1;
 }
 
+// Run checkpoint for resume after STOP or crash. remaining_tasks are the
+// current wave's tasks not yet reported (excluding priority_tasks); future
+// waves are rebuilt from the manifest on restore.
+message CoverageCheckpoint {
+  int32 current_wave = 1;
+  int32 total_files = 2;
+  int32 selected_files = 3;
+  repeated bytes remaining_tasks = 4;  // serialized common::Task
+  repeated bytes priority_tasks = 5;   // serialized common::Task
+}
+
 // Registration validation: local deployment info of the client. It is the
 // REGISTER business payload; the framework does not parse it and the
 // coverage server plugin interprets it.

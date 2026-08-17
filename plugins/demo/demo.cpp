@@ -105,6 +105,16 @@ public:
         }
     }
 
+    bool saveCheckpoint(const std::string& run_id) override {
+        (void)run_id;
+        return true;  // demo has no persistent state
+    }
+
+    bool restore(const std::string& run_id) override {
+        (void)run_id;
+        return false;  // demo runs cannot be resumed
+    }
+
     void processResult(const common::TaskResult& result) override {
         demo::DemoResult demo_result;
         std::string message = "unparsed";
