@@ -9,11 +9,14 @@
 #include <json.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace coverage_plugin {
@@ -139,9 +142,17 @@ bool ClientPlugin::init(const std::string& config) {
     program_version_ = cfg.value("program_version", std::string());
     dataset_version_ = cfg.value("dataset_version", std::string());
     deployed_ = cfg.value("deployed", false);
+    deploy_state_path_ = cfg.value("deploy_state", std::string());
+    deploy_max_attempts_ = cfg.value("deploy_max_attempts", 3);
+    deploy_retry_delay_ms_ = cfg.value("deploy_retry_delay_ms", 5000);
     for (const nlohmann::json& dll : cfg.value("occt_dlls", nlohmann::json::array())) {
         occt_dlls_.push_back(dll.get<std::string>());
     }
+
+    if (deploy_state_path_.empty() && !program_dir_.empty()) {
+        deploy_state_path_ = program_dir_ + "/deploy.json";
+    }
+    LoadDeployState();
 
     if (!export_dir_.empty()) {
         std::error_code ec;
@@ -174,7 +185,99 @@ common::RegisterOutcome ClientPlugin::handleValidationReply(const std::string& r
         return common::RegisterOutcome::kReady;
     }
 
-    const std::string shared = reply.shared_dir();
+    int attempt = 1;
+    bool ok = false;
+    while (attempt <= deploy_max_attempts_) {
+        ok = DeployFromShared(reply.shared_dir());
+        if (ok) {
+            break;
+        }
+        if (attempt < deploy_max_attempts_) {
+            LOG_WARN("coverage plugin: deploy attempt " << attempt << " failed, retrying in "
+                                                        << deploy_retry_delay_ms_ << " ms");
+            std::this_thread::sleep_for(std::chrono::milliseconds(deploy_retry_delay_ms_));
+        }
+        ++attempt;
+    }
+    if (!ok) {
+        LOG_ERROR("coverage plugin: deployment failed after " << deploy_max_attempts_
+                                                             << " attempts");
+        return common::RegisterOutcome::kFailed;
+    }
+
+    program_version_ = reply.target_program_version();
+    dataset_version_ = reply.target_dataset_version();
+    deployed_ = true;
+    ResolveProgramPaths();
+    if (!SaveDeployState()) {
+        LOG_ERROR("coverage plugin: failed to persist deployment state");
+        return common::RegisterOutcome::kFailed;
+    }
+    LOG_INFO("coverage plugin: deploy to program=" << reply.target_program_version()
+                                                   << " dataset=" << reply.target_dataset_version());
+    return common::RegisterOutcome::kRetry;
+}
+
+bool ClientPlugin::LoadDeployState() {
+    if (deploy_state_path_.empty()) {
+        return false;
+    }
+    std::ifstream in(deploy_state_path_);
+    if (!in.is_open()) {
+        return false;
+    }
+    const nlohmann::json json = nlohmann::json::parse(in, nullptr, false);
+    if (json.is_discarded() || !json.value("deployed", false)) {
+        return false;
+    }
+    program_version_ = json.value("program_version", std::string());
+    dataset_version_ = json.value("dataset_version", std::string());
+    deployed_ = true;
+    LOG_INFO("coverage plugin: deployment state loaded from " << deploy_state_path_);
+    return true;
+}
+
+bool ClientPlugin::SaveDeployState() {
+    if (deploy_state_path_.empty()) {
+        LOG_WARN("coverage plugin: deploy_state not configured, deployment state not persisted");
+        return true;
+    }
+    nlohmann::json json;
+    json["deployed"] = true;
+    json["program_version"] = program_version_;
+    json["dataset_version"] = dataset_version_;
+
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(deploy_state_path_).parent_path(),
+                                        ec);
+    if (ec) {
+        LOG_ERROR("coverage plugin: cannot create deploy state dir: " << ec.message());
+        return false;
+    }
+    const std::string tmp_path = deploy_state_path_ + ".tmp";
+    {
+        std::ofstream out(tmp_path);
+        if (!out.is_open()) {
+            LOG_ERROR("coverage plugin: cannot open deploy state temp file");
+            return false;
+        }
+        out << json.dump();
+        out.flush();
+        if (!out.good()) {
+            LOG_ERROR("coverage plugin: write deploy state temp file failed");
+            return false;
+        }
+    }
+    std::filesystem::rename(tmp_path, deploy_state_path_, ec);
+    if (ec) {
+        LOG_ERROR("coverage plugin: rename deploy state failed: " << ec.message());
+        return false;
+    }
+    LOG_INFO("coverage plugin: deployment state saved to " << deploy_state_path_);
+    return true;
+}
+
+bool ClientPlugin::DeployFromShared(const std::string& shared) {
     if (!shared.empty() && (!program_dir_.empty() || !stp_root_.empty())) {
         bool ok = true;
         if (!program_dir_.empty()) {
@@ -185,20 +288,109 @@ common::RegisterOutcome ClientPlugin::handleValidationReply(const std::string& r
         }
         if (!ok) {
             LOG_ERROR("coverage plugin: deployment copy failed from " << shared);
-            return common::RegisterOutcome::kFailed;
+            return false;
+        }
+        if (!program_dir_.empty() && !VerifyManifest(program_dir_, true)) {
+            LOG_ERROR("coverage plugin: program deployment verification failed");
+            return false;
+        }
+        if (!stp_root_.empty() && !VerifyManifest(stp_root_, false)) {
+            LOG_ERROR("coverage plugin: dataset deployment verification failed");
+            return false;
         }
         LOG_INFO("coverage plugin: deployed from " << shared << " program=" << program_dir_
                                                    << " dataset=" << stp_root_);
     } else {
         LOG_WARN("coverage plugin: shared_dir/deploy dirs not configured, simulating deployment");
     }
+    return true;
+}
 
-    LOG_INFO("coverage plugin: deploy to program=" << reply.target_program_version()
-                                                   << " dataset=" << reply.target_dataset_version());
-    program_version_ = reply.target_program_version();
-    dataset_version_ = reply.target_dataset_version();
-    deployed_ = true;
-    return common::RegisterOutcome::kRetry;
+bool ClientPlugin::VerifyManifest(const std::string& dir, bool hash_files) {
+    const std::string manifest_path = dir + "/manifest.txt";
+    std::ifstream in(manifest_path);
+    if (!in.is_open()) {
+        LOG_ERROR("coverage plugin: manifest missing: " << manifest_path);
+        return false;
+    }
+    std::string line;
+    size_t checked = 0;
+    while (std::getline(in, line)) {
+        // Strip a UTF-8 BOM; editors and PowerShell scripts commonly add one
+        // to text manifests.
+        if (line.size() >= 3 && static_cast<unsigned char>(line[0]) == 0xEF &&
+            static_cast<unsigned char>(line[1]) == 0xBB &&
+            static_cast<unsigned char>(line[2]) == 0xBF) {
+            line.erase(0, 3);
+        }
+        if (line.empty()) {
+            continue;
+        }
+        const size_t first_comma = line.find(',');
+        if (first_comma == std::string::npos) {
+            LOG_ERROR("coverage plugin: bad manifest line: " << line);
+            return false;
+        }
+        const std::string name = line.substr(0, first_comma);
+        const size_t second_comma = line.find(',', first_comma + 1);
+        const std::string size_str =
+            line.substr(first_comma + 1,
+                        second_comma == std::string::npos
+                            ? std::string::npos
+                            : second_comma - first_comma - 1);
+        const std::uint64_t expected_size =
+            std::strtoull(size_str.c_str(), nullptr, 10);
+        const std::string expected_hash =
+            second_comma == std::string::npos ? std::string() : line.substr(second_comma + 1);
+
+        const std::string path = dir + "/" + name;
+        std::error_code ec;
+        const std::uintmax_t actual_size = std::filesystem::file_size(path, ec);
+        if (ec || actual_size != expected_size) {
+            LOG_ERROR("coverage plugin: manifest size mismatch " << name << " expected="
+                                                                 << expected_size
+                                                                 << " actual="
+                                                                 << (ec ? 0 : actual_size));
+            return false;
+        }
+        if (hash_files && !expected_hash.empty()) {
+            const std::string actual_hash = Sha256Hex(path);
+            if (actual_hash.empty() || actual_hash != expected_hash) {
+                LOG_ERROR("coverage plugin: manifest hash mismatch " << name);
+                return false;
+            }
+        }
+        ++checked;
+    }
+    if (checked == 0) {
+        LOG_ERROR("coverage plugin: manifest is empty: " << manifest_path);
+        return false;
+    }
+    LOG_INFO("coverage plugin: manifest verified " << manifest_path << " files=" << checked);
+    return true;
+}
+
+void ClientPlugin::ResolveProgramPaths() {
+    if (program_dir_.empty()) {
+        return;
+    }
+    auto resolve = [this](const std::string& raw) {
+        if (raw.empty()) {
+            return raw;
+        }
+        if (raw.size() >= 2 && raw[1] == ':') {
+            return raw;  // drive absolute
+        }
+        if (raw.rfind("\\\\", 0) == 0 || raw[0] == '/' || raw[0] == '\\') {
+            return raw;  // UNC or rooted
+        }
+        return program_dir_ + "/" + raw;
+    };
+    target_exe_ = resolve(target_exe_);
+    opencppcoverage_ = resolve(opencppcoverage_);
+    for (std::string& dll : occt_dlls_) {
+        dll = resolve(dll);
+    }
 }
 
 bool ClientPlugin::RunOneFile(const std::string& run_id, int wave, const std::string& file,

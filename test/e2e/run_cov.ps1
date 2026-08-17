@@ -16,6 +16,11 @@ New-Item -ItemType Directory -Force "$ws\shared\program" | Out-Null
 New-Item -ItemType Directory -Force "$ws\shared\dataset" | Out-Null
 Set-Content -Path "$ws\shared\program\step.exe" -Value 'x' -Encoding UTF8
 Set-Content -Path "$ws\shared\dataset\dummy.stp" -Value 'x' -Encoding UTF8
+$stepSize = (Get-Item "$ws\shared\program\step.exe").Length
+$stepHash = (Get-FileHash "$ws\shared\program\step.exe" -Algorithm SHA256).Hash.ToLower()
+Set-Content -Path "$ws\shared\program\manifest.txt" -Value "step.exe,$stepSize,$stepHash" -Encoding UTF8
+$stpSize = (Get-Item "$ws\shared\dataset\dummy.stp").Length
+Set-Content -Path "$ws\shared\dataset\manifest.txt" -Value "dummy.stp,$stpSize" -Encoding UTF8
 
 $schedCfg = @{
     server = @{

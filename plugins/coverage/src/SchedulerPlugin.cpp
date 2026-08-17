@@ -113,6 +113,13 @@ bool SchedulerPlugin::BuildWaves(const std::string& run_id) {
     }
     std::string line;
     while (std::getline(in, line)) {
+        // Strip a UTF-8 BOM; editors and PowerShell scripts commonly add one
+        // to text manifests.
+        if (line.size() >= 3 && static_cast<unsigned char>(line[0]) == 0xEF &&
+            static_cast<unsigned char>(line[1]) == 0xBB &&
+            static_cast<unsigned char>(line[2]) == 0xBF) {
+            line.erase(0, 3);
+        }
         if (line.empty()) {
             continue;
         }

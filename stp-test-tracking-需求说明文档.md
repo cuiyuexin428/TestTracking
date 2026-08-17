@@ -403,3 +403,20 @@ public:
 验证：`test/e2e/run_cov_merge.ps1`（真实 StepTest + 4 个 OCCT DLL，文件存储/PostgreSQL 两种后端）；`tools/validate_coverage.py` 增加 wave summary 与点集一致性检查。
 
 已知事实：OpenCppCoverage 对同一输入重复执行会有数行抖动（实测 18071 vs 18076），属工具行为，非框架问题；点集与汇总均为当次实际采集结果。
+
+### 15.6 空白机部署与初始化（已完成）
+
+场景：调度机已运行；另一台空白机只拷贝了客户端程序，无测试程序、无数据集。客户端启动后自动完成部署与初始化：
+
+注册 → 服务端校验（未部署/版本不符）→ 拒绝并下发 `shared_dir` 与目标版本 → 客户端拷贝 program + dataset → 清单校验 → 写入部署标记 → 重新注册 → 接受 → 开始拉取任务。
+
+实现要点：
+
+1. 共享目录：服务端插件配置 `shared_dir` 为客户端可访问路径（UNC 或盘符映射），客户端进程账户需有读权限；跨公网需 VPN/虚拟内网（SMB 不能直穿公网），如无 VPN 后续可换 HTTP/对象存储后端，接口不变。
+2. 部署标记：默认写入 `program_dir/deploy.json`（可用 `deploy_state` 覆盖），记录 program_version/dataset_version；客户端重启加载标记，版本匹配则免重新拷贝。标记存在时优先于配置文件中的 `deployed`。
+3. 清单校验：`shared/program/manifest.txt` 行格式 `文件名,大小,SHA-256`（程序强制哈希）；`shared/dataset/manifest.txt` 行格式 `文件名,大小`（数据集只校验数量与大小）；校验失败视为部署失败。
+4. 拷贝失败重试：`deploy_max_attempts`（默认 3）+ `deploy_retry_delay_ms`（默认 5000），不再直接退出。
+5. 路径解析：`target_exe`、`opencppcoverage`、`occt_dlls` 相对 `program_dir` 解析；程序包需包含 StepTest.exe、OCCT DLL、PDB、OpenCppCoverage.exe。
+6. 清单读取兼容 UTF-8 BOM（脚本/编辑器常见）。
+
+验证：`test/e2e/run_deploy.ps1` 覆盖空白机部署全流程与重启免重拷；`run_cov.ps1` 回归共享目录部署路径。

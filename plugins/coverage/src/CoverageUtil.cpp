@@ -4,11 +4,13 @@
 
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <set>
 #include <utility>
 
 #ifdef _WIN32
 #include <windows.h>
+#include <bcrypt.h>
 #else
 #include <cstdlib>
 #endif
@@ -115,6 +117,55 @@ std::string CanonicalPath(const std::string& filename,
     // Deterministic fallback: identity stays stable even when the build
     // machine's source tree is not present locally.
     return sources.empty() ? filename : (sources[0] + "\\" + filename);
+}
+
+std::string Sha256Hex(const std::string& file_path) {
+#ifdef _WIN32
+    std::ifstream in(file_path, std::ios::binary);
+    if (!in.is_open()) {
+        return std::string();
+    }
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) {
+        return std::string();
+    }
+    std::string digest;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    if (BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0) == 0) {
+        char buf[64 * 1024];
+        bool read_ok = true;
+        while (in) {
+            in.read(buf, sizeof(buf));
+            const std::streamsize got = in.gcount();
+            if (got > 0 &&
+                BCryptHashData(hash, reinterpret_cast<PUCHAR>(buf),
+                               static_cast<ULONG>(got), 0) != 0) {
+                read_ok = false;
+                break;
+            }
+            if (got == 0) {
+                break;
+            }
+        }
+        if (read_ok) {
+            constexpr ULONG kDigestSize = 32;
+            BYTE raw[kDigestSize] = {};
+            if (BCryptFinishHash(hash, raw, kDigestSize, 0) == 0) {
+                static const char* kHex = "0123456789abcdef";
+                for (BYTE b : raw) {
+                    digest.push_back(kHex[(b >> 4) & 0xF]);
+                    digest.push_back(kHex[b & 0xF]);
+                }
+            }
+        }
+        BCryptDestroyHash(hash);
+    }
+    BCryptCloseAlgorithmProvider(alg, 0);
+    return digest;
+#else
+    (void)file_path;
+    return std::string();
+#endif
 }
 
 }  // namespace coverage_plugin
