@@ -38,21 +38,31 @@ public:
 private:
     bool BuildWaves(const std::string& run_id);
     void SaveCheckpointLocked();
-    void SettleWave();
+    // Settles the current wave and advances to the next one. Returns the
+    // settled wave index, or -1 when settlement/merge failed (the run is
+    // suspended with staging intact so it can be resumed).
+    int SettleWave();
+    bool MergeWaveCoverage(int wave);
+    std::string ManifestFingerprint() const;
 
     std::mutex mutex_;
     std::string run_id_;
     std::string manifest_path_;
+    std::string manifest_fingerprint_;
     std::string expected_program_version_;
     std::string expected_dataset_version_;
     std::string shared_dir_;
+    std::string opencppcoverage_;
     std::unique_ptr<CoverageStore> store_;
     int batch_size_ = 1000;
     int task_size_ = 25;
+    int failed_file_retries_ = 0;
     bool keep_staging_ = false;  // validation only: keep wave point files
+    bool store_cov_ = false;     // wave settlement computes cov-based totals
 
     std::vector<std::vector<common::Task>> waves_;
     size_t current_wave_ = 0;
+    size_t task_seq_ = 0;
     std::vector<common::Task> pending_;
     std::unordered_set<std::string> pending_ids_;
     // Reclaimed tasks (offline/lease) are re-sent before new tasks so the

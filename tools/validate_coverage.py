@@ -151,7 +151,8 @@ def main():
     args = parser.parse_args()
 
     waves = sorted(
-        d for d in os.listdir(args.store_dir) if d.startswith("wave-"))
+        d for d in os.listdir(args.store_dir)
+        if d.startswith("wave-") and os.path.isdir(os.path.join(args.store_dir, d)))
     if not waves:
         print(f"[FAIL] no wave-* dirs under {args.store_dir}")
         return 1
@@ -198,6 +199,17 @@ def main():
             optimal = brute_force_min_cover(plugin_sets, needed)
             print(f"[INFO] {wave}: greedy={len(selected_wave)} "
                   f"exact-optimal={optimal}")
+
+        summary_path = os.path.join(args.store_dir, f"wave-summary-{wave.split('-')[1]}.json")
+        if os.path.exists(summary_path):
+            with open(summary_path, encoding="utf-8") as f:
+                summary = json.load(f)
+            summary_ok = summary.get("covered_lines") == len(cumulative)
+            print(f"[{'PASS' if summary_ok else 'FAIL'}] {wave} wave summary "
+                  f"covered={summary.get('covered_lines')} "
+                  f"== cumulative points={len(cumulative)}")
+            if not summary_ok:
+                failed += 1
 
     final_ok = cumulative == union_all
     print(f"[{'PASS' if final_ok else 'FAIL'}] final cumulative == union(all): "

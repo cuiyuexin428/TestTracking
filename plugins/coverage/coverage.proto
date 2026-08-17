@@ -7,6 +7,8 @@ message CoverageTask {
   string run_id = 1;
   int32 wave_id = 2;
   repeated string files = 3;
+  // How many retries this task has already consumed (0 = first attempt).
+  int32 retry_count = 4;
 }
 
 // Summary of a single stp file. The covered point set itself travels via the
@@ -30,6 +32,11 @@ message CoverageCheckpoint {
   int32 selected_files = 3;
   repeated bytes remaining_tasks = 4;  // serialized common::Task
   repeated bytes priority_tasks = 5;   // serialized common::Task
+  // Fingerprint of the stp manifest the run was planned from, so restore
+  // refuses to resume when the input dataset changed underneath it.
+  string manifest_fingerprint = 6;
+  // Monotonic task id counter for retry tasks (kept unique across restarts).
+  int32 task_seq = 7;
 }
 
 // Registration validation: local deployment info of the client. It is the

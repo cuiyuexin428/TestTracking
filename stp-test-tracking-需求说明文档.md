@@ -384,3 +384,22 @@ public:
 | 1. 客户端异常关闭 | 已有 TASK_ACK 回执；客户端下线后 ReclaimClientTasks 把任务 requeue 到普通队尾 | 已完成：所有被回收任务一律进入覆盖率插件的优先发送任务队列，先于普通任务派发；requeue 接口不变 | 覆盖率服务插件 | 已实现 |
 | 2. 服务端 STOP | 客户端丢弃所持任务；插件 cancel 清空内存；无检查点，进度不可恢复 | 已完成：客户端停止执行即可，无需逐条回执；服务端基于 reclaim 落库；覆盖率插件按结果/波次/STOP 持续保存检查点（当前波次、剩余任务池、累计点集/已选文件）；调度端启动时自动恢复未完成 run | 调度 / 覆盖率插件 | 已实现 |
 | 3. 服务端崩溃 | 重启仅把 running run 标记为 interrupted，任务池不恢复 | 已完成：依赖场景 2 的检查点与插件 restore 接口，启动时自动恢复未完成 run；无法恢复的 run 标记 interrupted | 调度 + 覆盖率插件 | 已实现 |
+
+### 15.5 覆盖率波次汇总与 cov 合并（已完成）
+
+目标：波次结算时计算累计总覆盖率（去重行级），写入每波汇总，作为可视化数据；累计 cov 作为下一波初始覆盖率；cov 随波清理。
+
+变更内容：
+
+1. OpenCppCoverage 合并实测：`--input_coverage` 可多文件合并，无需执行目标程序；一次调用可同时导出 binary + cobertura。
+2. 去重口径：cobertura 按 class 展开，模板/头文件行会重复计数（实测 lines-covered 27061 vs 去重 18106），波次汇总按（规范路径，行号）去重后统计，与点集完全一致。
+3. 新表：`coverage_cumulative_cov`（每 run 最新累计 cov）、`coverage_wave_summary`（每波 covered/total/percent，可视化直接查询）。
+4. `clearWave` 同时清理 `coverage_cov_files`；恢复时清理当前波之前的残留暂存。
+5. 正确性修复：store 写入/读取返回 bool 并传播错误；客户端写失败标记文件 not ok；波次推进 → 保存检查点 → 清理暂存；检查点带 manifest 指纹并校验；restore 累计点集读取失败即拒绝恢复。
+6. 失败文件策略：`failed_file_retries`（默认 0 = 忽略），重试任务带 `retry_count`，`task_seq` 持久化保证任务 id 唯一。
+
+配置新增（服务端插件）：`store_cov`、`opencppcoverage`、`failed_file_retries`；客户端 `store_cov` 需与服务端一致。生产部署要求调度机安装 OpenCppCoverage。
+
+验证：`test/e2e/run_cov_merge.ps1`（真实 StepTest + 4 个 OCCT DLL，文件存储/PostgreSQL 两种后端）；`tools/validate_coverage.py` 增加 wave summary 与点集一致性检查。
+
+已知事实：OpenCppCoverage 对同一输入重复执行会有数行抖动（实测 18071 vs 18076），属工具行为，非框架问题；点集与汇总均为当次实际采集结果。

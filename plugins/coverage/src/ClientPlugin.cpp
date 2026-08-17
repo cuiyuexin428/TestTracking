@@ -16,12 +16,6 @@
 #include <string>
 #include <vector>
 
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <cstdlib>
-#endif
-
 namespace coverage_plugin {
 
 namespace {
@@ -67,44 +61,6 @@ std::vector<std::uint64_t> SyntheticPoints(const std::string& file) {
             file, static_cast<std::uint32_t>((seed + i * 7919ULL) % 1000000ULL)));
     }
     return points;
-}
-
-int RunCommand(const std::string& command) {
-#ifdef _WIN32
-    STARTUPINFOA si{};
-    si.cb = sizeof(si);
-    PROCESS_INFORMATION pi{};
-    std::string mutable_command = command;
-    if (!CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr, FALSE,
-                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-        return -1;
-    }
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD exit_code = 0;
-    GetExitCodeProcess(pi.hProcess, &exit_code);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    return static_cast<int>(exit_code);
-#else
-    return std::system(command.c_str());
-#endif
-}
-
-std::string CanonicalPath(const std::string& filename,
-                          const std::vector<std::string>& sources) {
-    if (filename.size() >= 2 && filename[1] == ':') {
-        return filename;  // already absolute
-    }
-    for (const std::string& root : sources) {
-        const std::string candidate = root + "\\" + filename;
-        std::error_code ec;
-        if (std::filesystem::exists(candidate, ec)) {
-            return candidate;
-        }
-    }
-    // Deterministic fallback: identity stays stable even when the build
-    // machine's source tree is not present locally.
-    return sources.empty() ? filename : (sources[0] + "\\" + filename);
 }
 
 bool ParseCobertura(const std::string& xml_path, std::vector<std::uint64_t>& points) {
@@ -279,11 +235,16 @@ bool ClientPlugin::RunOneFile(const std::string& run_id, int wave, const std::st
             std::string data(static_cast<size_t>(size), '\0');
             cov_in.seekg(0);
             cov_in.read(&data[0], size);
-            store_->saveFileCov(run_id, wave, file, data, static_cast<std::int64_t>(size));
+            if (!store_->saveFileCov(run_id, wave, file, data,
+                                     static_cast<std::int64_t>(size))) {
+                LOG_WARN("coverage plugin: failed to store cov for " << file);
+                return false;
+            }
             std::error_code ec;
             std::filesystem::remove(cov_path, ec);
         } else {
             LOG_WARN("coverage plugin: failed to read cov " << cov_path);
+            return false;
         }
     }
     if (!keep_reports_) {
@@ -318,7 +279,10 @@ bool ClientPlugin::execute(const common::Task& task, common::TaskResult& result)
         std::sort(points.begin(), points.end());
         points.erase(std::unique(points.begin(), points.end()), points.end());
         if (ok) {
-            store_->saveFileCoverage(cov_task.run_id(), cov_task.wave_id(), file, points);
+            ok = store_->saveFileCoverage(cov_task.run_id(), cov_task.wave_id(), file, points);
+            if (!ok) {
+                LOG_WARN("coverage plugin: failed to store points for " << file);
+            }
         }
 
         entry.set_ok(ok);

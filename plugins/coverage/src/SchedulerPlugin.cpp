@@ -3,12 +3,15 @@
 #include "common/Logger.h"
 
 #include "coverage.pb.h"
+#include "coverage/CoverageUtil.h"
 
 #include <json.hpp>
 
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <utility>
 
 namespace coverage_plugin {
@@ -25,15 +28,44 @@ bool SchedulerPlugin::init(const std::string& config) {
     shared_dir_ = cfg.value("shared_dir", std::string());
     batch_size_ = cfg.value("batch_size", 1000);
     task_size_ = cfg.value("task_size", 25);
+    failed_file_retries_ = cfg.value("failed_file_retries", 0);
+    store_cov_ = cfg.value("store_cov", false);
+    opencppcoverage_ = cfg.value("opencppcoverage", std::string("OpenCppCoverage.exe"));
     keep_staging_ = cfg.value("keep_staging", false);
     if (manifest_path_.empty()) {
         LOG_ERROR("coverage plugin: stp_manifest is required");
         return false;
     }
+    if (failed_file_retries_ < 0) {
+        LOG_ERROR("coverage plugin: failed_file_retries must be >= 0");
+        return false;
+    }
+    if (store_cov_) {
+#ifdef _WIN32
+        const bool is_bare_name =
+            opencppcoverage_.find('\\') == std::string::npos &&
+            opencppcoverage_.find('/') == std::string::npos &&
+            opencppcoverage_.find(':') == std::string::npos;
+        if (!is_bare_name) {
+            std::error_code ec;
+            if (!std::filesystem::exists(opencppcoverage_, ec)) {
+                LOG_ERROR("coverage plugin: opencppcoverage not found: "
+                          << opencppcoverage_);
+                return false;
+            }
+        }
+#else
+        LOG_ERROR("coverage plugin: cov merge requires OpenCppCoverage (Windows only)");
+        return false;
+#endif
+    }
     store_ = CreateCoverageStore(config);
     if (!store_->init(config)) {
         LOG_ERROR("coverage plugin: coverage store init failed");
         return false;
+    }
+    if (store_cov_) {
+        LOG_INFO("coverage plugin: cov merge enabled, opencppcoverage=" << opencppcoverage_);
     }
     return true;
 }
@@ -96,6 +128,11 @@ bool SchedulerPlugin::BuildWaves(const std::string& run_id) {
         LOG_ERROR("coverage plugin: manifest is empty");
         return false;
     }
+    manifest_fingerprint_ = ManifestFingerprint();
+    if (manifest_fingerprint_.empty()) {
+        LOG_ERROR("coverage plugin: cannot fingerprint manifest " << manifest_path_);
+        return false;
+    }
     std::sort(files.begin(), files.end(),
               [](const auto& a, const auto& b) { return a.second < b.second; });
 
@@ -143,6 +180,7 @@ bool SchedulerPlugin::plan(const common::RunRequest& request,
     tasks_by_id_.clear();
     cumulative_.clear();
     current_wave_ = 0;
+    task_seq_ = 0;
     selected_count_ = 0;
 
     pending_ = waves_[0];
@@ -202,10 +240,20 @@ void SchedulerPlugin::SaveCheckpointLocked() {
     if (run_id_.empty()) {
         return;
     }
+    if (current_wave_ < waves_.size() && wave_task_ids_.empty()) {
+        // A live wave must always have outstanding tasks; an empty pool here
+        // means settlement failed or is in progress. Persisting this state
+        // would make the run unresumable, so keep the previous checkpoint.
+        LOG_ERROR("coverage plugin: refusing to save checkpoint with empty task pool "
+                  "for active wave " << current_wave_);
+        return;
+    }
     coverage::CoverageCheckpoint ckpt;
     ckpt.set_current_wave(static_cast<std::int32_t>(current_wave_));
     ckpt.set_total_files(static_cast<std::int32_t>(total_files_));
     ckpt.set_selected_files(static_cast<std::int32_t>(selected_count_));
+    ckpt.set_manifest_fingerprint(manifest_fingerprint_);
+    ckpt.set_task_seq(static_cast<std::int32_t>(task_seq_));
     for (const std::string& task_id : wave_task_ids_) {
         if (priority_ids_.count(task_id) > 0) {
             continue;
@@ -232,7 +280,9 @@ void SchedulerPlugin::SaveCheckpointLocked() {
         LOG_ERROR("coverage plugin: failed to serialize checkpoint for run " << run_id_);
         return;
     }
-    store_->saveCheckpoint(run_id_, blob);
+    if (!store_->saveCheckpoint(run_id_, blob)) {
+        LOG_ERROR("coverage plugin: failed to save checkpoint for run " << run_id_);
+    }
 }
 
 bool SchedulerPlugin::saveCheckpoint(const std::string& run_id) {
@@ -262,6 +312,16 @@ bool SchedulerPlugin::restore(const std::string& run_id) {
         LOG_ERROR("coverage plugin: restore failed to rebuild waves for run " << run_id);
         return false;
     }
+    if (!ckpt.manifest_fingerprint().empty() &&
+        ckpt.manifest_fingerprint() != manifest_fingerprint_) {
+        LOG_ERROR("coverage plugin: manifest changed since checkpoint, cannot restore run "
+                  << run_id);
+        return false;
+    }
+    if (ckpt.manifest_fingerprint().empty()) {
+        LOG_WARN("coverage plugin: legacy checkpoint without manifest fingerprint for run "
+                 << run_id);
+    }
 
     run_id_ = run_id;
     pending_.clear();
@@ -275,6 +335,15 @@ bool SchedulerPlugin::restore(const std::string& run_id) {
     current_wave_ = static_cast<size_t>(ckpt.current_wave());
     total_files_ = static_cast<size_t>(ckpt.total_files());
     selected_count_ = static_cast<size_t>(ckpt.selected_files());
+    task_seq_ = static_cast<size_t>(ckpt.task_seq());
+
+    if (!keep_staging_) {
+        // Waves before the checkpoint wave are settled; remove any staging
+        // left by an interrupted settle/cleanup sequence.
+        for (size_t wave = 0; wave < current_wave_; ++wave) {
+            store_->clearWave(run_id, static_cast<int>(wave));
+        }
+    }
 
     if (current_wave_ >= waves_.size()) {
         LOG_INFO("coverage plugin: run " << run_id << " checkpoint marks run finished");
@@ -315,8 +384,11 @@ bool SchedulerPlugin::restore(const std::string& run_id) {
                                                             "active wave, restore rejected");
         return false;
     }
-    const std::vector<std::uint64_t> points =
-        store_->loadCumulative(run_id, static_cast<int>(current_wave_) - 1);
+    std::vector<std::uint64_t> points;
+    if (!store_->loadCumulative(run_id, static_cast<int>(current_wave_) - 1, &points)) {
+        LOG_ERROR("coverage plugin: cannot load cumulative points for run " << run_id);
+        return false;
+    }
     cumulative_.insert(points.begin(), points.end());
     LOG_INFO("coverage plugin: run restored " << run_id << " wave=" << current_wave_
                                               << " remaining=" << wave_task_ids_.size());
@@ -326,27 +398,78 @@ bool SchedulerPlugin::restore(const std::string& run_id) {
 void SchedulerPlugin::processResult(const common::TaskResult& result) {
     coverage::CoverageResult coverage_result;
     int covered_lines = 0;
+    bool result_parse_failed = false;
+    std::vector<std::string> failed_files;
     if (!coverage_result.ParseFromString(result.result())) {
         LOG_ERROR("coverage plugin: unparseable result for " << result.task_id());
+        result_parse_failed = true;
     } else {
         for (const coverage::FileCoverage& file : coverage_result.files()) {
             covered_lines += file.covered_lines();
             if (!file.ok()) {
                 LOG_WARN("coverage plugin: file failed: " << file.file());
+                failed_files.push_back(file.file());
             }
         }
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
+    int retry_count = 0;
+    int retry_wave = -1;
+    std::string retry_run_id;
+    const auto spec_it = tasks_by_id_.find(result.task_id());
+    if (spec_it != tasks_by_id_.end()) {
+        coverage::CoverageTask task_meta;
+        if (task_meta.ParseFromString(spec_it->second.payload())) {
+            retry_count = task_meta.retry_count();
+            retry_run_id = task_meta.run_id();
+            retry_wave = task_meta.wave_id();
+            if (result_parse_failed) {
+                for (const std::string& file : task_meta.files()) {
+                    failed_files.push_back(file);
+                }
+            }
+        }
+    }
     wave_task_ids_.erase(result.task_id());
     task_client_.erase(result.task_id());
+
+    if (failed_file_retries_ > 0 && retry_count < failed_file_retries_ &&
+        retry_wave == static_cast<int>(current_wave_) &&
+        !failed_files.empty()) {
+        coverage::CoverageTask retry_task;
+        retry_task.set_run_id(retry_run_id);
+        retry_task.set_wave_id(retry_wave);
+        retry_task.set_retry_count(retry_count + 1);
+        for (const std::string& file : failed_files) {
+            retry_task.add_files(file);
+        }
+        common::Task spec;
+        spec.set_task_id(run_id_ + "-w" + std::to_string(retry_wave) + "-r" +
+                         std::to_string(++task_seq_));
+        retry_task.SerializeToString(spec.mutable_payload());
+        pending_.push_back(spec);
+        pending_ids_.insert(spec.task_id());
+        wave_task_ids_.insert(spec.task_id());
+        tasks_by_id_[spec.task_id()] = spec;
+        LOG_WARN("coverage plugin: retrying " << failed_files.size() << " failed files as "
+                                              << spec.task_id());
+    }
+
     LOG_INFO("coverage plugin: result " << result.task_id() << " covered_lines="
                                         << covered_lines);
 
     if (wave_task_ids_.empty()) {
-        SettleWave();
+        const int settled_wave = SettleWave();
+        SaveCheckpointLocked();
+        if (settled_wave >= 0 && !keep_staging_) {
+            if (!store_->clearWave(run_id_, settled_wave)) {
+                LOG_ERROR("coverage plugin: clearWave failed for wave " << settled_wave);
+            }
+        }
+    } else {
+        SaveCheckpointLocked();
     }
-    SaveCheckpointLocked();
 }
 
 bool SchedulerPlugin::runFinished() {
@@ -366,13 +489,20 @@ void SchedulerPlugin::cancel() {
     tasks_by_id_.clear();
     cumulative_.clear();
     current_wave_ = 0;
+    task_seq_ = 0;
     total_files_ = 0;
     selected_count_ = 0;
+    manifest_fingerprint_.clear();
     LOG_INFO("coverage plugin: run cancelled, task pool cleared");
 }
 
-void SchedulerPlugin::SettleWave() {
-    auto file_points = store_->loadWave(run_id_, static_cast<int>(current_wave_));
+int SchedulerPlugin::SettleWave() {
+    const int settled_wave = static_cast<int>(current_wave_);
+    std::unordered_map<std::string, std::set<std::uint64_t>> file_points;
+    if (!store_->loadWave(run_id_, settled_wave, &file_points)) {
+        LOG_ERROR("coverage plugin: loadWave failed for wave " << settled_wave);
+        return -1;
+    }
 
     // Batch greedy: repeatedly pick the file adding the most NEW points.
     std::vector<std::string> selected;
@@ -402,18 +532,29 @@ void SchedulerPlugin::SettleWave() {
         taken.insert(best);
         cumulative_.insert(file_points[best].begin(), file_points[best].end());
     }
-    selected_count_ += selected.size();
-
-    store_->appendSelected(run_id_, selected);
-    std::vector<std::uint64_t> cumulative_vec(cumulative_.begin(), cumulative_.end());
-    store_->saveCumulative(run_id_, static_cast<int>(current_wave_), cumulative_vec);
-    store_->saveRunSummary(run_id_, static_cast<int>(total_files_),
-                           static_cast<int>(selected_count_),
-                           static_cast<std::int64_t>(cumulative_.size()));
-    if (!keep_staging_) {
-        store_->clearWave(run_id_, static_cast<int>(current_wave_));
+    if (!store_->appendSelected(run_id_, selected)) {
+        LOG_ERROR("coverage plugin: appendSelected failed for wave " << settled_wave);
+        return -1;
     }
-    LOG_INFO("coverage plugin: wave " << current_wave_ << " settled, selected "
+    std::vector<std::uint64_t> cumulative_vec(cumulative_.begin(), cumulative_.end());
+    if (!store_->saveCumulative(run_id_, settled_wave, cumulative_vec)) {
+        LOG_ERROR("coverage plugin: saveCumulative failed for wave " << settled_wave);
+        return -1;
+    }
+    const size_t new_selected_count = selected_count_ + selected.size();
+    if (!store_->saveRunSummary(run_id_, static_cast<int>(total_files_),
+                                static_cast<int>(new_selected_count),
+                                static_cast<std::int64_t>(cumulative_.size()))) {
+        LOG_ERROR("coverage plugin: saveRunSummary failed for wave " << settled_wave);
+        return -1;
+    }
+    if (store_cov_ && !MergeWaveCoverage(settled_wave)) {
+        LOG_ERROR("coverage plugin: wave " << settled_wave
+                                           << " cov merge failed, run suspended");
+        return -1;
+    }
+    selected_count_ = new_selected_count;
+    LOG_INFO("coverage plugin: wave " << settled_wave << " settled, selected "
                                       << selected.size() << "/" << file_points.size()
                                       << " files, cumulative points=" << cumulative_.size());
 
@@ -435,6 +576,89 @@ void SchedulerPlugin::SettleWave() {
                                                             << " files, cumulative points="
                                                             << cumulative_.size());
     }
+    return settled_wave;
+}
+
+bool SchedulerPlugin::MergeWaveCoverage(int wave) {
+#ifdef _WIN32
+    const std::filesystem::path work_dir =
+        std::filesystem::temp_directory_path() /
+        ("tt-cov-" + run_id_ + "-w" + std::to_string(wave));
+    std::error_code ec;
+    std::filesystem::remove_all(work_dir, ec);
+    std::filesystem::create_directories(work_dir, ec);
+    if (ec) {
+        LOG_ERROR("coverage plugin: cannot create cov work dir: " << ec.message());
+        return false;
+    }
+
+    std::vector<std::string> wave_covs;
+    if (!store_->exportWaveCovs(run_id_, wave, work_dir.string(), wave_covs)) {
+        LOG_ERROR("coverage plugin: exportWaveCovs failed for wave " << wave);
+        return false;
+    }
+    std::string cumulative_path;
+    if (!store_->exportCumulativeCov(run_id_, work_dir.string(), cumulative_path)) {
+        LOG_ERROR("coverage plugin: exportCumulativeCov failed for wave " << wave);
+        return false;
+    }
+    if (wave_covs.empty() && cumulative_path.empty()) {
+        LOG_ERROR("coverage plugin: wave " << wave << " has no cov artifacts to merge");
+        return false;
+    }
+
+    std::string command = "\"" + opencppcoverage_ + "\" --quiet";
+    if (!cumulative_path.empty()) {
+        command += " --input_coverage=\"" + cumulative_path + "\"";
+    }
+    for (const std::string& path : wave_covs) {
+        command += " --input_coverage=\"" + path + "\"";
+    }
+    const std::string out_cov = (work_dir / "cumulative.cov").string();
+    const std::string out_xml = (work_dir / "summary.xml").string();
+    command += " --export_type=binary:" + out_cov;
+    command += " --export_type=cobertura:" + out_xml;
+
+    const int exit_code = RunCommand(command);
+    if (exit_code != 0) {
+        LOG_ERROR("coverage plugin: cov merge failed for wave " << wave
+                                                               << " exit=" << exit_code);
+        return false;
+    }
+    std::int64_t covered = 0;
+    std::int64_t total = 0;
+    if (!ParseCoverageTotals(out_xml, &covered, &total)) {
+        LOG_ERROR("coverage plugin: cannot parse merged cobertura for wave " << wave);
+        return false;
+    }
+    if (!store_->saveCumulativeCov(run_id_, wave, out_cov)) {
+        LOG_ERROR("coverage plugin: saveCumulativeCov failed for wave " << wave);
+        return false;
+    }
+    const double percent = total > 0 ? static_cast<double>(covered) / total : 0.0;
+    if (!store_->saveWaveSummary(run_id_, wave, covered, total, percent)) {
+        LOG_ERROR("coverage plugin: saveWaveSummary failed for wave " << wave);
+        return false;
+    }
+    std::filesystem::remove_all(work_dir, ec);
+    LOG_INFO("coverage plugin: wave " << wave << " total coverage=" << covered << "/"
+                                      << total << " (" << (percent * 100.0) << "%)");
+    return true;
+#else
+    LOG_ERROR("coverage plugin: cov merge requires OpenCppCoverage (Windows only)");
+    return false;
+#endif
+}
+
+std::string SchedulerPlugin::ManifestFingerprint() const {
+    std::ifstream in(manifest_path_, std::ios::binary);
+    if (!in.is_open()) {
+        return std::string();
+    }
+    std::ostringstream content;
+    content << in.rdbuf();
+    const std::string data = content.str();
+    return std::to_string(data.size()) + ":" + std::to_string(Fnv1a64(data));
 }
 
 }  // namespace coverage_plugin

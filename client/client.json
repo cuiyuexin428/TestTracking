@@ -18,6 +18,7 @@
       "enabled": true,
       "dry_run": true,
       "store_dir": "coverage_store",
+      "store_cov": false,
       "stp_root": "D:/stp_set",
       "opencppcoverage": "OpenCppCoverage.exe",
       "target_exe": "step.exe",

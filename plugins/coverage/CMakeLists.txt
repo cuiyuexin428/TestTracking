@@ -10,6 +10,7 @@ add_library(coverage SHARED
     src/SchedulerPlugin.cpp
     src/ClientPlugin.cpp
     src/CoverageStore.cpp
+    src/CoverageUtil.cpp
     ${THIRD_PARTY_ROOT}/tinyxml2/tinyxml2.cpp
     ${COVERAGE_PROTO_SRCS}
 )
