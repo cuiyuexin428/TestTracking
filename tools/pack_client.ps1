@@ -6,6 +6,8 @@ param(
     [string]$OutDir = 'client_package',
     [string]$Endpoint = 'tcp://127.0.0.1:5555',
     [string]$WorkerId = 'worker-1',
+    [string]$StoreType = 'file',
+    [string]$DbConn = '',
     [switch]$IncludePdb
 )
 $ErrorActionPreference = 'Stop'
@@ -43,6 +45,27 @@ if ($IncludePdb) {
     Get-ChildItem $BinDir -Filter '*.pdb' | Copy-Item -Destination $OutDir
 }
 
+$coverageCfg = @{
+    dll = 'coverage.dll'
+    enabled = $true
+    dry_run = $true
+    store_type = $StoreType
+    store_dir = 'store'
+    store_cov = $false
+    deploy_state = ''
+    deploy_max_attempts = 3
+    deploy_retry_delay_ms = 5000
+    program_dir = 'program'
+    stp_root = 'dataset'
+    export_dir = 'reports'
+    opencppcoverage = 'OpenCppCoverage.exe'
+    target_exe = 'StepTest.exe'
+    occt_dlls = @('TKernel.dll', 'TKBRep.dll', 'TKDESTEP.dll', 'TKTopAlgo.dll')
+}
+if ($DbConn) {
+    $coverageCfg['db_conn'] = $DbConn
+}
+
 $clientCfg = @{
     scheduler = @{
         endpoint = $Endpoint
@@ -55,23 +78,7 @@ $clientCfg = @{
     }
     plugins = @{
         demo = @{ dll = 'demo.dll'; enabled = $false }
-        coverage = @{
-            dll = 'coverage.dll'
-            enabled = $true
-            dry_run = $true
-            store_type = 'file'
-            store_dir = 'store'
-            store_cov = $false
-            deploy_state = ''
-            deploy_max_attempts = 3
-            deploy_retry_delay_ms = 5000
-            program_dir = 'program'
-            stp_root = 'dataset'
-            export_dir = 'reports'
-            opencppcoverage = 'OpenCppCoverage.exe'
-            target_exe = 'StepTest.exe'
-            occt_dlls = @('TKernel.dll', 'TKBRep.dll', 'TKDESTEP.dll', 'TKTopAlgo.dll')
-        }
+        coverage = $coverageCfg
     }
 } | ConvertTo-Json -Depth 6
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -91,8 +98,8 @@ client_package - standalone client
 1. MUST EDIT config/client.json
    - scheduler.endpoint: the scheduler address, e.g. tcp://192.168.1.100:5555
    - client.worker_id: must be unique per machine
-   - Optional PostgreSQL: set coverage.store_type to "postgres" and add
-     "db_conn": "host=<scheduler-ip> port=5432 dbname=testtracking user=postgres"
+   - When packaged with -StoreType postgres, db_conn points at the scheduler
+     machine's PostgreSQL and must be reachable from this machine.
 
 2. PREREQUISITES
    - Firewall must allow outbound to the scheduler port 5555
