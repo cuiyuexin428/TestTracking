@@ -19,5 +19,9 @@ Desktop.ini
 /tools/x64vax2602/
 /tools/x64vax2602.zip
 
+# Local PostgreSQL binaries archive (deployed separately, not part of the
+# project's third-party build)
+/third_party_src/downloads/postgresql-*.zip
+
 # Generated test/validation data (manifests, coverage staging)
 /testdata/

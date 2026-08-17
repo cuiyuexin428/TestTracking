@@ -28,15 +28,19 @@ TaskExecutor::~TaskExecutor() {
     stop();
 }
 
-void TaskExecutor::start(common::WorkerPlugin* plugin, CompletionCallback on_completed) {
+void TaskExecutor::start(common::WorkerPlugin* plugin, CompletionCallback on_completed,
+                         int thread_count) {
     if (plugin == nullptr) {
         throw std::invalid_argument("TaskExecutor: null plugin");
+    }
+    if (thread_count < 1) {
+        throw std::invalid_argument("TaskExecutor: thread_count must be >= 1");
     }
     std::lock_guard<std::mutex> lock(mutex_);
     plugin_ = plugin;
     on_completed_ = std::move(on_completed);
     cancelled_.store(false);
-    pool_ = std::make_unique<common::EventManager>(1);
+    pool_ = std::make_unique<common::EventManager>(thread_count);
 }
 
 void TaskExecutor::push(const common::Task& task) {

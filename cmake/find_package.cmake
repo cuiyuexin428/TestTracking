@@ -29,7 +29,7 @@ message(STATUS "THIRD_PARTY_ROOT=${THIRD_PARTY_ROOT}")
 
 # PostgreSQL client library (libpq) for DB-backed storage. Points at a local
 # PostgreSQL install (e.g. the unpacked binary zip used for development).
-set(PG_ROOT "D:/workTask/pg/pgsql" CACHE PATH
+set(PG_ROOT "C:/WorkSpace/ThirdParty/pgsql" CACHE PATH
     "PostgreSQL install root containing include/ lib/ bin/")
 set(PG_INCLUDE_DIR "${PG_ROOT}/include" CACHE PATH "libpq headers directory")
 set(PG_LIBRARY "${PG_ROOT}/lib/libpq.lib" CACHE FILEPATH "libpq import library")

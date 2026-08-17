@@ -5,7 +5,8 @@
   },
   "client": {
     "worker_id": "worker-1",
-    "heartbeat_interval_ms": 1000
+    "heartbeat_interval_ms": 1000,
+    "task_threads": 1
   },
   "plugins": {
     "demo": {

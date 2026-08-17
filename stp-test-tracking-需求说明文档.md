@@ -2,10 +2,10 @@
 
 | 项目名称 | stp-test-tracking 通用测试执行调度系统 |
 | --- | --- |
-| 文档版本 | v0.6（框架设计讨论稿） |
-| 状态 | 讨论稿 |
-| 日期 | 2026-08-15 |
-| 上一版本 | v0.5（2026-08-12），本文重写框架与执行流部分 |
+| 文档版本 | v0.7（本轮重构计划） |
+| 状态 | 计划中 |
+| 日期 | 2026-08-17 |
+| 上一版本 | v0.6（2026-08-15），本文在其基础上新增本轮重构计划 |
 
 ## 1. 系统定位与设计原则
 
@@ -299,3 +299,73 @@ public:
 3. ✅ 调度端 runs/tasks 落库 + 启动时把遗留 running run 标记为 interrupted。
 4. ✅ 真实 stp 环境验证（8 文件真实执行 + 双客户端并发 + 重启恢复，全部通过）。
 5. ⏳ 重启后任务池自动恢复（需插件 restore 接口，利用 tasks.payload）。
+
+## 15. 本轮重构计划（v0.7）
+
+### 15.1 目标与原则
+
+本轮目标：把任务定义为与执行粒度一致的原子单元，把并发交回框架；客户端全权决定拉取任务的时机与数量，服务端不做并发上限；客户端与服务端采用对称的"通信模块 + 调度/状态机"结构。重构从客户端框架开始。
+
+原则：
+
+1. 任务在服务端框架、客户端框架保持同一语义，客户端插件不再拆解任务。
+2. 并发由框架负责：客户端框架以可配置 N 个线程执行任务，插件不管理线程。
+3. 客户端自主决定一次请求几个任务（count），服务端有任务即按请求尽量满足（仅注册门禁例外），服务端不设上限。
+4. 服务端只负责 in-flight 记账、任务回执、租约/回收/停止；波次、批次、任务池与结算由具体插件闭环。
+5. 批量授予只发生在传输层，不改变任务原子性。
+
+### 15.2 框架 → 模块 → 类明细
+
+按框架分组，每个框架一个表；"待改进项目"列按行阅读，完成情况随实现推进更新。
+
+#### 客户端框架（本轮开始）
+
+| 模块 | 类/文件 | 功能 | 待改进项目 | 完成情况 |
+| --- | --- | --- | --- | --- |
+| 客户端主体（状态机） | Client | 主线程状态机：注册 → READY → 拉取任务 → 执行 → 逐条上报结果；心跳与退避 | 1) 单任务状态枚举改为计数驱动：空闲槽位 = N - 在飞数 - 未应答请求数<br>2) 收到 TASK 后逐任务 ACK、逐任务推入执行池（批量 list 解析待第 3 步）<br>3) 收到 NO_TASK 整组退避<br>4) 去掉 REQUEST_TASK 超时重发（一个请求一个回复）<br>5) 心跳 BUSY 改为"在飞数 > 0" | 本轮进行中（计数驱动状态机已实现；批量请求待第 3 步） |
+| 执行池 | TaskExecutor | 框架级并发执行任务：一个 worker 执行一个任务，完成后回调上报 | 1) 1 线程改为 N 线程可配置，复用 common::EventManager(N)<br>2) 每任务一个 Event<br>3) STOP 语义保持：执行中的任务等完成后结果丢弃，未执行任务丢弃 | 本轮已实现（N 线程可配置） |
+| 客户端通信组件（新增） | ClientComm（暂定名） | 与服务端服务模块对称：一个线程 + input/output 两个队列，负责 socket 收发 | 状态机不再直接碰 socket<br>心跳时机由状态机决定，组件只负责发出<br>注册阶段保持同步完成后再启动 | 规划中（第二步，不在本轮） |
+
+#### 服务端框架
+
+| 模块 | 类/文件 | 功能 | 待改进项目 | 完成情况 |
+| --- | --- | --- | --- | --- |
+| 服务模块 | Server | 一个线程循环维护 input/output 队列：收注册/心跳/请求任务/任务回执/任务结果；发任务/无任务/命令 | 1) 修复 HWM 满时 break 导致收发循环退出的 bug（应为 continue）<br>2) 支持一个 TASK 信封携带最多 count 个任务<br>3) 出站吞吐优化（poll 同时等收发，避免每轮先等收再发一条） | 未开始 |
+| 调度模块 | Scheduler | 从服务模块取消息、拆信封；in-flight 记账/租约/回收/STOP；调用插件；管理 run 生命周期 | 1) 去掉"每客户端最多 1 个在飞"门禁，改为按请求 count 循环调用插件 requestTask 批量授予，服务端不设上限<br>2) 注册门禁保留，count <= 0 回 NO_TASK<br>3) 旧 run 完成时补 storage_.FinishRun<br>4) 明确两段式记账：派发 → ACK 后标记已确认 → 结果回来后进入插件结果处理池 | 部分完成（已去掉每客户端 1 个在飞门禁；批量授予待协议批量字段） |
+| 持久化 | Storage | runs/tasks 落库、重启标记 interrupted、任务 reclaim | 1) 非 Windows 平台实现（当前 void* conn_ + PQ 调用无法编译）<br>2) ReclaimTasks 数组转义健壮性 | 已实现（Windows），待验证 |
+
+#### 通信协议
+
+| 模块 | 类/文件 | 功能 | 待改进项目 | 完成情况 |
+| --- | --- | --- | --- | --- |
+| 消息定义 | command.proto / communication.proto / common.proto | Envelope 信封、框架命令、任务与结果载体 | 1) RequestTaskCommand 增加 count 字段（期望任务数）<br>2) TaskCommand 单 Task 改为 repeated Task tasks，数量由 tasks_size 隐含，客户端按 list 解析<br>3) 逐任务 TASK_ACK、逐任务 TASK_REPORT 保持不变<br>4) 更新 common.proto 注释：区分框架字段（run_id/task_id/exit_code/count 等）与业务 opaque payload | 未开始 |
+
+#### 插件框架
+
+| 模块 | 类/文件 | 功能 | 待改进项目 | 完成情况 |
+| --- | --- | --- | --- | --- |
+| 服务端插件规范 | TaskPlugin | init/validateClient/plan/requestTask/processResult/runFinished/cancel/requeue | 接口不变：requestTask 仍一次给一个任务，批量由调度模块循环调用<br>补充并发调用契约注释（processResult 在结果池线程，其余在调度线程） | 保持 |
+| 客户端插件规范 | WorkerPlugin | init/collectRegistrationInfo/handleValidationReply/execute | 明确契约：execute 与框架一个 worker 一一对应，插件不得自行管理线程/并发 | 保持 |
+
+#### 覆盖率插件
+
+| 模块 | 类/文件 | 功能 | 待改进项目 | 完成情况 |
+| --- | --- | --- | --- | --- |
+| 客户端插件 | CoverageClientPlugin（含 ExcuteEvent） | 执行任务：跑 OpenCppCoverage、解析 cobertura、写 CoverageStore、组装 FileCoverage 结果 | 1) 删除自建 EventManager 池、ExcuteEvent、pending_/files_/mutex_/cv_<br>2) task_threads 配置上移为客户端框架配置<br>3) execute 变为纯任务逻辑：单文件任务直跑，文件列表任务顺序执行 | 本轮（客户端框架之后），未动工 |
+| 服务端插件 | CoverageSchedulerPlugin | 波次/批次/任务池管理、注册校验、按请求给任务、波次结算与贪心选择 | 1) 任务粒度（单文件 vs 批）由插件内部决策，框架不感知<br>2) 清理 task_client_ 等死状态<br>3) MakePoint 路径哈希改 64 位（Fnv1a64），消除 4 万文件规模碰撞风险 | 保持/微调 |
+| 覆盖率存储 | CoverageStore（File/PostgreSQL 后端） | 波次点集、cov 工件、cumulative、selected、summary | PostgreSQL 后端跨平台（当前仅 Windows） | 已实现（Windows），待验证 |
+
+#### 通用基础组件
+
+| 模块 | 类/文件 | 功能 | 待改进项目 | 完成情况 |
+| --- | --- | --- | --- | --- |
+| 阻塞队列 | BlockingQueue | 超时 pop、pushFront、clear、notifyAll | 顶部注释仍写 placeholder skeleton，更新为正式实现说明 | 已实现 |
+| 事件池 | EventManager | 多线程事件分发 | 无（客户端 TaskExecutor 复用其 N 线程能力） | 已实现 |
+
+### 15.3 本轮实施顺序
+
+1. 客户端框架：TaskExecutor N 线程池 + 计数驱动状态机（本轮从这里开始）；
+2. 覆盖率客户端插件瘦身（删除自建并发）；
+3. 协议批量字段（RequestTaskCommand.count、TaskCommand.repeated tasks）；
+4. 服务端批量授予与门禁调整（去掉每客户端 1 个在飞限制，服务端不设上限）；
+5. e2e 回归：demo 主流程、覆盖率多波次、STOP 路径、批量并发。

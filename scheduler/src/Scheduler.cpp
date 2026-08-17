@@ -331,24 +331,6 @@ void Scheduler::HandleRequestTask(const IncomingMessage& msg) {
         }
     }
 
-    // One task in flight per client: never grant a second task.
-    bool has_inflight = false;
-    {
-        std::lock_guard<std::mutex> lock(in_flight_mutex_);
-        for (const auto& item : in_flight_) {
-            if (item.second.identity == msg.identity) {
-                has_inflight = true;
-                break;
-            }
-        }
-    }
-    if (has_inflight) {
-        LOG_WARN("request_task: client " << msg.identity
-                                         << " already has an in-flight task, no task granted");
-        SendNoTask(msg.identity, plugin_type);
-        return;
-    }
-
     common::TaskPlugin* plugin = it->second;
     common::ClientInfo client;
     client.identity = msg.identity;

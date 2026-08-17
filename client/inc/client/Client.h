@@ -30,27 +30,14 @@ struct ClientPluginDeleter {
     }
 };
 
-// Client state machine (main thread drives it):
-//   INIT           load plugins + REGISTER validation (no threads)
-//   READY          heartbeat, receive, send REQUEST_TASK when due
-//   REQUEST_TASK   heartbeat, receive; TASK -> EXECUTING, NO_TASK -> READY
-//   EXECUTING      heartbeat, receive; completion -> TASK_COMPLETED,
-//                  STOP -> stop executor -> READY
-//   TASK_COMPLETED heartbeat, send result -> READY
-//   STOPPED        shutdown
-enum class ClientState {
-    kInit,
-    kReady,
-    kRequesting,
-    kExecuting,
-    kTaskCompleted,
-    kStopped,
-};
-
-// The main thread is the state machine: it owns the DEALER socket and drives
-// all transitions. Tasks are executed by a TaskExecutor backed by a single
-// common::EventManager worker; the executor signals completion by setting
-// kTaskCompleted and queueing the result.
+// The main thread is a counter-driven state machine: it owns the DEALER
+// socket and drives task acquisition. task_slots_ is the configured worker
+// count, in_flight_ counts tasks handed to the executor, and
+// outstanding_requests_ counts REQUEST_TASK messages awaiting a reply. The
+// client sends one request per free slot; the server grants one task per
+// request (registration gate only), so the client fully controls how many
+// tasks it pulls. Tasks are executed by a TaskExecutor worker pool; each
+// completed task queues its result for the main thread to report.
 class Client {
 public:
     explicit Client(common::Config& config);
@@ -99,13 +86,14 @@ private:
 
     // Shared with the executor thread.
     mutable std::mutex state_mutex_;
-    ClientState state_ = ClientState::kInit;
+    int in_flight_ = 0;
+    int outstanding_requests_ = 0;
+    int task_slots_ = 1;
     common::BlockingQueue<common::TaskResult> completed_results_;
 
     // State machine timing (main thread only).
     std::chrono::steady_clock::time_point last_heartbeat_;
     std::chrono::steady_clock::time_point next_request_;
-    std::chrono::steady_clock::time_point request_sent_at_;
     std::chrono::milliseconds backoff_;
 
     std::string worker_id_;
@@ -114,7 +102,6 @@ private:
     std::chrono::milliseconds poll_timeout_;
     std::chrono::milliseconds request_backoff_initial_;
     std::chrono::milliseconds request_backoff_max_;
-    std::chrono::milliseconds request_timeout_;
     int register_timeout_ms_ = 0;  // <=0 means registration waits forever
     int register_max_attempts_ = 5;
 };

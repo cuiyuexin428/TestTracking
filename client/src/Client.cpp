@@ -23,13 +23,13 @@ namespace client {
 Client::Client(common::Config& config)
     : config_(config),
       dealer_(config.get("scheduler.endpoint", std::string("tcp://127.0.0.1:5555"))),
+      task_slots_(std::max(1, config.get("client.task_threads", 1))),
       worker_id_(config.get("client.worker_id", std::string("worker-1"))),
       ip_(config.get("client.ip", std::string())),
       heartbeat_interval_(config.get("client.heartbeat_interval_ms", 1000)),
       poll_timeout_(config.get("scheduler.poll_timeout_ms", 50)),
       request_backoff_initial_(config.get("client.request_backoff_initial_ms", 1000)),
       request_backoff_max_(config.get("client.request_backoff_max_ms", 30000)),
-      request_timeout_(config.get("client.request_timeout_ms", 5000)),
       register_timeout_ms_(config.get("client.register_timeout_ms", 0)),
       register_max_attempts_(config.get("client.register_max_attempts", 5)) {
 }
@@ -59,12 +59,10 @@ void Client::start() {
         return;
     }
 
-    // INIT passed: start the executor on a single EventManager worker.
-    executor_.start(plugin_, [this](const common::TaskResult& result) { OnTaskCompleted(result); });
-    {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        state_ = ClientState::kReady;
-    }
+    // INIT passed: start the executor worker pool.
+    executor_.start(plugin_,
+                    [this](const common::TaskResult& result) { OnTaskCompleted(result); },
+                    task_slots_);
 
     running_.store(true);
     RunStateMachine();
@@ -75,11 +73,12 @@ void Client::stop() {
     if (!running_.exchange(false)) {
         return;
     }
+    executor_.stop();
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        state_ = ClientState::kStopped;
+        in_flight_ = 0;
+        outstanding_requests_ = 0;
     }
-    executor_.stop();
 }
 
 bool Client::LoadPlugins() {
@@ -297,41 +296,27 @@ void Client::RunStateMachine() {
             SendHeartbeat();
         }
 
-        ClientState state;
-        {
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            state = state_;
+        // Report completed tasks; workers queue results as they finish.
+        common::TaskResult result;
+        while (completed_results_.pop(result, std::chrono::milliseconds(0))) {
+            SendTaskReport(result);
+            backoff_ = request_backoff_initial_;
         }
 
-        if (state == ClientState::kTaskCompleted) {
-            common::TaskResult result;
-            if (completed_results_.pop(result, std::chrono::milliseconds(0))) {
-                SendTaskReport(result);
-                backoff_ = request_backoff_initial_;
-            }
-            {
+        // Pull one task per free slot. The server grants one task per
+        // request (registration gate only), so the client controls capacity.
+        int free_slots = 0;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            free_slots = task_slots_ - in_flight_ - outstanding_requests_;
+        }
+        if (free_slots > 0 && now >= next_request_) {
+            for (int i = 0; i < free_slots; ++i) {
+                SendRequestTask();
                 std::lock_guard<std::mutex> lock(state_mutex_);
-                if (completed_results_.empty() && state_ == ClientState::kTaskCompleted) {
-                    state_ = ClientState::kReady;
-                }
-            }
-            next_request_ = now;
-        } else if (state == ClientState::kReady) {
-            if (now >= next_request_) {
-                SendRequestTask();
-                request_sent_at_ = now;
-                {
-                    std::lock_guard<std::mutex> lock(state_mutex_);
-                    state_ = ClientState::kRequesting;
-                }
-            }
-        } else if (state == ClientState::kRequesting) {
-            if (now - request_sent_at_ >= request_timeout_) {
-                SendRequestTask();
-                request_sent_at_ = now;
+                ++outstanding_requests_;
             }
         }
-        // kExecuting: wait for the executor's completion callback.
 
         common::Envelope out;
         while (outgoing_.pop(out, std::chrono::milliseconds(0))) {
@@ -355,11 +340,13 @@ void Client::HandleEnvelope(const common::Envelope& env) {
             break;
         case common::NO_TASK: {
             std::lock_guard<std::mutex> lock(state_mutex_);
-            if (state_ == ClientState::kRequesting) {
-                backoff_ = std::min(backoff_ * 2, request_backoff_max_);
-                next_request_ = std::chrono::steady_clock::now() + backoff_;
-                state_ = ClientState::kReady;
-                LOG_INFO("client: no task, next request in " << backoff_.count() << " ms");
+            if (outstanding_requests_ > 0) {
+                --outstanding_requests_;
+                if (outstanding_requests_ == 0) {
+                    backoff_ = std::min(backoff_ * 2, request_backoff_max_);
+                    next_request_ = std::chrono::steady_clock::now() + backoff_;
+                    LOG_INFO("client: no task, next request in " << backoff_.count() << " ms");
+                }
             }
             break;
         }
@@ -370,9 +357,7 @@ void Client::HandleEnvelope(const common::Envelope& env) {
             backoff_ = request_backoff_initial_;
             {
                 std::lock_guard<std::mutex> lock(state_mutex_);
-                if (state_ == ClientState::kReady) {
-                    next_request_ = std::chrono::steady_clock::now();
-                }
+                next_request_ = std::chrono::steady_clock::now();
             }
             LOG_INFO("client: wake");
             break;
@@ -390,11 +375,13 @@ void Client::HandleStop() {
     completed_results_.clear();
     // Restart a fresh executor so tasks of a new run can be executed.
     executor_.start(plugin_,
-                    [this](const common::TaskResult& result) { OnTaskCompleted(result); });
+                    [this](const common::TaskResult& result) { OnTaskCompleted(result); },
+                    task_slots_);
     backoff_ = request_backoff_initial_;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        state_ = ClientState::kReady;
+        in_flight_ = 0;
+        outstanding_requests_ = 0;
         next_request_ = std::chrono::steady_clock::now();
     }
 }
@@ -422,7 +409,7 @@ void Client::HandleMessage(const common::Envelope& env) {
 void Client::OnTaskCompleted(const common::TaskResult& result) {
     completed_results_.push(result);
     std::lock_guard<std::mutex> lock(state_mutex_);
-    state_ = ClientState::kTaskCompleted;
+    --in_flight_;
 }
 
 void Client::HandleTask(const common::TaskCommand& command, const std::string& plugin_type) {
@@ -430,6 +417,10 @@ void Client::HandleTask(const common::TaskCommand& command, const std::string& p
                              << " run=" << command.run_id());
     if (plugin_ != nullptr && plugin_type != plugin_->pluginType()) {
         LOG_WARN("client: plugin_type mismatch, ignoring task " << command.task().task_id());
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (outstanding_requests_ > 0) {
+            --outstanding_requests_;
+        }
         return;
     }
     // Task receipt: confirm delivery before execution.
@@ -441,9 +432,10 @@ void Client::HandleTask(const common::TaskCommand& command, const std::string& p
 
     executor_.push(command.task());
     std::lock_guard<std::mutex> lock(state_mutex_);
-    if (state_ == ClientState::kReady || state_ == ClientState::kRequesting) {
-        state_ = ClientState::kExecuting;
+    if (outstanding_requests_ > 0) {
+        --outstanding_requests_;
     }
+    ++in_flight_;
 }
 
 void Client::SendHeartbeat() {
@@ -454,8 +446,8 @@ void Client::SendHeartbeat() {
     heartbeat->set_ip(ip_);
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        heartbeat->set_status(state_ == ClientState::kExecuting ? common::Heartbeat::BUSY
-                                                                : common::Heartbeat::IDLE);
+        heartbeat->set_status(in_flight_ > 0 ? common::Heartbeat::BUSY
+                                             : common::Heartbeat::IDLE);
     }
     common::ResourceUsage* resource = heartbeat->mutable_resource();
 #ifdef _WIN32
