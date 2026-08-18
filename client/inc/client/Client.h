@@ -66,7 +66,7 @@ private:
     void HandleEnvelope(const common::Envelope& env);
     void HandleTask(const common::TaskCommand& command, const std::string& plugin_type);
     void HandleMessage(const common::Envelope& env);
-    void HandleStop();
+    void HandleStop(const std::string& run_id, const std::string& reason);
     void OnTaskCompleted(const common::TaskResult& result);
     void SendHeartbeat();
     bool SendRequestTask(int count);

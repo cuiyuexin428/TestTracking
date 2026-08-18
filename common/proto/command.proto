@@ -60,7 +60,7 @@ message TaskRejectCommand {
   string reason = 2;
 }
 
-// Wake a sleeping client (reserved).
+// Wake a sleeping client (sent by the scheduler's wakeup command).
 message WakeCommand {}
 
 // Stop execution (server -> client). The server reclaims this client's

@@ -192,3 +192,4 @@ pause
 }
 
 Write-Host "done. copy '$OutDir' to the target machine and run start_client.bat"
+Write-Host "NOTE: endpoint/db_conn default to this environment (192.168.100.2); pass -Endpoint/-DbConn for other machines."

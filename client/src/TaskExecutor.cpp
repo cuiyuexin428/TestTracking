@@ -2,6 +2,7 @@
 
 #include "common/Logger.h"
 
+#include <chrono>
 #include <stdexcept>
 #include <utility>
 
@@ -59,6 +60,7 @@ void TaskExecutor::push(const common::Task& task) {
     auto action = [plugin, on_completed, &cancelled, task] {
         common::TaskResult result;
         result.set_task_id(task.task_id());
+        const auto start = std::chrono::steady_clock::now();
         bool ok = false;
         try {
             ok = plugin->execute(task, result);
@@ -72,6 +74,10 @@ void TaskExecutor::push(const common::Task& task) {
         if (!ok) {
             result.set_exit_code(-1);
         }
+        result.set_duration_ms(static_cast<std::int64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start)
+                .count()));
         if (!cancelled.load(std::memory_order_relaxed) && on_completed) {
             on_completed(result);
         }

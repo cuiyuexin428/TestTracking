@@ -8,9 +8,9 @@
 
 namespace common {
 
-// Minimal blocking queue. This is a placeholder skeleton; timeout-aware
-// pop and close semantics will be added when the component is formally
-// implemented.
+// Thread-safe blocking queue with timeout-aware pop, pushFront and clear.
+// pop blocks until an item is available or the timeout expires; pushFront
+// re-queues an item at the head for retry.
 template <typename T>
 class BlockingQueue {
 public:

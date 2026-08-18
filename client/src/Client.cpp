@@ -437,7 +437,9 @@ void Client::HandleEnvelope(const common::Envelope& env) {
             break;
         }
         case common::STOP:
-            HandleStop();
+            if (env.has_stop()) {
+                HandleStop(env.stop().run_id(), env.stop().reason());
+            }
             break;
         case common::WAKE: {
             const bool was_silent = silent_.exchange(false);
@@ -456,8 +458,9 @@ void Client::HandleEnvelope(const common::Envelope& env) {
     }
 }
 
-void Client::HandleStop() {
-    LOG_WARN("client: STOP received, stopping executor and entering silent state");
+void Client::HandleStop(const std::string& run_id, const std::string& reason) {
+    LOG_WARN("client: STOP received run_id=" << run_id << " reason=" << reason
+                                             << ", stopping executor and entering silent state");
     // Drops queued tasks; the server reclaims them from its in_flight table.
     executor_.stop();
     // Drop results of the stopped run so they are not reported later.

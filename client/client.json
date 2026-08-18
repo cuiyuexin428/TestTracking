@@ -19,13 +19,17 @@
       "dry_run": true,
       "store_dir": "coverage_store",
       "store_cov": false,
-      "deploy_state": "",
-      "deploy_max_attempts": 3,
-      "deploy_retry_delay_ms": 5000,
-      "stp_root": "D:/stp_set",
-      "opencppcoverage": "OpenCppCoverage.exe",
-      "target_exe": "step.exe",
-      "occt_dlls": ["TKernel.dll", "TKSTEP.dll"]
+      "program_dir": "testenv/program",
+      "stp_root": "testenv/dataset",
+      "export_dir": "reports",
+      "opencppcoverage": "testenv/opencppcoverage/OpenCppCoverage.exe",
+      "target_exe": "testenv/program/StepTest.exe",
+      "occt_dlls": [
+        "testenv/program/TKernel.dll",
+        "testenv/program/TKBRep.dll",
+        "testenv/program/TKDESTEP.dll",
+        "testenv/program/TKTopAlgo.dll"
+      ]
     }
   }
 }

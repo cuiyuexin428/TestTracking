@@ -74,8 +74,10 @@ void Server::RunLoop() {
                 } else {
                     // Send queue full (HWM): keep this message at the head so
                     // ordering is preserved and it is retried next round.
+                    // If this keeps happening in production it is a P0 sign
+                    // that the server thread is not draining the queue.
                     outgoing_.pushFront(std::move(out));
-                    break;
+                    continue;
                 }
             }
         } catch (const std::exception& e) {

@@ -16,7 +16,6 @@
       "dll": "coverage.dll",
       "enabled": true,
       "stp_manifest": "C:/Shared/dataset/manifest.txt",
-      "store_dir": "C:/WorkSpace/TestTracking/testdata/coverage_store",
       "store_type": "postgres",
       "db_conn": "host=127.0.0.1 port=5432 dbname=testtracking user=postgres",
       "batch_size": 1000,
