@@ -8,6 +8,9 @@ param(
     [string]$WorkerId = 'worker-1',
     [string]$StoreType = 'file',
     [string]$DbConn = '',
+    [switch]$Deployed,
+    [string]$ProgramVersion = '',
+    [string]$DatasetVersion = '',
     [switch]$DryRun,
     [switch]$StoreCov,
     [switch]$IncludePdb
@@ -66,6 +69,11 @@ $coverageCfg = @{
 }
 if ($DbConn) {
     $coverageCfg['db_conn'] = $DbConn
+}
+if ($Deployed) {
+    $coverageCfg['deployed'] = $true
+    $coverageCfg['program_version'] = $ProgramVersion
+    $coverageCfg['dataset_version'] = $DatasetVersion
 }
 
 $clientCfg = @{
