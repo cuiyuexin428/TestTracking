@@ -119,18 +119,23 @@ if (-not $OnlyClient -and -not $OnlyProgram) {
     }
     New-Item -ItemType Directory -Force $dataDir | Out-Null
     if (Get-Command robocopy -ErrorAction SilentlyContinue) {
-        & robocopy $DatasetDir $dataDir *.stp /NFL /NDL /NJH /NJS /NP | Out-Null
+        & robocopy $DatasetDir $dataDir *.stp /E /NFL /NDL /NJH /NJS /NP | Out-Null
         if ($LASTEXITCODE -ge 8) {
             throw "robocopy failed with exit code $LASTEXITCODE"
         }
     } else {
-        Get-ChildItem $DatasetDir -File -Filter *.stp | Copy-Item -Destination $dataDir
+        Get-ChildItem $DatasetDir -File -Filter *.stp -Recurse | ForEach-Object {
+            $rel = $_.FullName.Substring((Resolve-Path $DatasetDir).Path.Length + 1)
+            $dest = Join-Path $dataDir $rel
+            New-Item -ItemType Directory -Force (Split-Path $dest -Parent) | Out-Null
+            Copy-Item -LiteralPath $_.FullName -Destination $dest
+        }
     }
     [System.IO.File]::WriteAllText(
         (Join-Path $dataDir 'version.txt'),
         $DatasetVersion,
         (New-Object System.Text.UTF8Encoding($false)))
-    $count = (Get-ChildItem $dataDir -File -Filter *.stp | Measure-Object).Count
+    $count = (Get-ChildItem $dataDir -File -Filter *.stp -Recurse | Measure-Object).Count
     Write-Host "built testenv\dataset ($count files, version $DatasetVersion)"
 }
 
