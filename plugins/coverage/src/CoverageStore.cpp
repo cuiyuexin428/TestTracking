@@ -162,6 +162,29 @@ public:
         return true;
     }
 
+    bool loadFileCoverage(const std::string& run_id, int wave, const std::string& file,
+                          std::set<std::uint64_t>* points) override {
+        if (points == nullptr) {
+            return false;
+        }
+        points->clear();
+        const std::filesystem::path path =
+            std::filesystem::path(WaveDir(store_dir_, run_id, wave)) /
+            PointFileName(file);
+        std::ifstream in(path.string());
+        if (!in.is_open()) {
+            return false;
+        }
+        const nlohmann::json json = nlohmann::json::parse(in, nullptr, false);
+        if (json.is_discarded() || !json.contains("points")) {
+            return false;
+        }
+        for (const nlohmann::json& point : json["points"]) {
+            points->insert(point.get<std::uint64_t>());
+        }
+        return true;
+    }
+
     bool clearWave(const std::string& run_id, int wave) override {
         std::error_code ec;
         std::filesystem::remove_all(WaveDir(store_dir_, run_id, wave), ec);
@@ -576,6 +599,46 @@ public:
             PQclear(result);
             return false;
         }
+    }
+
+    bool loadFileCoverage(const std::string& run_id, int wave, const std::string& file,
+                          std::set<std::uint64_t>* points) override {
+        if (points == nullptr) {
+            return false;
+        }
+        points->clear();
+        std::lock_guard<std::mutex> lock(mutex_);
+        const char* sql = "SELECT points FROM coverage_wave_points "
+                          "WHERE run_id=$1 AND wave_id=$2 AND file=$3";
+        const std::vector<PgParam> params = {
+            {run_id, false}, {std::to_string(wave), false}, {file, false}};
+        std::vector<const char*> values;
+        std::vector<int> lengths;
+        std::vector<int> formats;
+        for (const PgParam& p : params) {
+            values.push_back(p.value.data());
+            lengths.push_back(static_cast<int>(p.value.size()));
+            formats.push_back(0);
+        }
+        PGresult* result =
+            PQexecParams(conn_, sql, static_cast<int>(params.size()), nullptr, values.data(),
+                         lengths.data(), formats.data(), 0);
+        if (result == nullptr || PQresultStatus(result) != PGRES_TUPLES_OK) {
+            LOG_ERROR("coverage store: loadFileCoverage failed: "
+                      << (result ? PQresultErrorMessage(result) : PQerrorMessage(conn_)));
+            PQclear(result);
+            return false;
+        }
+        const bool found = PQntuples(result) > 0;
+        if (found) {
+            const std::string blob =
+                DecodeByteaText(PQgetvalue(result, 0, 0), PQgetlength(result, 0, 0));
+            for (std::uint64_t p : UnpackPoints(blob)) {
+                points->insert(p);
+            }
+        }
+        PQclear(result);
+        return found;
     }
 
     bool clearWave(const std::string& run_id, int wave) override {

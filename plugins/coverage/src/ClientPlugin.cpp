@@ -11,9 +11,11 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace coverage_plugin {
@@ -133,6 +135,7 @@ bool ClientPlugin::init(const std::string& config) {
     export_dir_ = cfg.value("export_dir", std::string());
     keep_reports_ = cfg.value("keep_reports", false);
     store_cov_ = cfg.value("store_cov", false);
+    dry_run_delay_ms_ = cfg.value("dry_run_delay_ms", 0);
     for (const nlohmann::json& dll : cfg.value("occt_dlls", nlohmann::json::array())) {
         occt_dlls_.push_back(dll.get<std::string>());
     }
@@ -237,9 +240,20 @@ bool ClientPlugin::execute(const common::Task& task, common::TaskResult& result)
 
         std::vector<std::uint64_t> points;
         bool ok = false;
-        if (dry_run_) {
+        std::set<std::uint64_t> existing;
+        const bool already_covered =
+            store_->loadFileCoverage(cov_task.run_id(), cov_task.wave_id(), file, &existing);
+        if (already_covered) {
+            points.assign(existing.begin(), existing.end());
+            ok = true;
+            LOG_INFO("coverage plugin: file " << file << " already covered, skip ("
+                                              << points.size() << " lines)");
+        } else if (dry_run_) {
             points = SyntheticPoints(file);
             ok = true;
+            if (dry_run_delay_ms_ > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(dry_run_delay_ms_));
+            }
         } else {
             ok = RunOneFile(cov_task.run_id(), cov_task.wave_id(), file, points);
         }

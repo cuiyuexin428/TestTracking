@@ -133,6 +133,24 @@ bool Scheduler::stopRun(const std::string& plugin_type) {
     return true;
 }
 
+void Scheduler::wakeupClients(const std::string& plugin_type) {
+    std::vector<std::string> identities;
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex_);
+        for (const auto& entry : clients_) {
+            if (plugin_type.empty() || entry.second.info.plugin_type == plugin_type) {
+                identities.push_back(entry.first);
+            }
+        }
+    }
+    common::Envelope env;
+    env.set_type(common::WAKE);
+    for (const std::string& identity : identities) {
+        server_.sendTo(identity, env);
+        LOG_INFO("wakeup sent to " << identity);
+    }
+}
+
 std::vector<common::ClientInfo> Scheduler::clients() const {
     std::lock_guard<std::mutex> lock(clients_mutex_);
     std::vector<common::ClientInfo> out;

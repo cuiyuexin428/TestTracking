@@ -38,6 +38,7 @@ private:
     std::string export_dir_;
     bool keep_reports_ = false;  // validation only: keep cobertura XMLs
     bool store_cov_ = false;     // keep OpenCppCoverage .cov binaries in the store
+    int dry_run_delay_ms_ = 0;   // test only: per-file delay in dry run mode
     std::vector<std::string> occt_dlls_;
 
     // Component versions read from version.txt files in the package.

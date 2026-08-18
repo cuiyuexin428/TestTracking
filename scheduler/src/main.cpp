@@ -70,6 +70,7 @@ void PrintHelp() {
         "  help                                     show this help\n"
         "  run <plugin_type> <dataset_version> [params]  start a run\n"
         "  stop <plugin_type>                          stop the active run\n"
+        "  wakeup [plugin_type]                        resume stopped clients\n"
         "  clients                                  list connected clients\n"
         "  status                                   plugins and in-flight tasks\n"
         "  quit                                     stop the scheduler\n");
@@ -127,6 +128,12 @@ int main(int argc, char* argv[]) {
                 PrintHelp();
             } else if (line == "clients") {
                 PrintClients(sched.clients());
+            } else if (line == "wakeup" || line.rfind("wakeup ", 0) == 0) {
+                std::istringstream in(line);
+                std::string cmd;
+                std::string plugin_type;
+                in >> cmd >> plugin_type;
+                sched.wakeupClients(plugin_type);
             } else if (line == "status") {
                 std::printf("plugins=%zu in_flight=%zu\n", sched.pluginCount(),
                             sched.inFlightCount());

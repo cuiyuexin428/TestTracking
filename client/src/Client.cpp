@@ -382,15 +382,17 @@ void Client::RunStateMachine() {
 
         // Ask for all free slots in one request; the server grants up to
         // count tasks in a single reply. At most one request is outstanding.
-        int free_slots = 0;
-        {
-            std::lock_guard<std::mutex> lock(counters_mutex_);
-            free_slots = task_slots_ - in_flight_ - outstanding_requests_;
-        }
-        if (free_slots > 0 && outstanding_requests_ == 0 && now >= next_request_) {
-            if (SendRequestTask(free_slots)) {
+        if (!silent_.load(std::memory_order_relaxed)) {
+            int free_slots = 0;
+            {
                 std::lock_guard<std::mutex> lock(counters_mutex_);
-                outstanding_requests_ = 1;
+                free_slots = task_slots_ - in_flight_ - outstanding_requests_;
+            }
+            if (free_slots > 0 && outstanding_requests_ == 0 && now >= next_request_) {
+                if (SendRequestTask(free_slots)) {
+                    std::lock_guard<std::mutex> lock(counters_mutex_);
+                    outstanding_requests_ = 1;
+                }
             }
         }
 
@@ -437,14 +439,17 @@ void Client::HandleEnvelope(const common::Envelope& env) {
         case common::STOP:
             HandleStop();
             break;
-        case common::WAKE:
+        case common::WAKE: {
+            const bool was_silent = silent_.exchange(false);
             backoff_ = request_backoff_initial_;
             {
                 std::lock_guard<std::mutex> lock(counters_mutex_);
                 next_request_ = std::chrono::steady_clock::now();
             }
-            LOG_INFO("client: wake");
+            LOG_INFO("client: wakeup received"
+                     << (was_silent ? ", resuming" : " (no-op, already active)"));
             break;
+        }
         default:
             HandleMessage(env);
             break;
@@ -452,7 +457,7 @@ void Client::HandleEnvelope(const common::Envelope& env) {
 }
 
 void Client::HandleStop() {
-    LOG_WARN("client: STOP received, stopping executor");
+    LOG_WARN("client: STOP received, stopping executor and entering silent state");
     // Drops queued tasks; the server reclaims them from its in_flight table.
     executor_.stop();
     // Drop results of the stopped run so they are not reported later.
@@ -468,6 +473,7 @@ void Client::HandleStop() {
         outstanding_requests_ = 0;
         next_request_ = std::chrono::steady_clock::now();
     }
+    silent_.store(true);
 }
 
 void Client::HandleMessage(const common::Envelope& env) {

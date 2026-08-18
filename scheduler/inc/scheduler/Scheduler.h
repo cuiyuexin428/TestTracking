@@ -57,6 +57,10 @@ public:
     // and reclaim their in-flight tasks.
     bool stopRun(const std::string& plugin_type);
 
+    // Send WAKEUP to clients (all when plugin_type is empty). Used to resume
+    // clients that entered the silent state after STOP.
+    void wakeupClients(const std::string& plugin_type);
+
     // Snapshot of the current client list.
     std::vector<common::ClientInfo> clients() const;
 

@@ -40,6 +40,13 @@ public:
                           std::unordered_map<std::string, std::set<std::uint64_t>>*
                               file_points) = 0;
 
+    // Client side: loads one file's already-stored point set. Returns true
+    // when the file has staged coverage (used for idempotent execution);
+    // false when nothing was stored for this file.
+    virtual bool loadFileCoverage(const std::string& run_id, int wave,
+                                  const std::string& file,
+                                  std::set<std::uint64_t>* points) = 0;
+
     // Removes the wave staging (point sets and .cov binaries) after
     // settlement. Returns false when the cleanup failed.
     virtual bool clearWave(const std::string& run_id, int wave) = 0;

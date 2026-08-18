@@ -80,6 +80,7 @@ private:
 
     std::atomic<bool> running_{false};
     std::atomic<bool> stop_requested_{false};
+    std::atomic<bool> silent_{false};  // stopped by server, waits for WAKEUP
 
     common::BlockingQueue<common::Envelope> outgoing_;
 
