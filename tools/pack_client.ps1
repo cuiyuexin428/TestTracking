@@ -8,6 +8,8 @@ param(
     [string]$WorkerId = 'worker-1',
     [string]$StoreType = 'file',
     [string]$DbConn = '',
+    [switch]$DryRun,
+    [switch]$StoreCov,
     [switch]$IncludePdb
 )
 $ErrorActionPreference = 'Stop'
@@ -48,17 +50,17 @@ if ($IncludePdb) {
 $coverageCfg = @{
     dll = 'coverage.dll'
     enabled = $true
-    dry_run = $true
+    dry_run = [bool]$DryRun
     store_type = $StoreType
     store_dir = 'store'
-    store_cov = $false
+    store_cov = [bool]$StoreCov
     deploy_state = ''
     deploy_max_attempts = 3
     deploy_retry_delay_ms = 5000
     program_dir = 'program'
     stp_root = 'dataset'
     export_dir = 'reports'
-    opencppcoverage = 'OpenCppCoverage.exe'
+    opencppcoverage = 'OpenCppCoverage/OpenCppCoverage.exe'
     target_exe = 'StepTest.exe'
     occt_dlls = @('TKernel.dll', 'TKBRep.dll', 'TKDESTEP.dll', 'TKTopAlgo.dll')
 }

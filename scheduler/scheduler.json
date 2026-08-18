@@ -15,18 +15,18 @@
     "coverage": {
       "dll": "coverage.dll",
       "enabled": true,
-      "stp_manifest": "C:/WorkSpace/TestTracking/testdata/stp_manifest.txt",
+      "stp_manifest": "C:/Shared/dataset/manifest.txt",
       "store_dir": "C:/WorkSpace/TestTracking/testdata/coverage_store",
       "store_type": "postgres",
       "db_conn": "host=127.0.0.1 port=5432 dbname=testtracking user=postgres",
       "batch_size": 1000,
       "task_size": 25,
       "failed_file_retries": 0,
-      "store_cov": false,
+      "store_cov": true,
       "opencppcoverage": "C:/Program Files/OpenCppCoverage/OpenCppCoverage.exe",
-      "expected_program_version": "",
-      "expected_dataset_version": "",
-      "shared_dir": ""
+      "expected_program_version": "1.0",
+      "expected_dataset_version": "d1",
+      "shared_dir": "\\\\192.168.100.2\\Shared"
     }
   }
 }
