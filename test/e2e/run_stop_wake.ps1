@@ -117,7 +117,7 @@ try {
     # Phase 1: run, wakeup-as-noop, stop mid-run, silent, wakeup resume.
     $sched1 = Start-Direct "$bin\scheduler.exe" "$ws\scheduler.json" $bin $true
     Start-Sleep -Seconds 2
-    $client1 = Start-Direct "$bin\client.exe" "$ws\client.json" $bin $false
+    $client1 = Start-Direct "$bin\client.exe" "$ws\client.json" $bin $true
     Start-Sleep -Seconds 1
     $sched1.proc.StandardInput.WriteLine('run coverage v1')
     $sched1.proc.StandardInput.Flush()
@@ -192,7 +192,7 @@ try {
     # already-stored files are skipped by the client.
     $sched2 = Start-Direct "$bin\scheduler.exe" "$ws\scheduler.json" $bin $true
     Start-Sleep -Seconds 5
-    $client2 = Start-Direct "$bin\client.exe" "$ws\client.json" $bin $false
+    $client2 = Start-Direct "$bin\client.exe" "$ws\client.json" $bin $true
     $restoreDeadline2 = (Get-Date).AddSeconds(60)
     while ((Get-Date) -lt $restoreDeadline2) {
         Start-Sleep -Seconds 2

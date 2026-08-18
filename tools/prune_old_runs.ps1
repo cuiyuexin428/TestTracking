@@ -3,11 +3,12 @@
 param(
     [int]$Keep = 10,
     [switch]$DryRun,
+    [string]$DbConn = 'host=127.0.0.1 port=5432 dbname=testtracking user=postgres',
     [string]$Psql = 'C:\WorkSpace\ThirdParty\pgsql\bin\psql.exe'
 )
 $ErrorActionPreference = 'Stop'
 
-$runs = & $Psql -h 127.0.0.1 -p 5432 -U postgres -d testtracking -t -A -c "SELECT run_id FROM runs ORDER BY created_at DESC OFFSET $Keep;" 2>$null
+$runs = & $Psql $DbConn -t -A -c "SELECT run_id FROM runs ORDER BY created_at DESC OFFSET $Keep;" 2>$null
 if (-not $runs) {
     Write-Host "no runs to prune (keep=$Keep)"
     exit 0
@@ -35,7 +36,7 @@ DELETE FROM tasks WHERE run_id='$runId';
 DELETE FROM runs WHERE run_id='$runId';
 COMMIT;
 "@
-    & $Psql -h 127.0.0.1 -p 5432 -U postgres -d testtracking -c $sql 2>&1 | Out-Null
+    & $Psql $DbConn -c $sql 2>&1 | Out-Null
     Write-Host "pruned $runId"
 }
 Write-Host 'done'

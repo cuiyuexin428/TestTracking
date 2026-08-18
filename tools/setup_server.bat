@@ -48,13 +48,15 @@ netsh advfirewall firewall add rule name="TestTracking PostgreSQL 5432" dir=in a
 
 echo.
 echo === Done ===
-echo Share    : \\MACHINE-IP\Shared  (read only, this machine IP is 192.168.100.2)
+echo Share    : \\MACHINE-IP\Shared  (detect your IP with ipconfig)
 echo Firewall : 445 / 5555 / 5432 inbound allowed
 echo.
 echo Next steps:
-echo   1. Restart the scheduler so it loads the new config.
+echo   1. Run tools\init_database.ps1, then restart the scheduler so it loads the new config.
 echo   2. Copy C:\Shared\client_package to the target machine.
-echo   3. On the target machine run start_client.bat.
+echo   3. For remote clients writing to the local PostgreSQL, run:
+echo      powershell -ExecutionPolicy Bypass -File tools\setup_postgres_remote.ps1
+echo   4. On the target machine run start_client.bat.
 
 :done
 pause

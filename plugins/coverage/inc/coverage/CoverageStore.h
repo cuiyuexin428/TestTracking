@@ -11,8 +11,8 @@ namespace coverage_plugin {
 
 // Storage interface for per-wave coverage staging and selected sets. The
 // client writes per-file point sets; the scheduler reads them at settlement.
-// Current implementation persists to files; a PostgreSQL/ODBC implementation
-// can replace it without touching the plugin logic.
+// Implementations: FileCoverageStore (all platforms) and PostgresCoverageStore
+// (Windows + libpq). Both implement the same interface, keeping plugin logic backend-independent.
 class CoverageStore {
 public:
     virtual ~CoverageStore() = default;

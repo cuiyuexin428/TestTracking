@@ -58,6 +58,7 @@ private:
     int failed_file_retries_ = 0;
     bool keep_staging_ = false;  // validation only: keep wave point files
     bool store_cov_ = false;     // wave settlement computes cov-based totals
+    bool last_checkpoint_save_ok_ = false;
 
     std::vector<std::vector<common::Task>> waves_;
     size_t current_wave_ = 0;

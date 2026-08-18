@@ -6,7 +6,11 @@
   "client": {
     "worker_id": "worker-1",
     "heartbeat_interval_ms": 1000,
-    "task_threads": 1
+    "task_threads": 1,
+    "request_backoff_initial_ms": 200,
+    "request_backoff_max_ms": 30000,
+    "register_timeout_ms": 5000,
+    "register_max_attempts": 5
   },
   "plugins": {
     "demo": {
@@ -17,6 +21,8 @@
       "dll": "coverage.dll",
       "enabled": true,
       "dry_run": true,
+      "store_type": "postgres",
+      "db_conn": "host=127.0.0.1 port=5432 dbname=testtracking user=postgres",
       "store_dir": "coverage_store",
       "store_cov": false,
       "program_dir": "testenv/program",

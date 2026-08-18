@@ -61,7 +61,18 @@ public:
     bool init(const std::string& config) override {
         const nlohmann::json cfg = nlohmann::json::parse(config);
         store_dir_ = cfg.value("store_dir", std::string());
-        return !store_dir_.empty();
+        if (store_dir_.empty()) {
+            LOG_ERROR("coverage store: store_dir is required for file backend");
+            return false;
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(store_dir_, ec);
+        if (ec) {
+            LOG_ERROR("coverage store: cannot create store_dir " << store_dir_ << ": "
+                                                                 << ec.message());
+            return false;
+        }
+        return true;
     }
 
     bool saveFileCoverage(const std::string& run_id, int wave, const std::string& file,
@@ -358,6 +369,13 @@ public:
     bool exportWaveCovs(const std::string& run_id, int wave, const std::string& dir,
                         std::vector<std::string>& paths) override {
         paths.clear();
+        std::error_code create_ec;
+        std::filesystem::create_directories(dir, create_ec);
+        if (create_ec) {
+            LOG_ERROR("coverage store: cannot create cov export dir " << dir << ": "
+                                                                      << create_ec.message());
+            return false;
+        }
         const std::filesystem::path wave_dir(WaveDir(store_dir_, run_id, wave));
         std::error_code ec;
         if (!std::filesystem::exists(wave_dir, ec)) {
@@ -373,7 +391,17 @@ public:
                 break;
             }
             if (entry.is_regular_file() && entry.path().extension() == ".cov") {
-                paths.push_back(entry.path().string());
+                                  const std::filesystem::path dest =
+                      std::filesystem::path(dir) /
+                      ("wave-" + std::to_string(wave) + "-" + entry.path().filename().string());
+                  std::filesystem::copy_file(entry.path(), dest,
+                                             std::filesystem::copy_options::overwrite_existing, ec);
+                  if (ec) {
+                      LOG_ERROR("coverage store: export cov failed for " << entry.path() << ": "
+                                                                         << ec.message());
+                      return false;
+                  }
+                  paths.push_back(dest.string());
             }
         }
         if (ec) {
@@ -387,11 +415,29 @@ public:
                              std::string& path) override {
         (void)dir;
         path.clear();
+        std::error_code create_ec;
+        std::filesystem::create_directories(dir, create_ec);
+        if (create_ec) {
+            LOG_ERROR("coverage store: cannot create cumulative cov export dir " << dir << ": "
+                                                                                << create_ec.message());
+            return false;
+        }
         const std::filesystem::path cov_path =
             std::filesystem::path(store_dir_) / run_id / "cumulative-cov.bin";
         std::error_code ec;
         if (std::filesystem::exists(cov_path, ec)) {
-            path = cov_path.string();
+            std::error_code copy_ec;
+            const std::filesystem::path exported =
+                std::filesystem::path(dir) / "cumulative-cov.bin";
+            std::filesystem::copy_file(cov_path, exported,
+                                       std::filesystem::copy_options::overwrite_existing,
+                                       copy_ec);
+            if (copy_ec) {
+                LOG_ERROR("coverage store: export cumulative cov failed: "
+                          << copy_ec.message());
+                return false;
+            }
+            path = exported.string();
         }
         return true;
     }
@@ -531,8 +577,7 @@ public:
             }
             return false;
         }
-        EnsureSchema();
-        return true;
+        return EnsureSchema();
     }
 
     bool saveFileCoverage(const std::string& run_id, int wave, const std::string& file,
@@ -920,7 +965,7 @@ public:
     }
 
 private:
-    void EnsureSchema() {
+    bool EnsureSchema() {
         const char* ddl =
             "CREATE TABLE IF NOT EXISTS coverage_wave_points ("
             " run_id text NOT NULL, wave_id int NOT NULL, file text NOT NULL,"
@@ -949,11 +994,14 @@ private:
             " settled_at timestamptz DEFAULT now(),"
             " PRIMARY KEY (run_id, wave_id));";
         PGresult* result = PQexec(conn_, ddl);
+        bool schema_ok = true;
         if (result == nullptr || PQresultStatus(result) != PGRES_COMMAND_OK) {
+            schema_ok = false;
             LOG_ERROR("coverage store: schema init failed: "
                       << (result ? PQresultErrorMessage(result) : PQerrorMessage(conn_)));
         }
         PQclear(result);
+        return schema_ok;
     }
 
     PGconn* conn_ = nullptr;

@@ -32,6 +32,11 @@ namespace common {
 
 	EventManager::~EventManager() {
 		stop_.store(true, std::memory_order_relaxed);
+		// Drop queued events before waking workers so nothing queued runs after stop.
+		{
+			std::lock_guard<std::mutex> lock(push_mutex_);
+			queue_.clear();
+		}
 		// Wake blocked workers immediately so they notice stop_ without waiting
 		// for the pop timeout. Workers busy executing finish, then exit.
 		queue_.notifyAll();
@@ -50,7 +55,14 @@ namespace common {
 		if (event == nullptr) {
 			return;
 		}
-		queue_.push(std::unique_ptr<Event>(event));
+		{
+			std::lock_guard<std::mutex> lock(push_mutex_);
+			if (stop_.load(std::memory_order_relaxed)) {
+				delete event;
+				return;
+			}
+			queue_.push(std::unique_ptr<Event>(event));
+		}
 	}
 
 }  // namespace common

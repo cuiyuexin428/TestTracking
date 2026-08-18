@@ -29,8 +29,29 @@ message(STATUS "THIRD_PARTY_ROOT=${THIRD_PARTY_ROOT}")
 
 # PostgreSQL client library (libpq) for DB-backed storage. Points at a local
 # PostgreSQL install (e.g. the unpacked binary zip used for development).
-set(PG_ROOT "C:/WorkSpace/ThirdParty/pgsql" CACHE PATH
+set(PG_ROOT "" CACHE PATH
     "PostgreSQL install root containing include/ lib/ bin/")
+if(NOT PG_ROOT AND DEFINED ENV{PG_ROOT})
+    set(PG_ROOT "$ENV{PG_ROOT}")
+endif()
+if(NOT PG_ROOT)
+    file(GLOB _pg_candidates
+        "C:/Program Files/PostgreSQL/*"
+        "C:/pgsql"
+        "C:/WorkSpace/ThirdParty/pgsql")
+    foreach(_pg_candidate IN LISTS _pg_candidates)
+        if(EXISTS "${_pg_candidate}/include/libpq-fe.h" AND
+           (EXISTS "${_pg_candidate}/lib/libpq.lib" OR EXISTS "${_pg_candidate}/lib/libpq.so"))
+            set(PG_ROOT "${_pg_candidate}")
+            break()
+        endif()
+    endforeach()
+endif()
+if(NOT PG_ROOT)
+    message(FATAL_ERROR
+        "PostgreSQL/libpq was not found. Install PostgreSQL or pass -DPG_ROOT=<postgres-root> "
+        "(a directory containing include/libpq-fe.h and lib/libpq.lib).")
+endif()
 set(PG_INCLUDE_DIR "${PG_ROOT}/include" CACHE PATH "libpq headers directory")
 set(PG_LIBRARY "${PG_ROOT}/lib/libpq.lib" CACHE FILEPATH "libpq import library")
 set(PG_BIN_DIR "${PG_ROOT}/bin" CACHE PATH "PostgreSQL bin directory (libpq.dll and deps)")

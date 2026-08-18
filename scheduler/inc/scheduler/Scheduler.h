@@ -16,6 +16,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace scheduler {
@@ -80,7 +81,7 @@ private:
     struct ClientEntry {
         common::ClientInfo info;
         std::chrono::steady_clock::time_point last_seen;
-        bool registered = false;  // REGISTER accepted by the server plugin
+        std::unordered_set<std::string> registered_plugins;  // REGISTER accepted per plugin_type
     };
 
     struct InFlight {

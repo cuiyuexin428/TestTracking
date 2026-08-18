@@ -97,11 +97,22 @@ int main(int argc, char* argv[]) {
                     break;
                 }
             }
+            client.stop();  // stdin EOF also stops the client
         });
-        stdin_thread.detach();
+
 
         LOG_INFO("client started, config=" << config_path);
-        client.start();  // blocks: INIT + state machine until stop()
+        try {
+            client.start();  // blocks: INIT + state machine until stop()
+        } catch (...) {
+            if (stdin_thread.joinable()) {
+                stdin_thread.detach();
+            }
+            throw;
+        }
+        if (stdin_thread.joinable()) {
+            stdin_thread.join();
+        }
         LOG_INFO("client stopped");
     } catch (const std::exception& e) {
         LOG_ERROR("client failed: " << e.what());

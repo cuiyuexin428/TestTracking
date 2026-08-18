@@ -81,6 +81,59 @@ std::string DetectLocalIp() {
 #endif
     return std::string();
 }
+#ifdef _WIN32
+int SampleProcessCpuPercent() {
+    // Process CPU usage since the previous heartbeat, clamped to [0, 100].
+    static FILETIME last_kernel{};
+    static FILETIME last_user{};
+    static ULONGLONG last_wall_100ns = 0;
+    static bool has_last = false;
+
+    FILETIME creation{};
+    FILETIME exit{};
+    FILETIME kernel{};
+    FILETIME user{};
+    if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user)) {
+        return 0;
+    }
+
+    ULARGE_INTEGER k;
+    ULARGE_INTEGER u;
+    k.LowPart = kernel.dwLowDateTime;
+    k.HighPart = kernel.dwHighDateTime;
+    u.LowPart = user.dwLowDateTime;
+    u.HighPart = user.dwHighDateTime;
+
+    ULONGLONG now_100ns =
+        (static_cast<ULONGLONG>(GetTickCount64()) * 10000ULL);
+    if (!has_last) {
+        last_kernel = kernel;
+        last_user = user;
+        last_wall_100ns = now_100ns;
+        has_last = true;
+        return 0;
+    }
+
+    ULARGE_INTEGER lk;
+    ULARGE_INTEGER lu;
+    lk.LowPart = last_kernel.dwLowDateTime;
+    lk.HighPart = last_kernel.dwHighDateTime;
+    lu.LowPart = last_user.dwLowDateTime;
+    lu.HighPart = last_user.dwHighDateTime;
+
+    const ULONGLONG cpu_delta = (k.QuadPart - lk.QuadPart) + (u.QuadPart - lu.QuadPart);
+    const ULONGLONG wall_delta = now_100ns - last_wall_100ns;
+    last_kernel = kernel;
+    last_user = user;
+    last_wall_100ns = now_100ns;
+
+    if (wall_delta == 0) {
+        return 0;
+    }
+    const ULONGLONG percent = (cpu_delta * 100ULL) / wall_delta;
+    return percent > 100ULL ? 100 : static_cast<int>(percent);
+}
+#endif
 
 }  // namespace
 
@@ -92,9 +145,9 @@ Client::Client(common::Config& config)
       ip_(config.get("client.ip", std::string())),
       heartbeat_interval_(config.get("client.heartbeat_interval_ms", 1000)),
       poll_timeout_(config.get("scheduler.poll_timeout_ms", 50)),
-      request_backoff_initial_(config.get("client.request_backoff_initial_ms", 1000)),
+      request_backoff_initial_(config.get("client.request_backoff_initial_ms", 200)),
       request_backoff_max_(config.get("client.request_backoff_max_ms", 30000)),
-      register_timeout_ms_(config.get("client.register_timeout_ms", 0)),
+      register_timeout_ms_(config.get("client.register_timeout_ms", 5000)),
       register_max_attempts_(config.get("client.register_max_attempts", 5)) {
 }
 
@@ -566,6 +619,7 @@ void Client::SendHeartbeat() {
     if (GetDiskFreeSpaceExA(nullptr, &free_bytes, nullptr, nullptr)) {
         resource->set_disk_free_bytes(static_cast<std::int64_t>(free_bytes.QuadPart));
     }
+    resource->set_cpu_percent(SampleProcessCpuPercent());
 #else
     (void)resource;
 #endif

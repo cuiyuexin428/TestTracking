@@ -33,8 +33,8 @@ struct ClientPluginDeleter {
 // socket and drives task acquisition. task_slots_ is the configured worker
 // count, in_flight_ counts tasks handed to the executor, and
 // outstanding_requests_ counts REQUEST_TASK messages awaiting a reply. The
-// client sends one request per free slot; the server grants one task per
-// request (registration gate only), so the client fully controls how many
+// client sends one request per free slot; the server grants up to count tasks in a single TASK reply
+// (registration gate only), so the client fully controls how many
 // tasks it pulls. Tasks are executed by a TaskExecutor worker pool; each
 // completed task queues its result for the main thread to report.
 class Client {

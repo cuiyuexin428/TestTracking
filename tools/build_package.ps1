@@ -17,10 +17,16 @@
 param(
     [string]$OutDir = 'C:\Shared\client_package',
     [string]$BinDir = $null,
-    [string]$Endpoint = 'tcp://192.168.100.2:5555',
+    [string]$Endpoint = '',
     [string]$WorkerId = 'worker-1',
     [string]$StoreType = 'postgres',
-    [string]$DbConn = 'host=192.168.100.2 port=5432 dbname=testtracking user=postgres',
+    [string]$DbConn = '',
+    [string]$ServerIp = '',
+    [int]$ServerPort = 5555,
+    [int]$DbPort = 5432,
+    [string]$DbName = 'testtracking',
+    [string]$DbUser = 'postgres',
+    [string]$DbPassword = '',
     [switch]$StoreCov,
     [switch]$OnlyClient,
     [switch]$OnlyProgram,
@@ -29,11 +35,38 @@ param(
     [string]$DatasetVersion = 'd1',
     [string[]]$OcctDlls = @('TKernel.dll', 'TKBRep.dll', 'TKDESTEP.dll', 'TKTopAlgo.dll'),
     [string]$StepTestExe = 'C:\WorkSpace\occt_demo\build\Debug\StepTest.exe',
+
     [string]$OcctSrcDir = 'C:\WorkSpace\occt_demo\occtlib\src',
     [string]$DatasetDir = 'C:\WorkSpace\occt_demo\step',
     [string]$OpenCppCoverageDir = 'C:\Program Files\OpenCppCoverage'
 )
 $ErrorActionPreference = 'Stop'
+function Get-LocalIPv4 {
+    $candidates = @()
+    foreach ($nic in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+        if ($nic.OperationalStatus -ne [System.Net.NetworkInformation.OperationalStatus]::Up) { continue }
+        foreach ($addr in $nic.GetIPProperties().UnicastAddresses) {
+            if ($addr.Address.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) { continue }
+            $ip = $addr.Address.ToString()
+            if ($ip -eq '127.0.0.1') { continue }
+            if ($ip.StartsWith('169.254.')) { continue }
+            $candidates += $ip
+        }
+    }
+    if ($candidates.Count -gt 0) { return $candidates }
+    throw 'Cannot auto-detect server IPv4 address; pass -ServerIp or -Endpoint.'
+}
+
+if (-not $ServerIp) {
+    $candidateIps = @(Get-LocalIPv4)
+    $ServerIp = $candidateIps[0]
+    Write-Host "detected IPv4 candidates: $($candidateIps -join ', '); using $ServerIp (override with -ServerIp)"
+}
+if (-not $Endpoint) { $Endpoint = "tcp://${ServerIp}:$ServerPort" }
+if (-not $DbConn -and $StoreType -eq 'postgres') {
+    $DbConn = "host=$ServerIp port=$DbPort dbname=$DbName user=$DbUser"
+    if ($DbPassword) { $DbConn += " password=$DbPassword" }
+}
 
 $root = Split-Path $PSScriptRoot -Parent
 if (-not $BinDir) {
@@ -170,6 +203,10 @@ if (-not $OnlyProgram -and -not $OnlyDataset) {
             worker_id = $WorkerId
             heartbeat_interval_ms = 1000
             task_threads = 2
+            request_backoff_initial_ms = 200
+            request_backoff_max_ms = 30000
+            register_timeout_ms = 5000
+            register_max_attempts = 5
         }
         plugins = @{
             demo = @{ dll = 'demo.dll'; enabled = $false }
@@ -192,4 +229,4 @@ pause
 }
 
 Write-Host "done. copy '$OutDir' to the target machine and run start_client.bat"
-Write-Host "NOTE: endpoint/db_conn default to this environment (192.168.100.2); pass -Endpoint/-DbConn for other machines."
+Write-Host "NOTE: endpoint/db_conn default to this machine's detected IPv4 ($ServerIp); pass -ServerIp/-Endpoint/-DbConn to override."

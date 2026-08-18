@@ -2,7 +2,7 @@
 
 namespace common {
 
-// Returns the common library version. Placeholder until real components land.
+// Returns the common library version string.
 const char* version();
 
 }  // namespace common

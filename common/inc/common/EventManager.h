@@ -3,6 +3,7 @@
 #include <atomic>
 #include <memory>
 #include <thread>
+#include <mutex>
 #include <vector>
 
 #include "common/BlockingQueue.h"
@@ -26,6 +27,7 @@ private:
     EventQueue queue_;
     std::vector<std::thread> thread_group;
     std::atomic<bool> stop_{false};
+    std::mutex push_mutex_;
 };
 
 }  // namespace common

@@ -142,6 +142,24 @@ bool ClientPlugin::init(const std::string& config) {
 
     program_version_ = ReadVersionFile(program_dir_ + "/version.txt");
     dataset_version_ = ReadVersionFile(stp_root_ + "/version.txt");
+    if (!dry_run_) {
+        if (target_exe_.empty() || stp_root_.empty()) {
+            LOG_ERROR("coverage plugin: target_exe and stp_root are required when dry_run=false");
+            return false;
+        }
+        std::error_code ec;
+        if (!std::filesystem::exists(target_exe_, ec) || ec) {
+            LOG_ERROR("coverage plugin: target_exe not found: " << target_exe_);
+            return false;
+        }
+        if (!std::filesystem::exists(opencppcoverage_, ec) || ec) {
+            LOG_ERROR("coverage plugin: opencppcoverage not found: " << opencppcoverage_);
+            return false;
+        }
+    }
+    if (dry_run_delay_ms_ < 0) {
+        dry_run_delay_ms_ = 0;
+    }
 
     if (!export_dir_.empty()) {
         std::error_code ec;

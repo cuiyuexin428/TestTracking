@@ -39,6 +39,10 @@ bool SchedulerPlugin::init(const std::string& config) {
         LOG_ERROR("coverage plugin: failed_file_retries must be >= 0");
         return false;
     }
+    if (batch_size_ <= 0 || task_size_ <= 0) {
+        LOG_ERROR("coverage plugin: batch_size and task_size must be > 0");
+        return false;
+    }
     if (store_cov_) {
 #ifdef _WIN32
         const bool is_bare_name =
@@ -192,6 +196,10 @@ bool SchedulerPlugin::plan(const common::RunRequest& request,
         tasks_by_id_[task.task_id()] = task;
     }
     SaveCheckpointLocked();
+    if (!last_checkpoint_save_ok_) {
+        LOG_ERROR("coverage plugin: cannot persist initial checkpoint, run not started");
+        return false;
+    }
     LOG_INFO("coverage plugin: planned " << total_files_ << " files, " << waves_.size()
                                          << " waves, " << pending_.size()
                                          << " tasks in first wave");
@@ -240,9 +248,11 @@ void SchedulerPlugin::requeue(const std::vector<std::string>& task_ids) {
 
 void SchedulerPlugin::SaveCheckpointLocked() {
     if (run_id_.empty()) {
+        last_checkpoint_save_ok_ = false;
         return;
     }
     if (current_wave_ < waves_.size() && wave_task_ids_.empty()) {
+        last_checkpoint_save_ok_ = false;
         // A live wave must always have outstanding tasks; an empty pool here
         // means settlement failed or is in progress. Persisting this state
         // would make the run unresumable, so keep the previous checkpoint.
@@ -279,11 +289,17 @@ void SchedulerPlugin::SaveCheckpointLocked() {
     }
     std::string blob;
     if (!ckpt.SerializeToString(&blob)) {
+        last_checkpoint_save_ok_ = false;
         LOG_ERROR("coverage plugin: failed to serialize checkpoint for run " << run_id_);
         return;
     }
+    last_checkpoint_save_ok_ = true;
     if (!store_->saveCheckpoint(run_id_, blob)) {
-        LOG_ERROR("coverage plugin: failed to save checkpoint for run " << run_id_);
+        LOG_ERROR("coverage plugin: failed to save checkpoint for run " << run_id_
+                                                                       << " (checkpoint gap)");
+        last_checkpoint_save_ok_ = false;
+        return;
+
     }
 }
 
@@ -295,6 +311,9 @@ bool SchedulerPlugin::saveCheckpoint(const std::string& run_id) {
         return false;
     }
     SaveCheckpointLocked();
+    if (!last_checkpoint_save_ok_) {
+        return false;
+    }
     return true;
 }
 
@@ -420,6 +439,11 @@ void SchedulerPlugin::processResult(const common::TaskResult& result) {
     int retry_wave = -1;
     std::string retry_run_id;
     const auto spec_it = tasks_by_id_.find(result.task_id());
+    if (spec_it == tasks_by_id_.end()) {
+        LOG_WARN("coverage plugin: result for unknown task " << result.task_id()
+                                                            << " after run state change, dropped");
+        return;
+    }
     if (spec_it != tasks_by_id_.end()) {
         coverage::CoverageTask task_meta;
         if (task_meta.ParseFromString(spec_it->second.payload())) {
@@ -464,6 +488,10 @@ void SchedulerPlugin::processResult(const common::TaskResult& result) {
     if (wave_task_ids_.empty()) {
         const int settled_wave = SettleWave();
         SaveCheckpointLocked();
+        if (!last_checkpoint_save_ok_) {
+            LOG_ERROR("coverage plugin: checkpoint save failed after settling wave "
+                      << settled_wave);
+        }
         if (settled_wave >= 0 && !keep_staging_) {
             if (!store_->clearWave(run_id_, settled_wave)) {
                 LOG_ERROR("coverage plugin: clearWave failed for wave " << settled_wave);
@@ -471,6 +499,9 @@ void SchedulerPlugin::processResult(const common::TaskResult& result) {
         }
     } else {
         SaveCheckpointLocked();
+        if (!last_checkpoint_save_ok_) {
+            LOG_ERROR("coverage plugin: checkpoint save failed after task result");
+        }
     }
 }
 
@@ -495,6 +526,8 @@ void SchedulerPlugin::cancel() {
     total_files_ = 0;
     selected_count_ = 0;
     manifest_fingerprint_.clear();
+    run_id_.clear();
+    last_checkpoint_save_ok_ = false;
     LOG_INFO("coverage plugin: run cancelled, task pool cleared");
 }
 
