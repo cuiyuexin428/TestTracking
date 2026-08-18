@@ -48,7 +48,7 @@ netsh advfirewall firewall add rule name="TestTracking PostgreSQL 5432" dir=in a
 
 echo.
 echo === Done ===
-echo Share    : \\<this-machine-ip>\Shared  (read only)
+echo Share    : \\MACHINE-IP\Shared  (read only, this machine IP is 192.168.100.2)
 echo Firewall : 445 / 5555 / 5432 inbound allowed
 echo.
 echo Next steps:
