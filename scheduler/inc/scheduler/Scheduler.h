@@ -68,6 +68,14 @@ public:
 
     size_t inFlightCount() const;
 
+    // Enabled plugin types (read-only after startup).
+    std::vector<std::string> pluginTypes() const;
+
+    // Number of currently active runs (safe to call from any thread).
+    size_t activeRunCount() const {
+        return active_run_count_.load(std::memory_order_relaxed);
+    }
+
 private:
     struct ClientEntry {
         common::ClientInfo info;
@@ -103,6 +111,8 @@ private:
     struct StopRunCommand {
         std::string plugin_type;
     };
+
+    std::atomic<size_t> active_run_count_{0};
 
     bool LoadPlugins();
     void RunProcessing();

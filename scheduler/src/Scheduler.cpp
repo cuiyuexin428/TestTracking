@@ -92,6 +92,7 @@ void Scheduler::start() {
             if (restored) {
                 storage_.ResumeRun(run.run_id);
                 active_runs_[pit->second] = {run.run_id, run.plugin_type};
+                active_run_count_.fetch_add(1, std::memory_order_relaxed);
                 LOG_INFO("run restored: " << run.run_id
                                           << " plugin_type=" << run.plugin_type);
             } else {
@@ -174,6 +175,14 @@ size_t Scheduler::pluginCount() const {
 size_t Scheduler::inFlightCount() const {
     std::lock_guard<std::mutex> lock(in_flight_mutex_);
     return in_flight_.size();
+}
+
+std::vector<std::string> Scheduler::pluginTypes() const {
+    std::vector<std::string> out;
+    for (const auto& entry : plugins_by_type_) {
+        out.push_back(entry.first);
+    }
+    return out;
 }
 
 bool Scheduler::LoadPlugins() {
@@ -547,6 +556,7 @@ void Scheduler::HandleCreateRun(const CreateRunCommand& command) {
     }
 
     active_runs_[plugin] = {request.run_id, command.plugin_type};
+    active_run_count_.fetch_add(1, std::memory_order_relaxed);
     if (storage_.enabled()) {
         storage_.SaveRun(request.run_id, command.plugin_type, request.dataset_version,
                          request.params);
@@ -611,6 +621,7 @@ void Scheduler::HandleStopRun(const StopRunCommand& command) {
     }
 
     active_runs_.erase(run_it);
+    active_run_count_.fetch_sub(1, std::memory_order_relaxed);
     if (storage_.enabled()) {
         storage_.FinishRun(run_id, "stopped");
     }
@@ -712,6 +723,7 @@ void Scheduler::RunTimeoutChecks() {
                 storage_.FinishRun(it->second.run_id, "finished");
             }
             it = active_runs_.erase(it);
+            active_run_count_.fetch_sub(1, std::memory_order_relaxed);
         } else {
             ++it;
         }

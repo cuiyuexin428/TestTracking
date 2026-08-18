@@ -3,6 +3,7 @@
 #include "common/TaskPlugin.h"
 #include "scheduler/Scheduler.h"
 
+#include <chrono>
 #include <cstdio>
 #include <exception>
 #include <filesystem>
@@ -10,6 +11,7 @@
 #include <sstream>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -122,6 +124,20 @@ int main(int argc, char* argv[]) {
         std::string line;
         while (std::getline(std::cin, line)) {
             if (line == "quit" || line == "exit") {
+                // Safe shutdown: stop every active run first so checkpoints
+                // are saved and in-flight tasks are reclaimed, then exit.
+                for (const std::string& plugin_type : sched.pluginTypes()) {
+                    sched.stopRun(plugin_type);
+                }
+                const auto deadline =
+                    std::chrono::steady_clock::now() + std::chrono::seconds(15);
+                while (sched.activeRunCount() > 0 &&
+                       std::chrono::steady_clock::now() < deadline) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                }
+                if (sched.activeRunCount() > 0) {
+                    LOG_WARN("timed out waiting for active runs to stop; exiting anyway");
+                }
                 break;
             }
             if (line == "help") {

@@ -432,3 +432,19 @@ client_package\
 构建工具：`tools/build_package.ps1` 生成全量包，支持 `-OnlyClient` / `-OnlyProgram` / `-OnlyDataset` 只重建对应组件并更新版本号。跨网络传输与部署编排后续独立成册（可用现成文件传输工具）。
 
 验证：`test/e2e/run_deploy.ps1` 覆盖版本不匹配被拒、修正后注册成功；`run_cov.ps1` 覆盖版本匹配 + 多波次结算。
+
+### 15.7 投入使用条件与操作规范（v1.0）
+
+本版目标：分布式执行真实 stp 覆盖率测试，产出最小 stp 文件集合（`coverage_selected`）。不做数据可视化。
+
+达到投入使用的条件（已通过真实数据验证）：
+
+1. 版本门禁注册；客户端离线 5 秒回收在飞任务进优先队列；STOP/WAKEUP 静默与恢复；重启后检查点自动恢复；
+2. 客户端执行前查库，已完成文件跳过（幂等），中断续跑结果与完整运行一致；
+3. 服务端退出防呆：`quit` 自动对活跃 run 执行 stop（保存检查点、回收任务）后再退出，无需手动先 stop。
+
+运行规范：
+
+- 调度机：`run coverage <dataset_version>` 启动；正常退出直接 `quit`（自动 stop）；不要强制杀进程。
+- 客户端：`start_client.bat`；stop 后进入静默，服务端 `wakeup coverage` 恢复。
+- 最小集合产物：`tools/export_selected.ps1` 导出 `coverage_selected` 为文件列表。
