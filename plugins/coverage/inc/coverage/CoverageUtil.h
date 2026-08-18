@@ -42,10 +42,6 @@ int RunCommand(const std::string& command);
 std::string CanonicalPath(const std::string& filename,
                           const std::vector<std::string>& sources);
 
-// Returns the lowercase hex SHA-256 of a file, or an empty string when the
-// file cannot be read or hashing is unavailable on this platform.
-std::string Sha256Hex(const std::string& file_path);
-
 // Parses the totals of a merged cobertura report produced by
 // OpenCppCoverage. OpenCppCoverage exports one <class> per compilation unit,
 // so template/header lines are repeated; the counts are deduplicated by

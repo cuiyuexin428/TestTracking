@@ -404,19 +404,31 @@ public:
 
 已知事实：OpenCppCoverage 对同一输入重复执行会有数行抖动（实测 18071 vs 18076），属工具行为，非框架问题；点集与汇总均为当次实际采集结果。
 
-### 15.6 空白机部署与初始化（已完成）
+### 15.6 版本门禁与全量部署包规范（已完成）
 
-场景：调度机已运行；另一台空白机只拷贝了客户端程序，无测试程序、无数据集。客户端启动后自动完成部署与初始化：
+部署职责从插件中移除：插件只负责配置解析、组件版本读取与任务执行；注册只做版本核对。
 
-注册 → 服务端校验（未部署/版本不符）→ 拒绝并下发 `shared_dir` 与目标版本 → 客户端拷贝 program + dataset → 清单校验 → 写入部署标记 → 重新注册 → 接受 → 开始拉取任务。
+全量部署包结构（`client_package`，直接整体拷贝到目标机器）：
 
-实现要点：
+```
+client_package\
+  client.exe / common.dll / coverage.dll / 运行依赖 DLL
+  config\client.json
+  start_client.bat
+  testenv\
+    program\            StepTest.exe + PDB + 全部 OCCT DLL + version.txt
+    dataset\            stp 数据集 + version.txt
+    opencppcoverage\    OpenCppCoverage.exe + 依赖 + Template
+```
 
-1. 共享目录：服务端插件配置 `shared_dir` 为客户端可访问路径（UNC 或盘符映射），客户端进程账户需有读权限；跨公网需 VPN/虚拟内网（SMB 不能直穿公网），如无 VPN 后续可换 HTTP/对象存储后端，接口不变。
-2. 部署标记：默认写入 `program_dir/deploy.json`（可用 `deploy_state` 覆盖），记录 program_version/dataset_version；客户端重启加载标记，版本匹配则免重新拷贝。标记存在时优先于配置文件中的 `deployed`。
-3. 清单校验：`shared/program/manifest.txt` 行格式 `文件名,大小,SHA-256`（程序强制哈希）；`shared/dataset/manifest.txt` 行格式 `文件名,大小`（数据集只校验数量与大小）；校验失败视为部署失败。
-4. 拷贝失败重试：`deploy_max_attempts`（默认 3）+ `deploy_retry_delay_ms`（默认 5000），不再直接退出。
-5. 路径解析：`target_exe`、`opencppcoverage`、`occt_dlls` 相对 `program_dir` 解析；程序包需包含 StepTest.exe、OCCT DLL、PDB、OpenCppCoverage.exe。
-6. 清单读取兼容 UTF-8 BOM（脚本/编辑器常见）。
+版本规范：
 
-验证：`test/e2e/run_deploy.ps1` 覆盖空白机部署全流程与重启免重拷；`run_cov.ps1` 回归共享目录部署路径。
+- `testenv\program\version.txt`、`testenv\dataset\version.txt` 是各自组件唯一的版本来源；谁更新了就替换对应目录并修改 version.txt，不做全量重发。
+- 客户端启动时读取两个版本文件并随注册消息上报（`CoverageClientInfo`）。
+- 服务端只校验版本：`expected_program_version` / `expected_dataset_version` 配置为空表示不校验；不匹配则拒绝注册并给出 reason。
+
+注册失败行为：客户端打印错误日志，交互环境下 `pause` 等待按键后退出（非交互环境自动跳过 pause）。
+
+构建工具：`tools/build_package.ps1` 生成全量包，支持 `-OnlyClient` / `-OnlyProgram` / `-OnlyDataset` 只重建对应组件并更新版本号。跨网络传输与部署编排后续独立成册（可用现成文件传输工具）。
+
+验证：`test/e2e/run_deploy.ps1` 覆盖版本不匹配被拒、修正后注册成功；`run_cov.ps1` 覆盖版本匹配 + 多波次结算。

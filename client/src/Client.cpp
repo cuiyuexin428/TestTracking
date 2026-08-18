@@ -182,8 +182,9 @@ bool Client::RegisterWithServer() {
                       << plugin_->pluginType());
             return false;
         }
-        if (!result.accepted() && !result.reason().empty()) {
-            LOG_WARN("client: registration reply reason=" << result.reason());
+        if (!result.accepted()) {
+            LOG_ERROR("client: registration rejected: " << result.reason());
+            return false;
         }
         try {
             switch (plugin_->handleValidationReply(result.payload())) {

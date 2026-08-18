@@ -22,7 +22,3 @@ target_include_directories(coverage PRIVATE
 )
 
 target_link_libraries(coverage PRIVATE common ${PG_LIBRARY})
-
-if(WIN32)
-    target_link_libraries(coverage PRIVATE bcrypt)
-endif()

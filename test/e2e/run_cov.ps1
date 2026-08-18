@@ -1,5 +1,6 @@
-# E2E coverage: version mismatch rejected -> deploy from shared dir -> re-register
-# -> 80 files / 2 waves -> greedy settlement -> selected.txt has 80 lines.
+# E2E coverage: version-gated registration + multi-wave dry run. The client
+# carries component versions from version.txt files (testenv convention);
+# the scheduler accepts only when program/dataset versions match.
 param([string]$BinDir = $null, [int]$Port = 5557)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'e2e_common.ps1')
@@ -9,18 +10,13 @@ $ws = New-E2EWorkspace 'cov'
 $storeDir = "$ws\cov_store"
 $endpoint = "tcp://127.0.0.1:$Port"
 New-Item -ItemType Directory -Force $storeDir | Out-Null
+New-Item -ItemType Directory -Force "$ws\prog" | Out-Null
+New-Item -ItemType Directory -Force "$ws\data" | Out-Null
+Set-Content -Path "$ws\prog\version.txt" -Value '1.0' -Encoding ASCII
+Set-Content -Path "$ws\data\version.txt" -Value 'd1' -Encoding ASCII
 
 $manifest = 1..80 | ForEach-Object { "file$_.stp,$($_ * 7 % 100 + 10)" }
 Set-Content -Path "$ws\manifest.txt" -Value $manifest -Encoding UTF8
-New-Item -ItemType Directory -Force "$ws\shared\program" | Out-Null
-New-Item -ItemType Directory -Force "$ws\shared\dataset" | Out-Null
-Set-Content -Path "$ws\shared\program\step.exe" -Value 'x' -Encoding UTF8
-Set-Content -Path "$ws\shared\dataset\dummy.stp" -Value 'x' -Encoding UTF8
-$stepSize = (Get-Item "$ws\shared\program\step.exe").Length
-$stepHash = (Get-FileHash "$ws\shared\program\step.exe" -Algorithm SHA256).Hash.ToLower()
-Set-Content -Path "$ws\shared\program\manifest.txt" -Value "step.exe,$stepSize,$stepHash" -Encoding UTF8
-$stpSize = (Get-Item "$ws\shared\dataset\dummy.stp").Length
-Set-Content -Path "$ws\shared\dataset\manifest.txt" -Value "dummy.stp,$stpSize" -Encoding UTF8
 
 $schedCfg = @{
     server = @{
@@ -40,7 +36,6 @@ $schedCfg = @{
             task_size = 10
             expected_program_version = '1.0'
             expected_dataset_version = 'd1'
-            shared_dir = "$ws\shared"
         }
     }
 } | ConvertTo-Json -Depth 5
@@ -55,9 +50,6 @@ $clientCfg = @{
             dll = 'coverage.dll'; enabled = $true
             dry_run = $true
             store_dir = $storeDir
-            program_version = '0.9'
-            dataset_version = 'd0'
-            deployed = $false
             program_dir = "$ws\prog"
             stp_root = "$ws\data"
         }
@@ -79,9 +71,9 @@ $client.WaitForExit(5000) | Out-Null
 
 Write-Host "workspace: $ws"
 Write-Host "scheduler exit=$($sched.ExitCode) client exit=$($client.ExitCode)"
+Assert-LogContains "$ws\client.log" 'registered: plugin_type=coverage' 'client registered'
 Assert-LogContains "$ws\scheduler.log" 'selected 80/80 files' 'all 80 files selected'
 Assert-LogContains "$ws\scheduler.log" 'coverage plugin: run finished' 'run finished'
-Assert-LogContains "$ws\client.log" 'deployed from ' 'client deployed from shared dir'
 
 $runDir = Get-ChildItem $storeDir -Directory | Select-Object -First 1
 $selected = Get-Content (Join-Path $runDir.FullName 'selected.txt') -ErrorAction SilentlyContinue

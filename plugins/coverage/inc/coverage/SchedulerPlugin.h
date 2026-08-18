@@ -51,7 +51,6 @@ private:
     std::string manifest_fingerprint_;
     std::string expected_program_version_;
     std::string expected_dataset_version_;
-    std::string shared_dir_;
     std::string opencppcoverage_;
     std::unique_ptr<CoverageStore> store_;
     int batch_size_ = 1000;

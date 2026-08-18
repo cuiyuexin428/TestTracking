@@ -32,7 +32,6 @@ $schedCfg = @{
             task_size = 10
             expected_program_version = ''
             expected_dataset_version = ''
-            shared_dir = ''
         }
     }
 } | ConvertTo-Json -Depth 5
@@ -48,9 +47,6 @@ $clientCfg = @{
             dry_run = $true
             store_type = 'postgres'
             db_conn = $DbConn
-            program_version = '0.9'
-            dataset_version = 'd0'
-            deployed = $true
         }
     }
 } | ConvertTo-Json -Depth 5

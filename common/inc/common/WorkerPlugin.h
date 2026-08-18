@@ -10,7 +10,7 @@ namespace common {
 // opaque business message; the plugin decides what to do next.
 enum class RegisterOutcome {
     kReady,   // validation passed, enter READY
-    kRetry,   // reply handled (e.g. deployed), re-send REGISTER
+    kRetry,   // reply handled, re-send REGISTER
     kFailed,  // cannot be satisfied, give up
 };
 

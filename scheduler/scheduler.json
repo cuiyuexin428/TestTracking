@@ -25,8 +25,7 @@
       "store_cov": true,
       "opencppcoverage": "C:/Program Files/OpenCppCoverage/OpenCppCoverage.exe",
       "expected_program_version": "1.0",
-      "expected_dataset_version": "d1",
-      "shared_dir": "\\\\192.168.100.2\\Shared"
+      "expected_dataset_version": "d1"
     }
   }
 }

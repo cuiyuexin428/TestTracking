@@ -39,21 +39,11 @@ message CoverageCheckpoint {
   int32 task_seq = 7;
 }
 
-// Registration validation: local deployment info of the client. It is the
-// REGISTER business payload; the framework does not parse it and the
-// coverage server plugin interprets it.
+// Registration validation: component versions of the client package. It is
+// the REGISTER business payload; the framework does not parse it and the
+// coverage server plugin interprets it. Versions come from version.txt files
+// inside the package's testenv component folders.
 message CoverageClientInfo {
   string program_version = 1;
   string dataset_version = 2;
-  bool deployed = 3;
-}
-
-// Server plugin reply: whether deployment is required plus target versions
-// and source. It is the REGISTER_RESULT business reply; the framework does
-// not parse it and the coverage client plugin interprets it.
-message CoverageValidationReply {
-  bool deploy_required = 1;
-  string target_program_version = 2;
-  string target_dataset_version = 3;
-  string shared_dir = 4;
 }

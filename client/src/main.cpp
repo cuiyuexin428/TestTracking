@@ -48,6 +48,20 @@ bool FileExists(const std::string& path) {
     return std::filesystem::exists(path, ec) && !ec;
 }
 
+void PauseIfInteractive() {
+#ifdef _WIN32
+    const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode = 0;
+    if (input != INVALID_HANDLE_VALUE && GetConsoleMode(input, &mode)) {
+        std::system("pause");
+    }
+#else
+    if (isatty(STDIN_FILENO)) {
+        std::system("read -n 1 -s -r -p \"Press any key to continue...\"");
+    }
+#endif
+}
+
 std::string ResolveConfigPath(int argc, char* argv[]) {
     if (argc > 1) {
         return argv[1];
@@ -90,7 +104,8 @@ int main(int argc, char* argv[]) {
         client.start();  // blocks: INIT + state machine until stop()
         LOG_INFO("client stopped");
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "client failed: %s\n", e.what());
+        LOG_ERROR("client failed: " << e.what());
+        PauseIfInteractive();
         return 1;
     }
     return 0;

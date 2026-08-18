@@ -68,7 +68,6 @@ $schedCfg = @{
             keep_staging = -not $usePg
             expected_program_version = ''
             expected_dataset_version = ''
-            shared_dir = ''
         } + $storeConfig
     }
 } | ConvertTo-Json -Depth 6
@@ -89,9 +88,6 @@ $clientCfg = @{
             occt_dlls = $occtDllPaths
             export_dir = "$ws\reports"
             keep_reports = $true
-            program_version = 'dev'
-            dataset_version = 'dev'
-            deployed = $true
         } + $storeConfig
     }
 } | ConvertTo-Json -Depth 6

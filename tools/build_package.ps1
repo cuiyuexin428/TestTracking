@@ -1,0 +1,189 @@
+# Builds the full deployment package (or just one component) under OutDir:
+#
+#   <OutDir>\
+#     client.exe / common.dll / coverage.dll / runtime DLLs
+#     config\client.json
+#     start_client.bat
+#     testenv\
+#       program\            StepTest.exe + PDB + all OCCT DLLs + version.txt
+#       dataset\            stp files + version.txt
+#       opencppcoverage\    OpenCppCoverage.exe + dependencies
+#
+# Versions are tracked per component in testenv\program\version.txt and
+# testenv\dataset\version.txt. Update only the component that changed:
+#   -OnlyClient   rebuild the client binaries/config only
+#   -OnlyProgram  replace testenv\program and bump its version
+#   -OnlyDataset  replace testenv\dataset and bump its version
+param(
+    [string]$OutDir = 'C:\Shared\client_package',
+    [string]$BinDir = $null,
+    [string]$Endpoint = 'tcp://192.168.100.2:5555',
+    [string]$WorkerId = 'worker-1',
+    [string]$StoreType = 'postgres',
+    [string]$DbConn = 'host=192.168.100.2 port=5432 dbname=testtracking user=postgres',
+    [switch]$StoreCov,
+    [switch]$OnlyClient,
+    [switch]$OnlyProgram,
+    [switch]$OnlyDataset,
+    [string]$ProgramVersion = '1.0',
+    [string]$DatasetVersion = 'd1',
+    [string[]]$OcctDlls = @('TKernel.dll', 'TKBRep.dll', 'TKDESTEP.dll', 'TKTopAlgo.dll'),
+    [string]$StepTestExe = 'C:\WorkSpace\occt_demo\build\Debug\StepTest.exe',
+    [string]$OcctSrcDir = 'C:\WorkSpace\occt_demo\occtlib\src',
+    [string]$DatasetDir = 'C:\WorkSpace\occt_demo\step',
+    [string]$OpenCppCoverageDir = 'C:\Program Files\OpenCppCoverage'
+)
+$ErrorActionPreference = 'Stop'
+
+$root = Split-Path $PSScriptRoot -Parent
+if (-not $BinDir) {
+    $candidates = @(
+        (Join-Path $root 'out\build\x64-Debug\bin\Debug'),
+        (Join-Path $root 'out\build\Release\bin\Release'),
+        (Join-Path $root 'build\bin\Release')
+    )
+    foreach ($c in $candidates) {
+        if (Test-Path (Join-Path $c 'client.exe')) {
+            $BinDir = $c
+            break
+        }
+    }
+}
+if (-not $BinDir -or -not (Test-Path (Join-Path $BinDir 'client.exe'))) {
+    throw "client.exe not found; pass -BinDir <bin dir>"
+}
+
+$testenv = Join-Path $OutDir 'testenv'
+
+if (-not $OnlyClient -and -not $OnlyDataset) {
+    # testenv\program: StepTest + PDB + all OCCT DLLs + instrumented PDBs.
+    if (-not (Test-Path $StepTestExe)) {
+        throw "StepTest.exe not found: $StepTestExe"
+    }
+    if (-not (Test-Path $OcctSrcDir)) {
+        throw "OCCT resources not found: $OcctSrcDir"
+    }
+    if (-not (Test-Path (Join-Path $OpenCppCoverageDir 'OpenCppCoverage.exe'))) {
+        throw "OpenCppCoverage.exe not found under $OpenCppCoverageDir"
+    }
+    $progDir = Join-Path $testenv 'program'
+    if (Test-Path $progDir) {
+        Remove-Item -LiteralPath $progDir -Recurse -Force
+    }
+    New-Item -ItemType Directory -Force $progDir | Out-Null
+    Copy-Item -LiteralPath $StepTestExe -Destination $progDir
+    $stepPdb = [System.IO.Path]::ChangeExtension($StepTestExe, '.pdb')
+    if (Test-Path $stepPdb) {
+        Copy-Item -LiteralPath $stepPdb -Destination $progDir
+    }
+    $stepDir = Split-Path $StepTestExe -Parent
+    foreach ($dll in $OcctDlls) {
+        $pdbPath = [System.IO.Path]::ChangeExtension((Join-Path $stepDir $dll), '.pdb')
+        if (Test-Path $pdbPath) {
+            Copy-Item -LiteralPath $pdbPath -Destination $progDir
+        }
+    }
+    Get-ChildItem $stepDir -Filter '*.dll' | Copy-Item -Destination $progDir
+    Copy-Item -Path $OcctSrcDir -Destination (Join-Path $progDir 'occtlib') -Recurse
+    [System.IO.File]::WriteAllText(
+        (Join-Path $progDir 'version.txt'),
+        $ProgramVersion,
+        (New-Object System.Text.UTF8Encoding($false)))
+
+    # testenv\opencppcoverage (static tooling).
+    $occDir = Join-Path $testenv 'opencppcoverage'
+    if (Test-Path $occDir) {
+        Remove-Item -LiteralPath $occDir -Recurse -Force
+    }
+    $occSourceName = Split-Path $OpenCppCoverageDir -Leaf
+    if (Test-Path (Join-Path $testenv $occSourceName)) {
+        Remove-Item -LiteralPath (Join-Path $testenv $occSourceName) -Recurse -Force
+    }
+    New-Item -ItemType Directory -Force $occDir | Out-Null
+    if (Get-Command robocopy -ErrorAction SilentlyContinue) {
+        & robocopy $OpenCppCoverageDir $occDir /E /NFL /NDL /NJH /NJS /NP | Out-Null
+        if ($LASTEXITCODE -ge 8) {
+            throw "robocopy opencppcoverage failed with exit code $LASTEXITCODE"
+        }
+    } else {
+        Get-ChildItem $OpenCppCoverageDir | Copy-Item -Destination $occDir -Recurse
+    }
+    Get-ChildItem $occDir -Filter 'unins*' | Remove-Item -Force
+    Write-Host "built testenv\program (version $ProgramVersion) + opencppcoverage"
+}
+
+if (-not $OnlyClient -and -not $OnlyProgram) {
+    $dataDir = Join-Path $testenv 'dataset'
+    if (Test-Path $dataDir) {
+        Remove-Item -LiteralPath $dataDir -Recurse -Force
+    }
+    New-Item -ItemType Directory -Force $dataDir | Out-Null
+    if (Get-Command robocopy -ErrorAction SilentlyContinue) {
+        & robocopy $DatasetDir $dataDir *.stp /NFL /NDL /NJH /NJS /NP | Out-Null
+        if ($LASTEXITCODE -ge 8) {
+            throw "robocopy failed with exit code $LASTEXITCODE"
+        }
+    } else {
+        Get-ChildItem $DatasetDir -File -Filter *.stp | Copy-Item -Destination $dataDir
+    }
+    [System.IO.File]::WriteAllText(
+        (Join-Path $dataDir 'version.txt'),
+        $DatasetVersion,
+        (New-Object System.Text.UTF8Encoding($false)))
+    $count = (Get-ChildItem $dataDir -File -Filter *.stp | Measure-Object).Count
+    Write-Host "built testenv\dataset ($count files, version $DatasetVersion)"
+}
+
+if (-not $OnlyProgram -and -not $OnlyDataset) {
+    New-Item -ItemType Directory -Force (Join-Path $OutDir 'config') | Out-Null
+    Copy-Item -LiteralPath (Join-Path $BinDir 'client.exe') -Destination $OutDir
+    Get-ChildItem $BinDir -Filter '*.dll' | Copy-Item -Destination $OutDir
+
+    $coverageCfg = @{
+        dll = 'coverage.dll'
+        enabled = $true
+        dry_run = $false
+        store_type = $StoreType
+        store_cov = [bool]$StoreCov
+        store_dir = 'store'
+        program_dir = 'testenv/program'
+        stp_root = 'testenv/dataset'
+        export_dir = 'reports'
+        opencppcoverage = 'testenv/opencppcoverage/OpenCppCoverage.exe'
+        target_exe = 'testenv/program/StepTest.exe'
+        occt_dlls = $OcctDlls | ForEach-Object { "testenv/program/$_" }
+    }
+    if ($DbConn) {
+        $coverageCfg['db_conn'] = $DbConn
+    }
+    $clientCfg = @{
+        scheduler = @{
+            endpoint = $Endpoint
+            poll_timeout_ms = 50
+        }
+        client = @{
+            worker_id = $WorkerId
+            heartbeat_interval_ms = 1000
+            task_threads = 2
+        }
+        plugins = @{
+            demo = @{ dll = 'demo.dll'; enabled = $false }
+            coverage = $coverageCfg
+        }
+    } | ConvertTo-Json -Depth 6
+    [System.IO.File]::WriteAllText(
+        (Join-Path $OutDir 'config\client.json'),
+        $clientCfg,
+        (New-Object System.Text.UTF8Encoding($false)))
+
+    @"
+@echo off
+cd /d "%~dp0"
+client.exe config\client.json
+pause
+"@ | Set-Content -Path (Join-Path $OutDir 'start_client.bat') -Encoding ASCII
+
+    Write-Host "built client package: $OutDir"
+}
+
+Write-Host "done. copy '$OutDir' to the target machine and run start_client.bat"

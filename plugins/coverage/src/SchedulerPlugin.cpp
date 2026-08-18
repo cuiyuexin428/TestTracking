@@ -25,7 +25,6 @@ bool SchedulerPlugin::init(const std::string& config) {
     manifest_path_ = cfg.value("stp_manifest", std::string());
     expected_program_version_ = cfg.value("expected_program_version", std::string());
     expected_dataset_version_ = cfg.value("expected_dataset_version", std::string());
-    shared_dir_ = cfg.value("shared_dir", std::string());
     batch_size_ = cfg.value("batch_size", 1000);
     task_size_ = cfg.value("task_size", 25);
     failed_file_retries_ = cfg.value("failed_file_retries", 0);
@@ -87,20 +86,16 @@ bool SchedulerPlugin::validateClient(const common::ClientInfo& client,
          info.program_version() == expected_program_version_) &&
         (expected_dataset_version_.empty() ||
          info.dataset_version() == expected_dataset_version_);
-    if (info.deployed() && version_ok) {
+    if (version_ok) {
         result.accepted = true;
         result.reason = "ok";
         return true;
     }
 
-    coverage::CoverageValidationReply reply;
-    reply.set_deploy_required(true);
-    reply.set_target_program_version(expected_program_version_);
-    reply.set_target_dataset_version(expected_dataset_version_);
-    reply.set_shared_dir(shared_dir_);
-    reply.SerializeToString(&result.reply_payload);
     result.accepted = false;
-    result.reason = "deploy required";
+    result.reason = "version mismatch (program expected=" + expected_program_version_ +
+                    " got=" + info.program_version() + ", dataset expected=" +
+                    expected_dataset_version_ + " got=" + info.dataset_version() + ")";
     return true;
 }
 
