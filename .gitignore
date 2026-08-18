@@ -28,3 +28,7 @@ Desktop.ini
 
 # Generated standalone client package (tools/pack_client.ps1)
 /client_package/
+
+# Local artifacts (old package archive, coverage tool log)
+/client_package.7z
+/LastCoverageResults.log
