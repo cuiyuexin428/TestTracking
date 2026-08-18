@@ -17,6 +17,7 @@ namespace scheduler {
 struct IncomingMessage {
     std::string identity;
     common::Envelope envelope;
+    std::string peer_address;  // server-observed "ip:port" of the client
 };
 
 // A message waiting to be sent to a client.

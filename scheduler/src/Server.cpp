@@ -47,7 +47,11 @@ void Server::RunLoop() {
                 if (parts.size() >= 2) {
                     common::Envelope env;
                     if (env.ParseFromString(parts[1])) {
-                        incoming_.push({parts[0], std::move(env)});
+                        IncomingMessage msg;
+                        msg.identity = parts[0];
+                        msg.envelope = std::move(env);
+                        msg.peer_address = router_.lastPeerAddress();
+                        incoming_.push(std::move(msg));
                     } else {
                         LOG_WARN("server: dropped unparseable message from " << parts[0]);
                     }

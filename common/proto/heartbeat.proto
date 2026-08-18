@@ -17,4 +17,5 @@ message Heartbeat {
 
   Status status = 2;
   ResourceUsage resource = 3;  // health data (memory etc.)
+  string plugin_info = 4;  // opaque business info (e.g. versions) for display
 }

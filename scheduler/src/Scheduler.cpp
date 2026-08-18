@@ -137,8 +137,14 @@ std::vector<common::ClientInfo> Scheduler::clients() const {
     std::lock_guard<std::mutex> lock(clients_mutex_);
     std::vector<common::ClientInfo> out;
     out.reserve(clients_.size());
+    const auto now = std::chrono::steady_clock::now();
     for (const auto& entry : clients_) {
-        out.push_back(entry.second.info);
+        common::ClientInfo info = entry.second.info;
+        info.last_seen_age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    now - entry.second.last_seen)
+                                    .count();
+        info.registered = entry.second.registered;
+        out.push_back(std::move(info));
     }
     return out;
 }
@@ -251,6 +257,10 @@ void Scheduler::RunProcessing() {
 
 void Scheduler::HandleMessage(const IncomingMessage& msg) {
     const common::Envelope& env = msg.envelope;
+    if (!msg.peer_address.empty()) {
+        std::lock_guard<std::mutex> lock(clients_mutex_);
+        clients_[msg.identity].info.peer_address = msg.peer_address;
+    }
     switch (env.type()) {
         case common::REGISTER:
             if (env.has_register_()) {

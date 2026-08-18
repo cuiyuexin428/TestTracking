@@ -37,6 +37,12 @@ public:
 
     // Execute one task and fill the execution report.
     virtual bool execute(const Task& task, TaskResult& result) = 0;
+
+    // Optional short business info shown in the scheduler's client list
+    // (e.g. component versions). Empty string means no extra info.
+    virtual std::string heartbeatInfo() const {
+        return std::string();
+    }
 };
 
 // DLL entry points (extern "C", exported):

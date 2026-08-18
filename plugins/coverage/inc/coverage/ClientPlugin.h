@@ -22,6 +22,7 @@ public:
     bool init(const std::string& config) override;
     bool collectRegistrationInfo(std::string* payload) override;
     common::RegisterOutcome handleValidationReply(const std::string& reply_payload) override;
+    std::string heartbeatInfo() const override;
     bool execute(const common::Task& task, common::TaskResult& result) override;
 
 private:

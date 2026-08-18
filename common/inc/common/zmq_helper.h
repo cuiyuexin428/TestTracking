@@ -48,10 +48,17 @@ public:
     // Pass-through for zmq_setsockopt, e.g. ZMQ_RCVTIMEO, ZMQ_SUBSCRIBE.
     void setOption(int option, const void* value, size_t size);
 
+    // Peer address ("ip:port") of the last received message, captured from
+    // the ROUTER frame metadata. Empty when unavailable.
+    std::string lastPeerAddress() const {
+        return last_peer_address_;
+    }
+
 protected:
     void* context_ = nullptr;
     void* socket_ = nullptr;
     std::string ip_port_;
+    std::string last_peer_address_;
 };
 
 // PUB broadcasts; in this role it binds, so connect() is disabled.

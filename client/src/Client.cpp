@@ -13,12 +13,76 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
+#include <sdkddkver.h>
+#ifndef NTDDI_VERSION
+#define NTDDI_VERSION NTDDI_WIN10
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <psapi.h>
+#include <iphlpapi.h>
 #pragma comment(lib, "psapi.lib")
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "ws2_32.lib")
 #endif
 
 namespace client {
+
+namespace {
+
+std::string DetectLocalIp() {
+#ifdef _WIN32
+    ULONG size = 0;
+    if (GetAdaptersAddresses(AF_INET,
+                             GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                                 GAA_FLAG_SKIP_DNS_SERVER,
+                             nullptr, nullptr, &size) != ERROR_BUFFER_OVERFLOW ||
+        size == 0) {
+        return std::string();
+    }
+    std::vector<BYTE> buffer(size);
+    PIP_ADAPTER_ADDRESSES addresses =
+        reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
+    if (GetAdaptersAddresses(AF_INET,
+                             GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                                 GAA_FLAG_SKIP_DNS_SERVER,
+                             nullptr, addresses, &size) != NO_ERROR) {
+        return std::string();
+    }
+    for (PIP_ADAPTER_ADDRESSES adapter = addresses; adapter != nullptr;
+         adapter = adapter->Next) {
+        if (adapter->OperStatus != IfOperStatusUp) {
+            continue;
+        }
+        for (PIP_ADAPTER_UNICAST_ADDRESS unicast = adapter->FirstUnicastAddress;
+             unicast != nullptr; unicast = unicast->Next) {
+            if (unicast->Address.lpSockaddr->sa_family != AF_INET) {
+                continue;
+            }
+            const auto* sin =
+                reinterpret_cast<const sockaddr_in*>(unicast->Address.lpSockaddr);
+            char ip[INET_ADDRSTRLEN] = {};
+            inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip));
+            const std::string result(ip);
+            if (result.rfind("127.", 0) != 0) {
+                return result;
+            }
+        }
+    }
+#else
+    (void)0;
+#endif
+    return std::string();
+}
+
+}  // namespace
 
 Client::Client(common::Config& config)
     : config_(config),
@@ -50,6 +114,10 @@ void Client::start() {
     const int recv_timeout_ms = static_cast<int>(poll_timeout_.count());
     dealer_.setOption(ZMQ_RCVTIMEO, &recv_timeout_ms, sizeof(recv_timeout_ms));
     dealer_.connect();
+    if (ip_.empty()) {
+        ip_ = DetectLocalIp();
+    }
+    LOG_INFO("client local ip=" << ip_);
 
     // INIT: no threads yet, synchronously complete registration validation.
     if (!RegisterWithServer()) {
@@ -471,6 +539,9 @@ void Client::SendHeartbeat() {
     env.set_plugin_type(plugin_ != nullptr ? plugin_->pluginType() : std::string());
     common::Heartbeat* heartbeat = env.mutable_heartbeat();
     heartbeat->set_ip(ip_);
+    if (plugin_ != nullptr) {
+        heartbeat->set_plugin_info(plugin_->heartbeatInfo());
+    }
     {
         std::lock_guard<std::mutex> lock(counters_mutex_);
         heartbeat->set_status(in_flight_ > 0 ? common::Heartbeat::BUSY

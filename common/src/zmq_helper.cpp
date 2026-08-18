@@ -113,6 +113,10 @@ std::vector<std::string> ZmqBase<SocketType>::recvMsgParts() {
             throw std::runtime_error(std::string("zmq_msg_recv: ") + zmq_strerror(zmq_errno()));
         }
 
+        if (parts.empty()) {
+            const char* peer = zmq_msg_gets(&msg, "Peer-Address");
+            last_peer_address_ = peer != nullptr ? std::string(peer) : std::string();
+        }
         parts.emplace_back(static_cast<const char*>(zmq_msg_data(&msg)), zmq_msg_size(&msg));
         const bool more = zmq_msg_more(&msg) != 0;
         zmq_msg_close(&msg);

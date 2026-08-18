@@ -166,6 +166,10 @@ common::RegisterOutcome ClientPlugin::handleValidationReply(const std::string&) 
     return common::RegisterOutcome::kReady;
 }
 
+std::string ClientPlugin::heartbeatInfo() const {
+    return "program=" + program_version_ + ",dataset=" + dataset_version_;
+}
+
 bool ClientPlugin::RunOneFile(const std::string& run_id, int wave, const std::string& file,
                               std::vector<std::uint64_t>& points) {
     const std::string stp_path = stp_root_ + "/" + file;

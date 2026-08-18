@@ -14,6 +14,9 @@ struct ClientInfo {
     std::string identity;
     std::string plugin_type;
     Heartbeat heartbeat;
+    std::int64_t last_seen_age_ms = 0;  // filled by the scheduler snapshot
+    bool registered = false;            // filled by the scheduler snapshot
+    std::string peer_address;           // server-observed ip:port of the client
 };
 
 // Run request.

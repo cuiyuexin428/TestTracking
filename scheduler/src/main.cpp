@@ -81,9 +81,20 @@ void PrintClients(const std::vector<common::ClientInfo>& clients) {
         return;
     }
     for (const common::ClientInfo& c : clients) {
-        std::printf("client %s type=%s ip=%s status=%s\n", c.identity.c_str(),
-                    c.plugin_type.c_str(), c.heartbeat.ip().c_str(),
-                    c.heartbeat.status() == common::Heartbeat::BUSY ? "busy" : "idle");
+        const common::Heartbeat& hb = c.heartbeat;
+        const char* status =
+            hb.status() == common::Heartbeat::BUSY ? "busy" : "idle";
+        std::printf("client %s type=%s ip=%s peer=%s status=%s registered=%s",
+                    c.identity.c_str(), c.plugin_type.c_str(), hb.ip().c_str(),
+                    c.peer_address.c_str(), status, c.registered ? "yes" : "no");
+        if (hb.has_resource()) {
+            std::printf(" mem=%.0fMB disk=%.1fGB cpu=%d%%",
+                        hb.resource().memory_bytes() / (1024.0 * 1024.0),
+                        hb.resource().disk_free_bytes() / (1024.0 * 1024.0 * 1024.0),
+                        hb.resource().cpu_percent());
+        }
+        std::printf(" seen=%.1fs info=%s\n", c.last_seen_age_ms / 1000.0,
+                    hb.plugin_info().c_str());
     }
 }
 
