@@ -30,13 +30,19 @@ bool CopyTree(const std::string& from, const std::string& to) {
     std::error_code ec;
     std::filesystem::create_directories(to, ec);
     if (ec) {
+        LOG_ERROR("coverage plugin: cannot create deploy dir " << to << ": " << ec.message());
         return false;
     }
     std::filesystem::copy(from, to,
                           std::filesystem::copy_options::recursive |
                               std::filesystem::copy_options::overwrite_existing,
                           ec);
-    return !ec;
+    if (ec) {
+        LOG_ERROR("coverage plugin: copy failed " << from << " -> " << to << ": "
+                                                  << ec.message());
+        return false;
+    }
+    return true;
 }
 
 #ifdef _WIN32
@@ -142,6 +148,7 @@ bool ClientPlugin::init(const std::string& config) {
     program_version_ = cfg.value("program_version", std::string());
     dataset_version_ = cfg.value("dataset_version", std::string());
     deployed_ = cfg.value("deployed", false);
+    const bool explicit_deploy_state = cfg.contains("deployed");
     deploy_state_path_ = cfg.value("deploy_state", std::string());
     deploy_max_attempts_ = cfg.value("deploy_max_attempts", 3);
     deploy_retry_delay_ms_ = cfg.value("deploy_retry_delay_ms", 5000);
@@ -152,7 +159,9 @@ bool ClientPlugin::init(const std::string& config) {
     if (deploy_state_path_.empty() && !program_dir_.empty()) {
         deploy_state_path_ = program_dir_ + "/deploy.json";
     }
-    LoadDeployState();
+    if (!explicit_deploy_state) {
+        LoadDeployState();
+    }
 
     if (!export_dir_.empty()) {
         std::error_code ec;
