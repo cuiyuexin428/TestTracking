@@ -38,6 +38,7 @@ if(NOT PG_ROOT)
     file(GLOB _pg_candidates
         "C:/Program Files/PostgreSQL/*"
         "C:/pgsql"
+        "${THIRD_PARTY_ROOT}/pgsql"
         "C:/WorkSpace/ThirdParty/pgsql")
     foreach(_pg_candidate IN LISTS _pg_candidates)
         if(EXISTS "${_pg_candidate}/include/libpq-fe.h" AND

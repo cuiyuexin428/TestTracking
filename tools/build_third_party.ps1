@@ -258,6 +258,34 @@ Install-SingleFile "https://raw.githubusercontent.com/leethomason/tinyxml2/$Vers
 Install-SingleFile "https://raw.githubusercontent.com/leethomason/tinyxml2/$VersionTinyXml2/LICENSE.txt" (Join-Path $downloadsDir "tinyxml2-LICENSE.txt") (Join-Path $xmlDir "LICENSE.txt")
 
 Write-Host ""
+# ---------- PostgreSQL client (libpq) ----------
+$pgPrefix = Join-Path $installRoot "pgsql"
+if (Test-Path (Join-Path $pgPrefix "include\libpq-fe.h")) {
+    Write-Host "PostgreSQL client already installed: $pgPrefix"
+} else {
+    $pgZip = Get-ChildItem $downloadsDir -Filter "postgresql-*.zip" -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($pgZip) {
+        $pgExtract = Join-Path $extractDir "postgresql-tmp"
+        Prepare-BuildDir $pgExtract
+        Expand-Zip $pgZip.FullName $pgExtract
+        $inner = Get-ChildItem $pgExtract -Directory |
+            Where-Object { $_.Name -match "pgsql|postgresql" } |
+            Select-Object -First 1
+        if ($inner) {
+            Move-Item -LiteralPath $inner.FullName -Destination $pgPrefix
+        } elseif ((Get-ChildItem $pgExtract -File | Measure-Object).Count -gt 0) {
+            Rename-Item -LiteralPath $pgExtract -NewName $pgPrefix
+        } else {
+            throw "PostgreSQL zip layout not recognized: $($pgZip.FullName)"
+        }
+        Write-Host "PostgreSQL client installed: $pgPrefix"
+    } else {
+        Write-Host "WARN: postgresql-*.zip not found under $downloadsDir; install libpq manually"
+        Write-Host "  (copy the pgsql directory next to the project and set PG_ROOT, or place the zip here)"
+    }
+}
+
 Write-Host "==== Build complete ===="
 Write-Host "Install root: $installRoot"
 Write-Host "Source root : $srcRoot"
