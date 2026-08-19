@@ -32,3 +32,9 @@ Desktop.ini
 # Local artifacts (old package archive, coverage tool log)
 /client_package.7z
 /LastCoverageResults.log
+
+# Generated offline runtime (PostgreSQL data, staged dataset, start scripts)
+/runtime/
+
+# Generated offline client package (tools/setup_offline_server.ps1)
+/dist/

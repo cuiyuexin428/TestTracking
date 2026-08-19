@@ -12,6 +12,7 @@ param(
     [string]$BuildDir = "",
     [string]$PgRoot = "",
     [switch]$SkipThirdParty,
+    [string]$Config = 'Debug',
     [switch]$SkipBuild
 )
 $ErrorActionPreference = "Stop"
@@ -92,8 +93,8 @@ $cfgArgs = @("-S", $ProjectRoot, "-B", $BuildDir, "-A", "x64")
 if ($PgRoot) { $cfgArgs += "-DPG_ROOT=$PgRoot" }
 & cmake @cfgArgs
 if ($LASTEXITCODE -ne 0) { Write-Host "[FAIL] cmake configure failed"; exit 1 }
-& cmake --build $BuildDir --config Debug --parallel 8
+& cmake --build $BuildDir --config $Config --parallel 8
 if ($LASTEXITCODE -ne 0) { Write-Host "[FAIL] cmake build failed"; exit 1 }
-Write-Host "[PASS] configure + build (Debug) succeeded"
+Write-Host "[PASS] configure + build ($Config) succeeded"
 if ($failures -eq 0) { Write-Host "RESULT: ALL PASS" } else { Write-Host "RESULT: $failures FAILED" }
 exit $failures

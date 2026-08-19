@@ -19,6 +19,7 @@ param(
     [string]$BinDir = $null,
     [string]$Endpoint = '',
     [string]$WorkerId = 'worker-1',
+    [int]$TaskThreads = 2,
     [string]$StoreType = 'postgres',
     [string]$DbConn = '',
     [string]$ServerIp = '',
@@ -168,6 +169,9 @@ if (-not $OnlyClient -and -not $OnlyProgram) {
         (Join-Path $dataDir 'version.txt'),
         $DatasetVersion,
         (New-Object System.Text.UTF8Encoding($false)))
+    & (Join-Path $PSScriptRoot 'build_dataset_manifest.ps1') `
+        -DatasetDir $dataDir `
+        -OutFile (Join-Path $dataDir 'manifest.txt')
     $count = (Get-ChildItem $dataDir -File -Filter *.stp -Recurse | Measure-Object).Count
     Write-Host "built testenv\dataset ($count files, version $DatasetVersion)"
 }
@@ -202,7 +206,7 @@ if (-not $OnlyProgram -and -not $OnlyDataset) {
         client = @{
             worker_id = $WorkerId
             heartbeat_interval_ms = 1000
-            task_threads = 2
+            task_threads = $TaskThreads
             request_backoff_initial_ms = 200
             request_backoff_max_ms = 30000
             register_timeout_ms = 5000
