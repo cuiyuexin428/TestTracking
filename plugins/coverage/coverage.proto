@@ -37,6 +37,11 @@ message CoverageCheckpoint {
   string manifest_fingerprint = 6;
   // Monotonic task id counter for retry tasks (kept unique across restarts).
   int32 task_seq = 7;
+  // Waves whose settlement is still pending (in progress or queued), in order.
+  repeated int32 pending_settle_waves = 8;
+  // Wave whose settlement failed; absent means none. When set, the settlement
+  // chain is paused (dispatch continues) and no automatic retry is attempted.
+  optional int32 settle_failed_wave = 9;
 }
 
 // Registration validation: component versions of the client package. It is

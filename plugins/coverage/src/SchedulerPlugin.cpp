@@ -185,9 +185,15 @@ bool SchedulerPlugin::plan(const common::RunRequest& request,
     task_client_.clear();
     tasks_by_id_.clear();
     cumulative_.clear();
+    {
+        std::lock_guard<std::mutex> settle_lock(settle_mutex_);
+        settle_queue_.clear();
+        settle_failed_wave_.store(-1);
+        settle_active_.store(false);
+    }
     current_wave_ = 0;
     task_seq_ = 0;
-    selected_count_ = 0;
+    selected_count_.store(0);
 
     pending_ = waves_[0];
     for (const common::Task& task : pending_) {
@@ -263,7 +269,7 @@ void SchedulerPlugin::SaveCheckpointLocked() {
     coverage::CoverageCheckpoint ckpt;
     ckpt.set_current_wave(static_cast<std::int32_t>(current_wave_));
     ckpt.set_total_files(static_cast<std::int32_t>(total_files_));
-    ckpt.set_selected_files(static_cast<std::int32_t>(selected_count_));
+    ckpt.set_selected_files(static_cast<std::int32_t>(selected_count_.load()));
     ckpt.set_manifest_fingerprint(manifest_fingerprint_);
     ckpt.set_task_seq(static_cast<std::int32_t>(task_seq_));
     for (const std::string& task_id : wave_task_ids_) {
@@ -287,6 +293,15 @@ void SchedulerPlugin::SaveCheckpointLocked() {
         it->second.SerializeToString(&bytes);
         ckpt.add_priority_tasks(bytes);
     }
+    {
+        // Snapshot settlement state under settle_mutex_; the merge itself
+        // never holds this lock, so result bookkeeping is never blocked.
+        std::lock_guard<std::mutex> settle_lock(settle_mutex_);
+        for (int wave : settle_queue_) {
+            ckpt.add_pending_settle_waves(wave);
+        }
+        ckpt.set_settle_failed_wave(settle_failed_wave_.load());
+    }
     std::string blob;
     if (!ckpt.SerializeToString(&blob)) {
         last_checkpoint_save_ok_ = false;
@@ -304,119 +319,177 @@ void SchedulerPlugin::SaveCheckpointLocked() {
 }
 
 bool SchedulerPlugin::saveCheckpoint(const std::string& run_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (run_id_ != run_id) {
-        LOG_WARN("coverage plugin: saveCheckpoint run mismatch, current=" << run_id_
-                                                                         << " asked=" << run_id);
-        return false;
+    // Wait for any in-flight settlement so the snapshot is stable (stop/quit).
+    while (true) {
+        {
+            std::unique_lock<std::mutex> settle_lock(settle_mutex_);
+            settle_cv_.wait(settle_lock, [this] {
+                return !settle_active_.load(std::memory_order_relaxed);
+            });
+        }
+        bool active = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            {
+                std::lock_guard<std::mutex> settle_lock(settle_mutex_);
+                active = settle_active_.load(std::memory_order_relaxed);
+            }
+            if (!active) {
+                if (run_id_ != run_id) {
+                    LOG_WARN("coverage plugin: saveCheckpoint run mismatch, current=" << run_id_
+                                                                                      << " asked=" << run_id);
+                    return false;
+                }
+                SaveCheckpointLocked();
+                return last_checkpoint_save_ok_;
+            }
+        }
+        // A new settlement started after the wait; retry with locks released.
     }
-    SaveCheckpointLocked();
-    if (!last_checkpoint_save_ok_) {
-        return false;
-    }
-    return true;
 }
 
 bool SchedulerPlugin::restore(const std::string& run_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    std::string blob;
-    if (!store_->loadCheckpoint(run_id, &blob)) {
-        LOG_WARN("coverage plugin: no checkpoint for run " << run_id);
-        return false;
-    }
-    coverage::CoverageCheckpoint ckpt;
-    if (!ckpt.ParseFromString(blob)) {
-        LOG_ERROR("coverage plugin: unparseable checkpoint for run " << run_id);
-        return false;
-    }
-    if (!BuildWaves(run_id)) {
-        LOG_ERROR("coverage plugin: restore failed to rebuild waves for run " << run_id);
-        return false;
-    }
-    if (!ckpt.manifest_fingerprint().empty() &&
-        ckpt.manifest_fingerprint() != manifest_fingerprint_) {
-        LOG_ERROR("coverage plugin: manifest changed since checkpoint, cannot restore run "
-                  << run_id);
-        return false;
-    }
-    if (ckpt.manifest_fingerprint().empty()) {
-        LOG_WARN("coverage plugin: legacy checkpoint without manifest fingerprint for run "
-                 << run_id);
-    }
-
-    run_id_ = run_id;
-    pending_.clear();
-    pending_ids_.clear();
-    priority_pending_.clear();
-    priority_ids_.clear();
-    wave_task_ids_.clear();
-    task_client_.clear();
-    tasks_by_id_.clear();
-    cumulative_.clear();
-    current_wave_ = static_cast<size_t>(ckpt.current_wave());
-    total_files_ = static_cast<size_t>(ckpt.total_files());
-    selected_count_ = static_cast<size_t>(ckpt.selected_files());
-    task_seq_ = static_cast<size_t>(ckpt.task_seq());
-
-    if (!keep_staging_) {
-        // Waves before the checkpoint wave are settled; remove any staging
-        // left by an interrupted settle/cleanup sequence.
-        for (size_t wave = 0; wave < current_wave_; ++wave) {
-            store_->clearWave(run_id, static_cast<int>(wave));
-        }
-    }
-
-    if (current_wave_ >= waves_.size()) {
-        LOG_INFO("coverage plugin: run " << run_id << " checkpoint marks run finished");
-        return true;
-    }
-
-    for (const std::string& bytes : ckpt.remaining_tasks()) {
-        common::Task task;
-        if (!task.ParseFromString(bytes)) {
-            LOG_ERROR("coverage plugin: unparseable remaining task in checkpoint");
+    bool resume_settle = false;
+    size_t pending_settle_count = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::string blob;
+        if (!store_->loadCheckpoint(run_id, &blob)) {
+            LOG_WARN("coverage plugin: no checkpoint for run " << run_id);
             return false;
         }
-        pending_.push_back(task);
-        pending_ids_.insert(task.task_id());
-        wave_task_ids_.insert(task.task_id());
-        tasks_by_id_[task.task_id()] = task;
-    }
-    for (const std::string& bytes : ckpt.priority_tasks()) {
-        common::Task task;
-        if (!task.ParseFromString(bytes)) {
-            LOG_ERROR("coverage plugin: unparseable priority task in checkpoint");
+        coverage::CoverageCheckpoint ckpt;
+        if (!ckpt.ParseFromString(blob)) {
+            LOG_ERROR("coverage plugin: unparseable checkpoint for run " << run_id);
             return false;
         }
-        priority_pending_.push_back(task);
-        priority_ids_.insert(task.task_id());
-        wave_task_ids_.insert(task.task_id());
-        tasks_by_id_[task.task_id()] = task;
-    }
-    for (size_t wave = current_wave_ + 1; wave < waves_.size(); ++wave) {
-        for (const common::Task& task : waves_[wave]) {
-            tasks_by_id_[task.task_id()] = task;
+        if (!BuildWaves(run_id)) {
+            LOG_ERROR("coverage plugin: restore failed to rebuild waves for run " << run_id);
+            return false;
         }
+        if (!ckpt.manifest_fingerprint().empty() &&
+            ckpt.manifest_fingerprint() != manifest_fingerprint_) {
+            LOG_ERROR("coverage plugin: manifest changed since checkpoint, cannot restore run "
+                      << run_id);
+            return false;
+        }
+        if (ckpt.manifest_fingerprint().empty()) {
+            LOG_WARN("coverage plugin: legacy checkpoint without manifest fingerprint for run "
+                     << run_id);
+        }
+
+        run_id_ = run_id;
+        pending_.clear();
+        pending_ids_.clear();
+        priority_pending_.clear();
+        priority_ids_.clear();
+        wave_task_ids_.clear();
+        task_client_.clear();
+        tasks_by_id_.clear();
+        cumulative_.clear();
+        current_wave_ = static_cast<size_t>(ckpt.current_wave());
+        total_files_ = static_cast<size_t>(ckpt.total_files());
+        selected_count_.store(static_cast<size_t>(ckpt.selected_files()));
+        task_seq_ = static_cast<size_t>(ckpt.task_seq());
+
+        if (!keep_staging_) {
+            // Waves before the checkpoint wave are settled; remove any staging
+            // left by an interrupted settle/cleanup sequence.
+            for (size_t wave = 0; wave < current_wave_; ++wave) {
+                store_->clearWave(run_id, static_cast<int>(wave));
+            }
+        }
+
+        if (current_wave_ < waves_.size()) {
+            for (const std::string& bytes : ckpt.remaining_tasks()) {
+                common::Task task;
+                if (!task.ParseFromString(bytes)) {
+                    LOG_ERROR("coverage plugin: unparseable remaining task in checkpoint");
+                    return false;
+                }
+                pending_.push_back(task);
+                pending_ids_.insert(task.task_id());
+                wave_task_ids_.insert(task.task_id());
+                tasks_by_id_[task.task_id()] = task;
+            }
+            for (const std::string& bytes : ckpt.priority_tasks()) {
+                common::Task task;
+                if (!task.ParseFromString(bytes)) {
+                    LOG_ERROR("coverage plugin: unparseable priority task in checkpoint");
+                    return false;
+                }
+                priority_pending_.push_back(task);
+                priority_ids_.insert(task.task_id());
+                wave_task_ids_.insert(task.task_id());
+                tasks_by_id_[task.task_id()] = task;
+            }
+            for (size_t wave = current_wave_ + 1; wave < waves_.size(); ++wave) {
+                for (const common::Task& task : waves_[wave]) {
+                    tasks_by_id_[task.task_id()] = task;
+                }
+            }
+            if (wave_task_ids_.empty()) {
+                LOG_ERROR("coverage plugin: checkpoint for run " << run_id
+                          << " has no remaining tasks in an active wave, restore rejected");
+                return false;
+            }
+        } else {
+            LOG_INFO("coverage plugin: run " << run_id << " checkpoint marks run finished");
+        }
+
+        if (current_wave_ > 0) {
+            std::vector<std::uint64_t> points;
+            if (!store_->loadCumulative(run_id, static_cast<int>(current_wave_) - 1, &points)) {
+                LOG_ERROR("coverage plugin: cannot load cumulative points for run " << run_id);
+                return false;
+            }
+            cumulative_.insert(points.begin(), points.end());
+        }
+
+        // Restore settlement state; pending waves are re-settled after the
+        // plugin lock is released (no concurrent threads exist yet at start).
+        {
+            std::lock_guard<std::mutex> settle_lock(settle_mutex_);
+            settle_queue_.clear();
+            if (ckpt.has_settle_failed_wave()) {
+                settle_failed_wave_.store(ckpt.settle_failed_wave());
+            } else {
+                settle_failed_wave_.store(-1);
+            }
+            for (int wave : ckpt.pending_settle_waves()) {
+                settle_queue_.push_back(wave);
+            }
+            if (settle_failed_wave_.load() < 0 && !settle_queue_.empty()) {
+                settle_active_.store(true);
+                resume_settle = true;
+            }
+            pending_settle_count = settle_queue_.size();
+        }
+        LOG_INFO("coverage plugin: run restored " << run_id << " wave=" << current_wave_
+                                                  << " remaining=" << wave_task_ids_.size()
+                                                  << " pending_settle=" << pending_settle_count);
     }
 
-    if (current_wave_ < waves_.size() && wave_task_ids_.empty()) {
-        LOG_ERROR("coverage plugin: checkpoint for run " << run_id
-                                                         << " has no remaining tasks in an "
-                                                            "active wave, restore rejected");
-        return false;
+    if (settle_failed_wave_.load() >= 0) {
+        LOG_ERROR("coverage plugin: run " << run_id << " has settlement failure at wave "
+                  << settle_failed_wave_.load() << ", settlement chain stays paused");
     }
-    std::vector<std::uint64_t> points;
-    if (!store_->loadCumulative(run_id, static_cast<int>(current_wave_) - 1, &points)) {
-        LOG_ERROR("coverage plugin: cannot load cumulative points for run " << run_id);
-        return false;
+    if (resume_settle) {
+        LOG_INFO("coverage plugin: resuming settlement for run " << run_id);
+        SettleWaveLoop();
     }
-    cumulative_.insert(points.begin(), points.end());
-    LOG_INFO("coverage plugin: run restored " << run_id << " wave=" << current_wave_
-                                              << " remaining=" << wave_task_ids_.size());
     return true;
 }
 
 void SchedulerPlugin::processResult(const common::TaskResult& result) {
+    if (HandleResultLocked(result)) {
+        SettleWaveLoop();
+    }
+}
+
+bool SchedulerPlugin::HandleResultLocked(const common::TaskResult& result) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
     coverage::CoverageResult coverage_result;
     int covered_lines = 0;
     bool result_parse_failed = false;
@@ -434,26 +507,23 @@ void SchedulerPlugin::processResult(const common::TaskResult& result) {
         }
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
     int retry_count = 0;
     int retry_wave = -1;
     std::string retry_run_id;
     const auto spec_it = tasks_by_id_.find(result.task_id());
     if (spec_it == tasks_by_id_.end()) {
         LOG_WARN("coverage plugin: result for unknown task " << result.task_id()
-                                                            << " after run state change, dropped");
-        return;
+                                                             << " after run state change, dropped");
+        return false;
     }
-    if (spec_it != tasks_by_id_.end()) {
-        coverage::CoverageTask task_meta;
-        if (task_meta.ParseFromString(spec_it->second.payload())) {
-            retry_count = task_meta.retry_count();
-            retry_run_id = task_meta.run_id();
-            retry_wave = task_meta.wave_id();
-            if (result_parse_failed) {
-                for (const std::string& file : task_meta.files()) {
-                    failed_files.push_back(file);
-                }
+    coverage::CoverageTask task_meta;
+    if (task_meta.ParseFromString(spec_it->second.payload())) {
+        retry_count = task_meta.retry_count();
+        retry_run_id = task_meta.run_id();
+        retry_wave = task_meta.wave_id();
+        if (result_parse_failed) {
+            for (const std::string& file : task_meta.files()) {
+                failed_files.push_back(file);
             }
         }
     }
@@ -461,8 +531,7 @@ void SchedulerPlugin::processResult(const common::TaskResult& result) {
     task_client_.erase(result.task_id());
 
     if (failed_file_retries_ > 0 && retry_count < failed_file_retries_ &&
-        retry_wave == static_cast<int>(current_wave_) &&
-        !failed_files.empty()) {
+        retry_wave == static_cast<int>(current_wave_) && !failed_files.empty()) {
         coverage::CoverageTask retry_task;
         retry_task.set_run_id(retry_run_id);
         retry_task.set_wave_id(retry_wave);
@@ -485,23 +554,86 @@ void SchedulerPlugin::processResult(const common::TaskResult& result) {
     LOG_INFO("coverage plugin: result " << result.task_id() << " covered_lines="
                                         << covered_lines);
 
-    if (wave_task_ids_.empty()) {
-        const int settled_wave = SettleWave();
+    if (!wave_task_ids_.empty()) {
         SaveCheckpointLocked();
-        if (!last_checkpoint_save_ok_) {
-            LOG_ERROR("coverage plugin: checkpoint save failed after settling wave "
-                      << settled_wave);
+        return false;
+    }
+
+    // The wave task pool is empty: advance dispatch state immediately so
+    // clients keep receiving tasks while this wave is settled in the
+    // background by the settlement loop.
+    const int settled_wave = static_cast<int>(current_wave_);
+    ++current_wave_;
+    if (current_wave_ < waves_.size()) {
+        pending_ = waves_[current_wave_];
+        wave_task_ids_.clear();
+        pending_ids_.clear();
+        for (const common::Task& task : pending_) {
+            wave_task_ids_.insert(task.task_id());
+            pending_ids_.insert(task.task_id());
+            tasks_by_id_[task.task_id()] = task;
         }
-        if (settled_wave >= 0 && !keep_staging_) {
-            if (!store_->clearWave(run_id_, settled_wave)) {
-                LOG_ERROR("coverage plugin: clearWave failed for wave " << settled_wave);
+        LOG_INFO("coverage plugin: wave " << current_wave_ << " started, "
+                                          << pending_.size() << " tasks");
+    } else {
+        LOG_INFO("coverage plugin: all waves dispatched, wave " << settled_wave
+                                                                << " settlement pending");
+    }
+
+    bool should_run = false;
+    {
+        std::lock_guard<std::mutex> settle_lock(settle_mutex_);
+        if (settle_failed_wave_.load() < 0) {
+            if (std::find(settle_queue_.begin(), settle_queue_.end(), settled_wave) ==
+                settle_queue_.end()) {
+                settle_queue_.push_back(settled_wave);
+            }
+            if (!settle_active_.load()) {
+                settle_active_.store(true);
+                should_run = true;
             }
         }
-    } else {
-        SaveCheckpointLocked();
-        if (!last_checkpoint_save_ok_) {
-            LOG_ERROR("coverage plugin: checkpoint save failed after task result");
+    }
+    SaveCheckpointLocked();
+    return should_run;
+}
+
+void SchedulerPlugin::SettleWaveLoop() {
+    while (true) {
+        int wave = -1;
+        {
+            std::lock_guard<std::mutex> settle_lock(settle_mutex_);
+            if (settle_failed_wave_.load() >= 0 || settle_queue_.empty()) {
+                settle_active_.store(false);
+                settle_cv_.notify_all();
+                return;
+            }
+            wave = settle_queue_.front();
+            settle_queue_.pop_front();
         }
+
+        const bool ok = SettleWave(wave);
+        if (!ok) {
+            LOG_ERROR("coverage plugin: wave " << wave
+                      << " settlement failed, chain paused (tasks keep dispatching)");
+            {
+                std::lock_guard<std::mutex> settle_lock(settle_mutex_);
+                settle_failed_wave_.store(wave);
+                settle_queue_.clear();
+                settle_active_.store(false);
+            }
+            settle_cv_.notify_all();
+            std::lock_guard<std::mutex> lock(mutex_);
+            SaveCheckpointLocked();
+            return;
+        }
+        if (!keep_staging_) {
+            if (!store_->clearWave(run_id_, wave)) {
+                LOG_ERROR("coverage plugin: clearWave failed for wave " << wave);
+            }
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        SaveCheckpointLocked();
     }
 }
 
@@ -524,19 +656,27 @@ void SchedulerPlugin::cancel() {
     current_wave_ = 0;
     task_seq_ = 0;
     total_files_ = 0;
-    selected_count_ = 0;
+    selected_count_.store(0);
     manifest_fingerprint_.clear();
     run_id_.clear();
     last_checkpoint_save_ok_ = false;
+    {
+        std::lock_guard<std::mutex> settle_lock(settle_mutex_);
+        settle_queue_.clear();
+        settle_failed_wave_.store(-1);
+        settle_active_.store(false);
+    }
+    settle_cv_.notify_all();
     LOG_INFO("coverage plugin: run cancelled, task pool cleared");
 }
 
-int SchedulerPlugin::SettleWave() {
-    const int settled_wave = static_cast<int>(current_wave_);
+bool SchedulerPlugin::SettleWave(int wave) {
+    // Runs on the single settlement loop; no plugin mutex is held so result
+    // bookkeeping and dispatch stay responsive during the heavy merge.
     std::unordered_map<std::string, std::set<std::uint64_t>> file_points;
-    if (!store_->loadWave(run_id_, settled_wave, &file_points)) {
-        LOG_ERROR("coverage plugin: loadWave failed for wave " << settled_wave);
-        return -1;
+    if (!store_->loadWave(run_id_, wave, &file_points)) {
+        LOG_ERROR("coverage plugin: loadWave failed for wave " << wave);
+        return false;
     }
 
     // Batch greedy: repeatedly pick the file adding the most NEW points.
@@ -568,50 +708,30 @@ int SchedulerPlugin::SettleWave() {
         cumulative_.insert(file_points[best].begin(), file_points[best].end());
     }
     if (!store_->appendSelected(run_id_, selected)) {
-        LOG_ERROR("coverage plugin: appendSelected failed for wave " << settled_wave);
-        return -1;
+        LOG_ERROR("coverage plugin: appendSelected failed for wave " << wave);
+        return false;
     }
     std::vector<std::uint64_t> cumulative_vec(cumulative_.begin(), cumulative_.end());
-    if (!store_->saveCumulative(run_id_, settled_wave, cumulative_vec)) {
-        LOG_ERROR("coverage plugin: saveCumulative failed for wave " << settled_wave);
-        return -1;
+    if (!store_->saveCumulative(run_id_, wave, cumulative_vec)) {
+        LOG_ERROR("coverage plugin: saveCumulative failed for wave " << wave);
+        return false;
     }
-    const size_t new_selected_count = selected_count_ + selected.size();
+    const size_t new_selected_count = selected_count_.load() + selected.size();
     if (!store_->saveRunSummary(run_id_, static_cast<int>(total_files_),
                                 static_cast<int>(new_selected_count),
                                 static_cast<std::int64_t>(cumulative_.size()))) {
-        LOG_ERROR("coverage plugin: saveRunSummary failed for wave " << settled_wave);
-        return -1;
+        LOG_ERROR("coverage plugin: saveRunSummary failed for wave " << wave);
+        return false;
     }
-    if (store_cov_ && !MergeWaveCoverage(settled_wave)) {
-        LOG_ERROR("coverage plugin: wave " << settled_wave
-                                           << " cov merge failed, run suspended");
-        return -1;
+    if (store_cov_ && !MergeWaveCoverage(wave)) {
+        LOG_ERROR("coverage plugin: wave " << wave << " cov merge failed");
+        return false;
     }
-    selected_count_ = new_selected_count;
-    LOG_INFO("coverage plugin: wave " << settled_wave << " settled, selected "
+    selected_count_.store(new_selected_count);
+    LOG_INFO("coverage plugin: wave " << wave << " settled, selected "
                                       << selected.size() << "/" << file_points.size()
                                       << " files, cumulative points=" << cumulative_.size());
-
-    ++current_wave_;
-    if (current_wave_ < waves_.size()) {
-        pending_ = waves_[current_wave_];
-        wave_task_ids_.clear();
-        pending_ids_.clear();
-        for (const common::Task& task : pending_) {
-            wave_task_ids_.insert(task.task_id());
-            pending_ids_.insert(task.task_id());
-            tasks_by_id_[task.task_id()] = task;
-        }
-        LOG_INFO("coverage plugin: wave " << current_wave_ << " started, " << pending_.size()
-                                          << " tasks");
-    } else {
-        LOG_INFO("coverage plugin: run finished, selected " << selected_count_ << "/"
-                                                            << total_files_
-                                                            << " files, cumulative points="
-                                                            << cumulative_.size());
-    }
-    return settled_wave;
+    return true;
 }
 
 bool SchedulerPlugin::MergeWaveCoverage(int wave) {
