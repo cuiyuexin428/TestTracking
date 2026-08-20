@@ -169,7 +169,7 @@ bool SchedulerPlugin::BuildWaves(const std::string& run_id) {
 }
 
 bool SchedulerPlugin::plan(const common::RunRequest& request,
-                           const std::vector<common::ClientInfo>& clients) {
+                            const std::vector<common::ClientInfo>& clients) {
     (void)clients;
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -181,7 +181,9 @@ bool SchedulerPlugin::plan(const common::RunRequest& request,
     pending_ids_.clear();
     priority_pending_.clear();
     priority_ids_.clear();
-    wave_task_ids_.clear();
+    wave_outstanding_.clear();
+    task_wave_.clear();
+    settled_waves_.clear();
     task_client_.clear();
     tasks_by_id_.clear();
     cumulative_.clear();
@@ -191,15 +193,19 @@ bool SchedulerPlugin::plan(const common::RunRequest& request,
         settle_failed_wave_.store(-1);
         settle_active_.store(false);
     }
-    current_wave_ = 0;
     task_seq_ = 0;
     selected_count_.store(0);
 
-    pending_ = waves_[0];
-    for (const common::Task& task : pending_) {
-        wave_task_ids_.insert(task.task_id());
-        pending_ids_.insert(task.task_id());
-        tasks_by_id_[task.task_id()] = task;
+    // All waves are dispatchable from the start; waves only define
+    // settlement batches. The pool keeps tasks in wave order.
+    for (size_t wave = 0; wave < waves_.size(); ++wave) {
+        for (const common::Task& task : waves_[wave]) {
+            pending_.push_back(task);
+            pending_ids_.insert(task.task_id());
+            wave_outstanding_[static_cast<int>(wave)].insert(task.task_id());
+            task_wave_[task.task_id()] = static_cast<int>(wave);
+            tasks_by_id_[task.task_id()] = task;
+        }
     }
     SaveCheckpointLocked();
     if (!last_checkpoint_save_ok_) {
@@ -208,7 +214,7 @@ bool SchedulerPlugin::plan(const common::RunRequest& request,
     }
     LOG_INFO("coverage plugin: planned " << total_files_ << " files, " << waves_.size()
                                          << " waves, " << pending_.size()
-                                         << " tasks in first wave");
+                                         << " tasks ready to dispatch");
     return true;
 }
 
@@ -242,9 +248,15 @@ void SchedulerPlugin::requeue(const std::vector<std::string>& task_ids) {
             LOG_WARN("coverage plugin: cannot requeue unknown task " << task_id);
             continue;
         }
+        const auto wave_it = task_wave_.find(task_id);
+        if (wave_it == task_wave_.end() || settled_waves_.count(wave_it->second) > 0) {
+            LOG_WARN("coverage plugin: cannot requeue task of settled wave " << task_id);
+            continue;
+        }
         if (priority_ids_.count(task_id) == 0 && pending_ids_.count(task_id) == 0) {
             priority_pending_.push_back(spec_it->second);
             priority_ids_.insert(task_id);
+            wave_outstanding_[wave_it->second].insert(task_id);
             LOG_WARN("coverage plugin: requeued to priority " << task_id);
         } else {
             LOG_WARN("coverage plugin: task already queued, skip requeue " << task_id);
@@ -257,32 +269,28 @@ void SchedulerPlugin::SaveCheckpointLocked() {
         last_checkpoint_save_ok_ = false;
         return;
     }
-    if (current_wave_ < waves_.size() && wave_task_ids_.empty()) {
-        last_checkpoint_save_ok_ = false;
-        // A live wave must always have outstanding tasks; an empty pool here
-        // means settlement failed or is in progress. Persisting this state
-        // would make the run unresumable, so keep the previous checkpoint.
-        LOG_ERROR("coverage plugin: refusing to save checkpoint with empty task pool "
-                  "for active wave " << current_wave_);
-        return;
-    }
     coverage::CoverageCheckpoint ckpt;
-    ckpt.set_current_wave(static_cast<std::int32_t>(current_wave_));
+    ckpt.set_checkpoint_version(2);
+    // Legacy field: first unsettled wave index (settled waves are always a
+    // prefix when the chain has not failed).
+    ckpt.set_current_wave(static_cast<std::int32_t>(settled_waves_.size()));
     ckpt.set_total_files(static_cast<std::int32_t>(total_files_));
     ckpt.set_selected_files(static_cast<std::int32_t>(selected_count_.load()));
     ckpt.set_manifest_fingerprint(manifest_fingerprint_);
     ckpt.set_task_seq(static_cast<std::int32_t>(task_seq_));
-    for (const std::string& task_id : wave_task_ids_) {
-        if (priority_ids_.count(task_id) > 0) {
-            continue;
+    for (const auto& wave_item : wave_outstanding_) {
+        for (const std::string& task_id : wave_item.second) {
+            if (priority_ids_.count(task_id) > 0) {
+                continue;
+            }
+            const auto it = tasks_by_id_.find(task_id);
+            if (it == tasks_by_id_.end()) {
+                continue;
+            }
+            std::string bytes;
+            it->second.SerializeToString(&bytes);
+            ckpt.add_remaining_tasks(bytes);
         }
-        const auto it = tasks_by_id_.find(task_id);
-        if (it == tasks_by_id_.end()) {
-            continue;
-        }
-        std::string bytes;
-        it->second.SerializeToString(&bytes);
-        ckpt.add_remaining_tasks(bytes);
     }
     for (const std::string& task_id : priority_ids_) {
         const auto it = tasks_by_id_.find(task_id);
@@ -292,6 +300,9 @@ void SchedulerPlugin::SaveCheckpointLocked() {
         std::string bytes;
         it->second.SerializeToString(&bytes);
         ckpt.add_priority_tasks(bytes);
+    }
+    for (int wave : settled_waves_) {
+        ckpt.add_settled_waves(wave);
     }
     {
         // Snapshot settlement state under settle_mutex_; the merge itself
@@ -311,10 +322,9 @@ void SchedulerPlugin::SaveCheckpointLocked() {
     last_checkpoint_save_ok_ = true;
     if (!store_->saveCheckpoint(run_id_, blob)) {
         LOG_ERROR("coverage plugin: failed to save checkpoint for run " << run_id_
-                                                                       << " (checkpoint gap)");
+                                                                        << " (checkpoint gap)");
         last_checkpoint_save_ok_ = false;
         return;
-
     }
 }
 
@@ -383,63 +393,91 @@ bool SchedulerPlugin::restore(const std::string& run_id) {
         pending_ids_.clear();
         priority_pending_.clear();
         priority_ids_.clear();
-        wave_task_ids_.clear();
+        wave_outstanding_.clear();
+        task_wave_.clear();
+        settled_waves_.clear();
         task_client_.clear();
         tasks_by_id_.clear();
         cumulative_.clear();
-        current_wave_ = static_cast<size_t>(ckpt.current_wave());
         total_files_ = static_cast<size_t>(ckpt.total_files());
         selected_count_.store(static_cast<size_t>(ckpt.selected_files()));
         task_seq_ = static_cast<size_t>(ckpt.task_seq());
 
-        if (!keep_staging_) {
-            // Waves before the checkpoint wave are settled; remove any staging
-            // left by an interrupted settle/cleanup sequence.
-            for (size_t wave = 0; wave < current_wave_; ++wave) {
-                store_->clearWave(run_id, static_cast<int>(wave));
+        const auto wave_of = [](const common::Task& task) {
+            coverage::CoverageTask meta;
+            return meta.ParseFromString(task.payload()) ? meta.wave_id() : 0;
+        };
+
+        size_t legacy_wave = 0;
+        const bool multi_wave = ckpt.checkpoint_version() >= 2;
+        if (multi_wave) {
+            for (int wave : ckpt.settled_waves()) {
+                settled_waves_.insert(wave);
+            }
+        } else {
+            // Legacy single-wave checkpoint: waves before current_wave are
+            // settled; later waves were never dispatched and go back to the pool.
+            legacy_wave = static_cast<size_t>(ckpt.current_wave());
+            for (size_t wave = 0; wave < legacy_wave; ++wave) {
+                settled_waves_.insert(static_cast<int>(wave));
             }
         }
 
-        if (current_wave_ < waves_.size()) {
-            for (const std::string& bytes : ckpt.remaining_tasks()) {
-                common::Task task;
-                if (!task.ParseFromString(bytes)) {
-                    LOG_ERROR("coverage plugin: unparseable remaining task in checkpoint");
-                    return false;
-                }
-                pending_.push_back(task);
-                pending_ids_.insert(task.task_id());
-                wave_task_ids_.insert(task.task_id());
-                tasks_by_id_[task.task_id()] = task;
+        const auto add_task = [&](const std::string& bytes, bool priority) {
+            common::Task task;
+            if (!task.ParseFromString(bytes)) {
+                LOG_ERROR("coverage plugin: unparseable task in checkpoint");
+                return false;
             }
-            for (const std::string& bytes : ckpt.priority_tasks()) {
-                common::Task task;
-                if (!task.ParseFromString(bytes)) {
-                    LOG_ERROR("coverage plugin: unparseable priority task in checkpoint");
-                    return false;
-                }
+            const int wave = wave_of(task);
+            wave_outstanding_[wave].insert(task.task_id());
+            task_wave_[task.task_id()] = wave;
+            tasks_by_id_[task.task_id()] = task;
+            if (priority) {
                 priority_pending_.push_back(task);
                 priority_ids_.insert(task.task_id());
-                wave_task_ids_.insert(task.task_id());
-                tasks_by_id_[task.task_id()] = task;
+            } else {
+                pending_.push_back(task);
+                pending_ids_.insert(task.task_id());
             }
-            for (size_t wave = current_wave_ + 1; wave < waves_.size(); ++wave) {
+            return true;
+        };
+        for (const std::string& bytes : ckpt.remaining_tasks()) {
+            if (!add_task(bytes, false)) {
+                return false;
+            }
+        }
+        for (const std::string& bytes : ckpt.priority_tasks()) {
+            if (!add_task(bytes, true)) {
+                return false;
+            }
+        }
+
+        if (!multi_wave) {
+            // Waves after the legacy current wave were not dispatched yet.
+            for (size_t wave = legacy_wave + 1; wave < waves_.size(); ++wave) {
                 for (const common::Task& task : waves_[wave]) {
+                    pending_.push_back(task);
+                    pending_ids_.insert(task.task_id());
+                    wave_outstanding_[static_cast<int>(wave)].insert(task.task_id());
+                    task_wave_[task.task_id()] = static_cast<int>(wave);
                     tasks_by_id_[task.task_id()] = task;
                 }
             }
-            if (wave_task_ids_.empty()) {
-                LOG_ERROR("coverage plugin: checkpoint for run " << run_id
-                          << " has no remaining tasks in an active wave, restore rejected");
-                return false;
-            }
-        } else {
-            LOG_INFO("coverage plugin: run " << run_id << " checkpoint marks run finished");
         }
 
-        if (current_wave_ > 0) {
+        if (!keep_staging_) {
+            // Remove staging only for waves already settled.
+            for (int wave : settled_waves_) {
+                store_->clearWave(run_id, wave);
+            }
+        }
+
+        if (!settled_waves_.empty()) {
+            const int last_settled = *std::max_element(settled_waves_.begin(),
+                                                       settled_waves_.end());
             std::vector<std::uint64_t> points;
-            if (!store_->loadCumulative(run_id, static_cast<int>(current_wave_) - 1, &points)) {
+            if (!store_->loadCumulative(run_id, last_settled, &points)) {
                 LOG_ERROR("coverage plugin: cannot load cumulative points for run " << run_id);
                 return false;
             }
@@ -465,8 +503,8 @@ bool SchedulerPlugin::restore(const std::string& run_id) {
             }
             pending_settle_count = settle_queue_.size();
         }
-        LOG_INFO("coverage plugin: run restored " << run_id << " wave=" << current_wave_
-                                                  << " remaining=" << wave_task_ids_.size()
+        LOG_INFO("coverage plugin: run restored " << run_id << " settled=" << settled_waves_.size()
+                                                  << " outstanding=" << wave_outstanding_.size()
                                                   << " pending_settle=" << pending_settle_count);
     }
 
@@ -507,31 +545,41 @@ bool SchedulerPlugin::HandleResultLocked(const common::TaskResult& result) {
         }
     }
 
-    int retry_count = 0;
-    int retry_wave = -1;
-    std::string retry_run_id;
-    const auto spec_it = tasks_by_id_.find(result.task_id());
-    if (spec_it == tasks_by_id_.end()) {
+    const auto tw_it = task_wave_.find(result.task_id());
+    if (tw_it == task_wave_.end()) {
         LOG_WARN("coverage plugin: result for unknown task " << result.task_id()
                                                              << " after run state change, dropped");
         return false;
     }
-    coverage::CoverageTask task_meta;
-    if (task_meta.ParseFromString(spec_it->second.payload())) {
-        retry_count = task_meta.retry_count();
-        retry_run_id = task_meta.run_id();
-        retry_wave = task_meta.wave_id();
-        if (result_parse_failed) {
-            for (const std::string& file : task_meta.files()) {
-                failed_files.push_back(file);
+    const int wave = tw_it->second;
+    if (settled_waves_.count(wave) > 0) {
+        LOG_WARN("coverage plugin: late result for settled wave " << wave << ", task "
+                  << result.task_id() << " dropped");
+        return false;
+    }
+
+    int retry_count = 0;
+    int retry_wave = -1;
+    std::string retry_run_id;
+    const auto spec_it = tasks_by_id_.find(result.task_id());
+    if (spec_it != tasks_by_id_.end()) {
+        coverage::CoverageTask task_meta;
+        if (task_meta.ParseFromString(spec_it->second.payload())) {
+            retry_count = task_meta.retry_count();
+            retry_run_id = task_meta.run_id();
+            retry_wave = task_meta.wave_id();
+            if (result_parse_failed) {
+                for (const std::string& file : task_meta.files()) {
+                    failed_files.push_back(file);
+                }
             }
         }
     }
-    wave_task_ids_.erase(result.task_id());
+    wave_outstanding_[wave].erase(result.task_id());
     task_client_.erase(result.task_id());
 
     if (failed_file_retries_ > 0 && retry_count < failed_file_retries_ &&
-        retry_wave == static_cast<int>(current_wave_) && !failed_files.empty()) {
+        retry_wave == wave && !failed_files.empty()) {
         coverage::CoverageTask retry_task;
         retry_task.set_run_id(retry_run_id);
         retry_task.set_wave_id(retry_wave);
@@ -545,7 +593,8 @@ bool SchedulerPlugin::HandleResultLocked(const common::TaskResult& result) {
         retry_task.SerializeToString(spec.mutable_payload());
         pending_.push_back(spec);
         pending_ids_.insert(spec.task_id());
-        wave_task_ids_.insert(spec.task_id());
+        wave_outstanding_[retry_wave].insert(spec.task_id());
+        task_wave_[spec.task_id()] = retry_wave;
         tasks_by_id_[spec.task_id()] = spec;
         LOG_WARN("coverage plugin: retrying " << failed_files.size() << " failed files as "
                                               << spec.task_id());
@@ -554,39 +603,19 @@ bool SchedulerPlugin::HandleResultLocked(const common::TaskResult& result) {
     LOG_INFO("coverage plugin: result " << result.task_id() << " covered_lines="
                                         << covered_lines);
 
-    if (!wave_task_ids_.empty()) {
+    if (!wave_outstanding_[wave].empty()) {
         SaveCheckpointLocked();
         return false;
     }
 
-    // The wave task pool is empty: advance dispatch state immediately so
-    // clients keep receiving tasks while this wave is settled in the
-    // background by the settlement loop.
-    const int settled_wave = static_cast<int>(current_wave_);
-    ++current_wave_;
-    if (current_wave_ < waves_.size()) {
-        pending_ = waves_[current_wave_];
-        wave_task_ids_.clear();
-        pending_ids_.clear();
-        for (const common::Task& task : pending_) {
-            wave_task_ids_.insert(task.task_id());
-            pending_ids_.insert(task.task_id());
-            tasks_by_id_[task.task_id()] = task;
-        }
-        LOG_INFO("coverage plugin: wave " << current_wave_ << " started, "
-                                          << pending_.size() << " tasks");
-    } else {
-        LOG_INFO("coverage plugin: all waves dispatched, wave " << settled_wave
-                                                                << " settlement pending");
-    }
-
+    // Wave ready to settle; dispatch of other waves is unaffected.
     bool should_run = false;
     {
         std::lock_guard<std::mutex> settle_lock(settle_mutex_);
-        if (settle_failed_wave_.load() < 0) {
-            if (std::find(settle_queue_.begin(), settle_queue_.end(), settled_wave) ==
+        if (settle_failed_wave_.load() < 0 && settled_waves_.count(wave) == 0) {
+            if (std::find(settle_queue_.begin(), settle_queue_.end(), wave) ==
                 settle_queue_.end()) {
-                settle_queue_.push_back(settled_wave);
+                settle_queue_.push_back(wave);
             }
             if (!settle_active_.load()) {
                 settle_active_.store(true);
@@ -633,13 +662,14 @@ void SchedulerPlugin::SettleWaveLoop() {
             }
         }
         std::lock_guard<std::mutex> lock(mutex_);
+        settled_waves_.insert(wave);
         SaveCheckpointLocked();
     }
 }
 
 bool SchedulerPlugin::runFinished() {
     std::lock_guard<std::mutex> lock(mutex_);
-    return waves_.empty() || current_wave_ >= waves_.size();
+    return waves_.empty() || settled_waves_.size() >= waves_.size();
 }
 
 void SchedulerPlugin::cancel() {
@@ -649,11 +679,12 @@ void SchedulerPlugin::cancel() {
     pending_ids_.clear();
     priority_pending_.clear();
     priority_ids_.clear();
-    wave_task_ids_.clear();
+    wave_outstanding_.clear();
+    task_wave_.clear();
+    settled_waves_.clear();
     task_client_.clear();
     tasks_by_id_.clear();
     cumulative_.clear();
-    current_wave_ = 0;
     task_seq_ = 0;
     total_files_ = 0;
     selected_count_.store(0);

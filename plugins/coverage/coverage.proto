@@ -42,6 +42,10 @@ message CoverageCheckpoint {
   // Wave whose settlement failed; absent means none. When set, the settlement
   // chain is paused (dispatch continues) and no automatic retry is attempted.
   optional int32 settle_failed_wave = 9;
+  // Waves already settled (ordered prefix); used by multi-wave restore.
+  repeated int32 settled_waves = 10;
+  // Checkpoint format version: 0 = legacy single-wave, 2 = multi-wave dispatch.
+  int32 checkpoint_version = 11;
 }
 
 // Registration validation: component versions of the client package. It is

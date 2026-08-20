@@ -77,7 +77,15 @@ private:
     bool last_checkpoint_save_ok_ = false;
 
     std::vector<std::vector<common::Task>> waves_;
-    size_t current_wave_ = 0;
+    // Outstanding (not yet reported) task ids per wave. Every wave starts with
+    // all of its tasks here; results erase ids, and an empty set means the
+    // wave is ready to settle. Multiple waves can be in flight at once.
+    std::unordered_map<int, std::unordered_set<std::string>> wave_outstanding_;
+    // Wave index of every known task id (used by requeue/result routing).
+    std::unordered_map<std::string, int> task_wave_;
+    // Waves whose settlement completed successfully (always a prefix unless
+    // the settlement chain paused at settle_failed_wave_).
+    std::unordered_set<int> settled_waves_;
     size_t task_seq_ = 0;
     std::vector<common::Task> pending_;
     std::unordered_set<std::string> pending_ids_;
@@ -85,7 +93,6 @@ private:
     // current wave can settle sooner.
     std::vector<common::Task> priority_pending_;
     std::unordered_set<std::string> priority_ids_;
-    std::unordered_set<std::string> wave_task_ids_;
     std::unordered_map<std::string, std::string> task_client_;
     std::unordered_map<std::string, common::Task> tasks_by_id_;
     std::set<std::uint64_t> cumulative_;
