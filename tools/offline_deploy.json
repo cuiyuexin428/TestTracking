@@ -12,9 +12,15 @@
   "dataset_dir": "C:/WorkSpace/occt_demo/step",
   "dataset_version": "d1",
   "step_test_exe": "C:/WorkSpace/occt_demo/build/Debug/StepTest.exe",
-  "occt_src_dir": "C:/WorkSpace/occt_demo/occtlib/src",
+  "engine_src_dir": "C:/WorkSpace/occt_demo/occtlib/src",
   "program_version": "1.0",
   "opencppcoverage_dir": "C:/Program Files/OpenCppCoverage",
+  "engine_dlls": [
+    "TKernel.dll",
+    "TKBRep.dll",
+    "TKDESTEP.dll",
+    "TKTopAlgo.dll"
+  ],
   "package_out_dir": "dist/client_package",
   "worker_id": "worker-1",
   "task_threads": 2,

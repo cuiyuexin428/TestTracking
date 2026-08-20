@@ -37,7 +37,7 @@ param(
     [string]$DatasetDir = '',
     [string]$DatasetVersion = '',
     [string]$StepTestExe = '',
-    [string]$OcctSrcDir = '',
+    [string]$EngineSrcDir = '',
     [string]$OpenCppCoverageDir = '',
     [string]$ProgramVersion = '',
     [string]$OutDir = '',
@@ -107,8 +107,11 @@ $registerService = [bool](Get-DeployValue 'register_db_service' $true)
 if ($NoService) { $registerService = $false }
 $datasetDir = if ($DatasetDir) { $DatasetDir } else { [string](Get-DeployValue 'dataset_dir' '') }
 $datasetVersion = if ($DatasetVersion) { $DatasetVersion } else { [string](Get-DeployValue 'dataset_version' 'd1') }
+$engineDlls = @()
+$rawDlls = Get-DeployValue 'engine_dlls' @()
+if ($rawDlls) { $engineDlls = @($rawDlls) }
 $stepTestExe = if ($StepTestExe) { $StepTestExe } else { [string](Get-DeployValue 'step_test_exe' '') }
-$occtSrcDir = if ($OcctSrcDir) { $OcctSrcDir } else { [string](Get-DeployValue 'occt_src_dir' '') }
+$engineSrcDir = if ($EngineSrcDir) { $EngineSrcDir } else { [string](Get-DeployValue 'engine_src_dir' '') }
 $opencppcoverageDir = if ($OpenCppCoverageDir) { $OpenCppCoverageDir } else { [string](Get-DeployValue 'opencppcoverage_dir' '') }
 $programVersion = if ($ProgramVersion) { $ProgramVersion } else { [string](Get-DeployValue 'program_version' '1.0') }
 $outDirRaw = if ($OutDir) { $OutDir } else { [string](Get-DeployValue 'package_out_dir' 'dist\client_package') }
@@ -247,7 +250,7 @@ if (-not $SkipPackage) {
         -TaskThreads $taskThreads `
         -StoreCov:$storeCov `
         -ProgramVersion $programVersion -DatasetVersion $datasetVersion `
-        -StepTestExe $stepTestExe -OcctSrcDir $occtSrcDir `
+        -StepTestExe $stepTestExe -EngineSrcDir $engineSrcDir -EngineDlls $engineDlls `
         -DatasetDir $datasetDir -OpenCppCoverageDir $opencppcoverageDir
 } else {
     Write-Host 'Skipped (as requested).'

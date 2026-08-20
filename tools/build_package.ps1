@@ -5,7 +5,7 @@
 #     config\client.json
 #     start_client.bat
 #     testenv\
-#       program\            StepTest.exe + PDB + all OCCT DLLs + version.txt
+#       program\            StepTest.exe + PDB + all engine DLLs + version.txt
 #       dataset\            stp files + version.txt
 #       opencppcoverage\    OpenCppCoverage.exe + dependencies
 #
@@ -34,10 +34,10 @@ param(
     [switch]$OnlyDataset,
     [string]$ProgramVersion = '1.0',
     [string]$DatasetVersion = 'd1',
-    [string[]]$OcctDlls = @('TKernel.dll', 'TKBRep.dll', 'TKDESTEP.dll', 'TKTopAlgo.dll'),
+    [string[]]$EngineDlls = @('TKernel.dll', 'TKBRep.dll', 'TKDESTEP.dll', 'TKTopAlgo.dll'),
     [string]$StepTestExe = 'C:\WorkSpace\occt_demo\build\Debug\StepTest.exe',
 
-    [string]$OcctSrcDir = 'C:\WorkSpace\occt_demo\occtlib\src',
+    [string]$EngineSrcDir = '',
     [string]$DatasetDir = 'C:\WorkSpace\occt_demo\step',
     [string]$OpenCppCoverageDir = 'C:\Program Files\OpenCppCoverage'
 )
@@ -90,12 +90,12 @@ if (-not $BinDir -or -not (Test-Path (Join-Path $BinDir 'client.exe'))) {
 $testenv = Join-Path $OutDir 'testenv'
 
 if (-not $OnlyClient -and -not $OnlyDataset) {
-    # testenv\program: StepTest + PDB + all OCCT DLLs + instrumented PDBs.
+    # testenv\program: target exe + PDB + all engine DLLs + instrumented PDBs.
     if (-not (Test-Path $StepTestExe)) {
         throw "StepTest.exe not found: $StepTestExe"
     }
-    if (-not (Test-Path $OcctSrcDir)) {
-        throw "OCCT resources not found: $OcctSrcDir"
+    if ($EngineSrcDir -and -not (Test-Path $EngineSrcDir)) {
+        throw "engine source dir not found: $EngineSrcDir"
     }
     if (-not (Test-Path (Join-Path $OpenCppCoverageDir 'OpenCppCoverage.exe'))) {
         throw "OpenCppCoverage.exe not found under $OpenCppCoverageDir"
@@ -111,14 +111,16 @@ if (-not $OnlyClient -and -not $OnlyDataset) {
         Copy-Item -LiteralPath $stepPdb -Destination $progDir
     }
     $stepDir = Split-Path $StepTestExe -Parent
-    foreach ($dll in $OcctDlls) {
+    foreach ($dll in $EngineDlls) {
         $pdbPath = [System.IO.Path]::ChangeExtension((Join-Path $stepDir $dll), '.pdb')
         if (Test-Path $pdbPath) {
             Copy-Item -LiteralPath $pdbPath -Destination $progDir
         }
     }
     Get-ChildItem $stepDir -Filter '*.dll' | Copy-Item -Destination $progDir
-    Copy-Item -Path $OcctSrcDir -Destination (Join-Path $progDir 'occtlib') -Recurse
+    if ($EngineSrcDir) {
+        Copy-Item -Path $EngineSrcDir -Destination (Join-Path $progDir 'engine_src') -Recurse
+    }
     [System.IO.File]::WriteAllText(
         (Join-Path $progDir 'version.txt'),
         $ProgramVersion,
@@ -193,7 +195,7 @@ if (-not $OnlyProgram -and -not $OnlyDataset) {
         export_dir = 'reports'
         opencppcoverage = 'testenv/opencppcoverage/OpenCppCoverage.exe'
         target_exe = 'testenv/program/StepTest.exe'
-        occt_dlls = $OcctDlls | ForEach-Object { "testenv/program/$_" }
+        engine_dlls = $EngineDlls | ForEach-Object { "testenv/program/$_" }
     }
     if ($DbConn) {
         $coverageCfg['db_conn'] = $DbConn

@@ -30,7 +30,7 @@
       "export_dir": "reports",
       "opencppcoverage": "testenv/opencppcoverage/OpenCppCoverage.exe",
       "target_exe": "testenv/program/StepTest.exe",
-      "occt_dlls": [
+      "engine_dlls": [
         "testenv/program/TKernel.dll",
         "testenv/program/TKBRep.dll",
         "testenv/program/TKDESTEP.dll",

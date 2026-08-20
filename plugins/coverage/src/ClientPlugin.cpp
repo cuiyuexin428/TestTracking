@@ -136,8 +136,8 @@ bool ClientPlugin::init(const std::string& config) {
     keep_reports_ = cfg.value("keep_reports", false);
     store_cov_ = cfg.value("store_cov", false);
     dry_run_delay_ms_ = cfg.value("dry_run_delay_ms", 0);
-    for (const nlohmann::json& dll : cfg.value("occt_dlls", nlohmann::json::array())) {
-        occt_dlls_.push_back(dll.get<std::string>());
+    for (const nlohmann::json& dll : cfg.value("engine_dlls", nlohmann::json::array())) {
+        engine_dlls_.push_back(dll.get<std::string>());
     }
 
     program_version_ = ReadVersionFile(program_dir_ + "/version.txt");
@@ -200,7 +200,7 @@ bool ClientPlugin::RunOneFile(const std::string& run_id, int wave, const std::st
         NormalizePath(export_dir_ + "/" + std::to_string(Fnv1a64(file)) + ".cov");
 
     std::string command = "\"" + opencppcoverage_ + "\" --quiet";
-    for (const std::string& module : occt_dlls_) {
+    for (const std::string& module : engine_dlls_) {
         command += " --modules=" + NormalizePath(module);
     }
     command += " --export_type=cobertura:" + xml_path;
