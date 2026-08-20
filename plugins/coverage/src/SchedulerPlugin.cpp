@@ -27,16 +27,11 @@ bool SchedulerPlugin::init(const std::string& config) {
     expected_dataset_version_ = cfg.value("expected_dataset_version", std::string());
     batch_size_ = cfg.value("batch_size", 1000);
     task_size_ = cfg.value("task_size", 25);
-    failed_file_retries_ = cfg.value("failed_file_retries", 0);
     store_cov_ = cfg.value("store_cov", false);
     opencppcoverage_ = cfg.value("opencppcoverage", std::string("OpenCppCoverage.exe"));
     keep_staging_ = cfg.value("keep_staging", false);
     if (manifest_path_.empty()) {
         LOG_ERROR("coverage plugin: stp_manifest is required");
-        return false;
-    }
-    if (failed_file_retries_ < 0) {
-        LOG_ERROR("coverage plugin: failed_file_retries must be >= 0");
         return false;
     }
     if (batch_size_ <= 0 || task_size_ <= 0) {
@@ -193,7 +188,6 @@ bool SchedulerPlugin::plan(const common::RunRequest& request,
         settle_failed_wave_.store(-1);
         settle_active_.store(false);
     }
-    task_seq_ = 0;
     selected_count_.store(0);
 
     // All waves are dispatchable from the start; waves only define
@@ -277,7 +271,7 @@ void SchedulerPlugin::SaveCheckpointLocked() {
     ckpt.set_total_files(static_cast<std::int32_t>(total_files_));
     ckpt.set_selected_files(static_cast<std::int32_t>(selected_count_.load()));
     ckpt.set_manifest_fingerprint(manifest_fingerprint_);
-    ckpt.set_task_seq(static_cast<std::int32_t>(task_seq_));
+    ckpt.set_task_seq(0);
     for (const auto& wave_item : wave_outstanding_) {
         for (const std::string& task_id : wave_item.second) {
             if (priority_ids_.count(task_id) > 0) {
@@ -401,7 +395,6 @@ bool SchedulerPlugin::restore(const std::string& run_id) {
         cumulative_.clear();
         total_files_ = static_cast<size_t>(ckpt.total_files());
         selected_count_.store(static_cast<size_t>(ckpt.selected_files()));
-        task_seq_ = static_cast<size_t>(ckpt.task_seq());
 
         const auto wave_of = [](const common::Task& task) {
             coverage::CoverageTask meta;
@@ -530,17 +523,13 @@ bool SchedulerPlugin::HandleResultLocked(const common::TaskResult& result) {
 
     coverage::CoverageResult coverage_result;
     int covered_lines = 0;
-    bool result_parse_failed = false;
-    std::vector<std::string> failed_files;
     if (!coverage_result.ParseFromString(result.result())) {
         LOG_ERROR("coverage plugin: unparseable result for " << result.task_id());
-        result_parse_failed = true;
     } else {
         for (const coverage::FileCoverage& file : coverage_result.files()) {
             covered_lines += file.covered_lines();
             if (!file.ok()) {
                 LOG_WARN("coverage plugin: file failed: " << file.file());
-                failed_files.push_back(file.file());
             }
         }
     }
@@ -557,48 +546,8 @@ bool SchedulerPlugin::HandleResultLocked(const common::TaskResult& result) {
                   << result.task_id() << " dropped");
         return false;
     }
-
-    int retry_count = 0;
-    int retry_wave = -1;
-    std::string retry_run_id;
-    const auto spec_it = tasks_by_id_.find(result.task_id());
-    if (spec_it != tasks_by_id_.end()) {
-        coverage::CoverageTask task_meta;
-        if (task_meta.ParseFromString(spec_it->second.payload())) {
-            retry_count = task_meta.retry_count();
-            retry_run_id = task_meta.run_id();
-            retry_wave = task_meta.wave_id();
-            if (result_parse_failed) {
-                for (const std::string& file : task_meta.files()) {
-                    failed_files.push_back(file);
-                }
-            }
-        }
-    }
     wave_outstanding_[wave].erase(result.task_id());
     task_client_.erase(result.task_id());
-
-    if (failed_file_retries_ > 0 && retry_count < failed_file_retries_ &&
-        retry_wave == wave && !failed_files.empty()) {
-        coverage::CoverageTask retry_task;
-        retry_task.set_run_id(retry_run_id);
-        retry_task.set_wave_id(retry_wave);
-        retry_task.set_retry_count(retry_count + 1);
-        for (const std::string& file : failed_files) {
-            retry_task.add_files(file);
-        }
-        common::Task spec;
-        spec.set_task_id(run_id_ + "-w" + std::to_string(retry_wave) + "-r" +
-                         std::to_string(++task_seq_));
-        retry_task.SerializeToString(spec.mutable_payload());
-        pending_.push_back(spec);
-        pending_ids_.insert(spec.task_id());
-        wave_outstanding_[retry_wave].insert(spec.task_id());
-        task_wave_[spec.task_id()] = retry_wave;
-        tasks_by_id_[spec.task_id()] = spec;
-        LOG_WARN("coverage plugin: retrying " << failed_files.size() << " failed files as "
-                                              << spec.task_id());
-    }
 
     LOG_INFO("coverage plugin: result " << result.task_id() << " covered_lines="
                                         << covered_lines);
@@ -685,7 +634,6 @@ void SchedulerPlugin::cancel() {
     task_client_.clear();
     tasks_by_id_.clear();
     cumulative_.clear();
-    task_seq_ = 0;
     total_files_ = 0;
     selected_count_.store(0);
     manifest_fingerprint_.clear();

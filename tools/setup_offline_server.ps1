@@ -119,7 +119,6 @@ $workerId = if ($WorkerId) { $WorkerId } else { [string](Get-DeployValue 'worker
 $taskThreads = [int](Get-DeployValue 'task_threads' 2)
 $batchSize = [int](Get-DeployValue 'batch_size' 1000)
 $taskSize = [int](Get-DeployValue 'task_size' 25)
-$failedRetries = [int](Get-DeployValue 'failed_file_retries' 0)
 $storeCov = [bool](Get-DeployValue 'store_cov' $true)
 
 if (-not $serverIp) {
@@ -224,7 +223,6 @@ $sched.plugins.coverage.expected_dataset_version = [string]$datasetVersion
 $sched.plugins.coverage.opencppcoverage = (Join-Path $opencppcoverageDir 'OpenCppCoverage.exe').Replace('\', '/')
 $sched.plugins.coverage.batch_size = $batchSize
 $sched.plugins.coverage.task_size = $taskSize
-$sched.plugins.coverage.failed_file_retries = $failedRetries
 $sched.plugins.coverage.store_cov = $storeCov
 $outCfgDir = Join-Path $binDir 'config'
 New-Item -ItemType Directory -Force -Path $outCfgDir | Out-Null

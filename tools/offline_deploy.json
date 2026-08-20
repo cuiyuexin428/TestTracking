@@ -26,6 +26,5 @@
   "task_threads": 2,
   "batch_size": 1000,
   "task_size": 25,
-  "failed_file_retries": 0,
   "store_cov": true
 }

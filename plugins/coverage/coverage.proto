@@ -7,7 +7,7 @@ message CoverageTask {
   string run_id = 1;
   int32 wave_id = 2;
   repeated string files = 3;
-  // How many retries this task has already consumed (0 = first attempt).
+  // Reserved for client-side retries; the server no longer performs file-level retries.
   int32 retry_count = 4;
 }
 
@@ -35,7 +35,7 @@ message CoverageCheckpoint {
   // Fingerprint of the stp manifest the run was planned from, so restore
   // refuses to resume when the input dataset changed underneath it.
   string manifest_fingerprint = 6;
-  // Monotonic task id counter for retry tasks (kept unique across restarts).
+  // Legacy checkpoint field kept for compatibility; no longer used.
   int32 task_seq = 7;
   // Waves whose settlement is still pending (in progress or queued), in order.
   repeated int32 pending_settle_waves = 8;

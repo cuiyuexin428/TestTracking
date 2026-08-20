@@ -71,7 +71,6 @@ private:
     std::unique_ptr<CoverageStore> store_;
     int batch_size_ = 1000;
     int task_size_ = 25;
-    int failed_file_retries_ = 0;
     bool keep_staging_ = false;  // validation only: keep wave point files
     bool store_cov_ = false;     // wave settlement computes cov-based totals
     bool last_checkpoint_save_ok_ = false;
@@ -86,7 +85,6 @@ private:
     // Waves whose settlement completed successfully (always a prefix unless
     // the settlement chain paused at settle_failed_wave_).
     std::unordered_set<int> settled_waves_;
-    size_t task_seq_ = 0;
     std::vector<common::Task> pending_;
     std::unordered_set<std::string> pending_ids_;
     // Reclaimed tasks (offline/lease) are re-sent before new tasks so the
