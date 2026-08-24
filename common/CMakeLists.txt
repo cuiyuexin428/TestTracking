@@ -1,3 +1,16 @@
+# protobuf 25.3 parses DEPENDENCIES as a single argument. Keep imported
+# schemas in one CMake list so changes to command.proto regenerate
+# communication.pb.* as well.
+set(PROTO_IMPORTS
+    ${CMAKE_CURRENT_SOURCE_DIR}/proto/common.proto
+    ${CMAKE_CURRENT_SOURCE_DIR}/proto/heartbeat.proto
+    ${CMAKE_CURRENT_SOURCE_DIR}/proto/command.proto
+)
+# The protobuf 25.3 helper expands ARGN unquoted before parsing it. Escape
+# list separators so DEPENDENCIES remains one argument until the helper adds
+# it to add_custom_command(DEPENDS ...).
+string(REPLACE ";" "\\\\;" PROTO_IMPORTS_ARGUMENT "${PROTO_IMPORTS}")
+
 # Shared base library: ZMQ wrapper, blocking queue, event dispatch, logging,
 # config access, protocol messages.
 protobuf_generate(
@@ -8,6 +21,7 @@ protobuf_generate(
         proto/heartbeat.proto
         proto/command.proto
         proto/communication.proto
+    DEPENDENCIES "${PROTO_IMPORTS_ARGUMENT}"
     IMPORT_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/proto
     PROTOC_OUT_DIR ${CMAKE_CURRENT_BINARY_DIR}
     EXPORT_MACRO COMMON_API

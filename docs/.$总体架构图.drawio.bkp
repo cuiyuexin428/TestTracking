@@ -1,0 +1,169 @@
+<mxfile host="app.diagrams.net" agent="kimi-code" version="24.7.5" type="device">
+  <diagram id="arch" name="总体架构图">
+    <mxGraphModel dx="1000" dy="700" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1520" pageHeight="920" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- 标题 -->
+        <mxCell id="title" value="stp-test-tracking 总体架构与任务流" style="text;html=1;align=left;verticalAlign=middle;fontSize=18;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="30" y="8" width="500" height="28" as="geometry" />
+        </mxCell>
+
+        <!-- ============ 框架边界 ============ -->
+        <mxCell id="fwRegion" value="通用框架：通信 · 调度 · 生命周期 —— 不含业务逻辑" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#6c8ebf;dashed=1;fontSize=12;fontStyle=1;fontColor=#6c8ebf;verticalAlign=top;align=left;spacingLeft=10;spacingTop=4;" vertex="1" parent="1">
+          <mxGeometry x="30" y="44" width="1460" height="576" as="geometry" />
+        </mxCell>
+
+        <!-- ============ 调度中心 ============ -->
+        <mxCell id="schedBox" value="调度中心 scheduler.exe" style="swimlane;html=1;startSize=26;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=13;fontStyle=1;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="60" y="100" width="430" height="490" as="geometry" />
+        </mxCell>
+        <mxCell id="s_main" value="main 控制台&lt;br&gt;run / stop / wakeup / quit" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="schedBox">
+          <mxGeometry x="20" y="36" width="180" height="42" as="geometry" />
+        </mxCell>
+        <mxCell id="s_sched" value="Scheduler 调度&lt;br&gt;客户端表 · 在飞记账&lt;br&gt;派发 · 回收 · STOP / 恢复" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="schedBox">
+          <mxGeometry x="20" y="94" width="180" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="s_server" value="Server 通信线程&lt;br&gt;ZMQ ROUTER&lt;br&gt;加 / 拆信封" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="schedBox">
+          <mxGeometry x="220" y="94" width="190" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="s_storage" value="Storage 持久化&lt;br&gt;runs / tasks 落库" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="schedBox">
+          <mxGeometry x="20" y="224" width="180" height="46" as="geometry" />
+        </mxCell>
+        <!-- 服务端插件槽 -->
+        <mxCell id="s_slot" value="插件宿主：可加载多个插件 DLL，按 plugin_type 路由" style="swimlane;html=1;startSize=24;fillColor=none;strokeColor=#82b366;dashed=1;fontSize=11;fontColor=#82b366;verticalAlign=top;align=left;spacingLeft=6;" vertex="1" parent="schedBox">
+          <mxGeometry x="20" y="290" width="390" height="180" as="geometry" />
+        </mxCell>
+        <mxCell id="s_cov" value="coverage.dll · 服务端插件 SchedulerPlugin&lt;br&gt;版本门禁 · 波次任务池 · 贪心结算 · 检查点" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;fontStyle=1;" vertex="1" parent="s_slot">
+          <mxGeometry x="16" y="34" width="358" height="52" as="geometry" />
+        </mxCell>
+        <mxCell id="s_demo" value="demo.dll · 端到端验证插件" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f7ee;strokeColor=#82b366;fontSize=11;" vertex="1" parent="s_slot">
+          <mxGeometry x="16" y="98" width="220" height="34" as="geometry" />
+        </mxCell>
+        <mxCell id="s_more" value="… 扩展新业务插件" style="text;html=1;align=center;verticalAlign=middle;fontSize=11;fontColor=#82b366;" vertex="1" parent="s_slot">
+          <mxGeometry x="246" y="98" width="128" height="34" as="geometry" />
+        </mxCell>
+        <mxCell id="e_main_sched" value="① run coverage" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#6c8ebf;fontSize=11;fontStyle=1;" edge="1" parent="schedBox" source="s_main" target="s_sched">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_sched_server" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#6c8ebf;startArrow=block;startFill=0;endArrow=block;endFill=0;" edge="1" parent="schedBox" source="s_sched" target="s_server">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_sched_storage" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#6c8ebf;" edge="1" parent="schedBox" source="s_sched" target="s_storage">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_sched_plugin" value="框架回调：②validateClient ③requestTask ⑥processResult" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#82b366;fontSize=10;fontStyle=1;labelBackgroundColor=#ffffff;" edge="1" parent="schedBox" source="s_sched" target="s_cov">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ============ 客户端 ============ -->
+        <mxCell id="clientBox" value="客户端 client.exe（每台测试机）" style="swimlane;html=1;startSize=26;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=13;fontStyle=1;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="1030" y="100" width="430" height="490" as="geometry" />
+        </mxCell>
+        <mxCell id="c_client" value="Client 状态机（主线程）&lt;br&gt;ZMQ DEALER · 加 / 拆信封&lt;br&gt;注册 · 计数拉取 · 上报&lt;br&gt;STOP 静默 / WAKE 恢复" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="clientBox">
+          <mxGeometry x="20" y="94" width="200" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="c_exec" value="TaskExecutor&lt;br&gt;N 线程执行池" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="clientBox">
+          <mxGeometry x="240" y="94" width="170" height="56" as="geometry" />
+        </mxCell>
+        <!-- 客户端插件槽 -->
+        <mxCell id="c_slot" value="插件宿主：可加载多个插件 DLL，按 plugin_type 路由" style="swimlane;html=1;startSize=24;fillColor=none;strokeColor=#82b366;dashed=1;fontSize=11;fontColor=#82b366;verticalAlign=top;align=left;spacingLeft=6;" vertex="1" parent="clientBox">
+          <mxGeometry x="20" y="290" width="390" height="180" as="geometry" />
+        </mxCell>
+        <mxCell id="c_cov" value="coverage.dll · 客户端插件 ClientPlugin&lt;br&gt;execute(task)：逐文件采集 · 幂等跳过 · 入库" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;fontStyle=1;" vertex="1" parent="c_slot">
+          <mxGeometry x="16" y="34" width="358" height="52" as="geometry" />
+        </mxCell>
+        <mxCell id="c_demo" value="demo.dll · 端到端验证插件" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f7ee;strokeColor=#82b366;fontSize=11;" vertex="1" parent="c_slot">
+          <mxGeometry x="16" y="98" width="220" height="34" as="geometry" />
+        </mxCell>
+        <mxCell id="c_more" value="… 扩展新业务插件" style="text;html=1;align=center;verticalAlign=middle;fontSize=11;fontColor=#82b366;" vertex="1" parent="c_slot">
+          <mxGeometry x="246" y="98" width="128" height="34" as="geometry" />
+        </mxCell>
+        <mxCell id="e_client_exec" value="④ push(task)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#6c8ebf;fontSize=11;fontStyle=1;" edge="1" parent="clientBox" source="c_client" target="c_exec">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_exec_plugin" value="④ execute(task)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#82b366;fontSize=11;fontStyle=1;labelBackgroundColor=#ffffff;" edge="1" parent="clientBox" source="c_exec" target="c_cov">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ============ 信封（通信层） ============ -->
+        <mxCell id="zmq_title" value="ZMQ ROUTER ⇄ DEALER（tcp 5555）" style="text;html=1;align=center;verticalAlign=middle;fontSize=12;fontStyle=1;fontColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="640" y="96" width="240" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="env" value="Envelope 信封（框架加 / 拆）" style="swimlane;html=1;startSize=24;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;fontStyle=1;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="640" y="124" width="240" height="96" as="geometry" />
+        </mxCell>
+        <mxCell id="env_head" value="type · plugin_type（框架路由字段）" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#9673a6;fontSize=10;" vertex="1" parent="env">
+          <mxGeometry x="14" y="28" width="212" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="env_payload" value="业务 payload：插件定义，框架不解析&lt;br&gt;（CoverageTask / FileCoverage）" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#9673a6;fontSize=10;fontStyle=1;" vertex="1" parent="env">
+          <mxGeometry x="14" y="56" width="212" height="34" as="geometry" />
+        </mxCell>
+        <mxCell id="env_note" value="插件只生产 / 处理自己适配的任务 payload；&lt;br&gt;加拆信封、路由、重发由框架负责" style="text;html=1;align=center;verticalAlign=middle;fontSize=10;fontColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="600" y="226" width="320" height="30" as="geometry" />
+        </mxCell>
+
+        <!-- ZMQ 消息箭头 -->
+        <mxCell id="m_up1" value="② REGISTER · HEARTBEAT · TASK_ACK" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;dashed=1;fontSize=10;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="c_client" target="s_server">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="m_up2" value="③ REQUEST_TASK(count)　⑥ TASK_REPORT（结果）" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;dashed=1;fontSize=10;exitX=0;exitY=0.65;exitDx=0;exitDy=0;entryX=1;entryY=0.65;entryDx=0;entryDy=0;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="c_client" target="s_server">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="m_down1" value="③ TASK（批量任务）" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;dashed=1;fontSize=10;exitX=1;exitY=0.8;exitDx=0;exitDy=0;entryX=0;entryY=0.8;entryDx=0;entryDy=0;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="s_server" target="c_client">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="m_down2" value="REGISTER_RESULT · NO_TASK · STOP / WAKE" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;dashed=1;fontSize=10;exitX=1;exitY=0.95;exitDx=0;exitDy=0;entryX=0;entryY=0.95;entryDx=0;entryDy=0;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="s_server" target="c_client">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ============ common.dll ============ -->
+        <mxCell id="commonBox" value="common.dll 公共基础库（两侧进程共同链接，同一 CRT）&lt;br&gt;信封协议 proto · ZMQ 封装 · 阻塞队列 / 事件池 · 日志 / 配置 · 动态库加载 · TaskPlugin / WorkerPlugin 接口" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="560" y="450" width="400" height="66" as="geometry" />
+        </mxCell>
+        <mxCell id="e_link_s" value="链接" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#9673a6;dashed=1;fontSize=10;endArrow=open;exitX=1;exitY=0.85;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="schedBox" target="commonBox">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_link_c" value="链接" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#9673a6;dashed=1;fontSize=10;endArrow=open;exitX=0;exitY=0.85;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="clientBox" target="commonBox">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ============ PostgreSQL ============ -->
+        <mxCell id="pgBox" value="PostgreSQL" style="swimlane;html=1;startSize=26;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;fontStyle=1;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="300" y="680" width="460" height="200" as="geometry" />
+        </mxCell>
+        <mxCell id="pg_frame" value="框架表&lt;br&gt;runs / tasks&lt;br&gt;（Storage 写）" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#eaf1fb;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="pgBox">
+          <mxGeometry x="20" y="40" width="190" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="pg_biz" value="业务表 coverage_*&lt;br&gt;点集 / .cov · 累计&lt;br&gt;检查点 · ★selected&lt;br&gt;（插件读写）" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#eaf5ea;strokeColor=#82b366;fontSize=11;" vertex="1" parent="pgBox">
+          <mxGeometry x="230" y="40" width="210" height="130" as="geometry" />
+        </mxCell>
+
+        <!-- ============ OpenCppCoverage ============ -->
+        <mxCell id="occ" value="OpenCppCoverage.exe&lt;br&gt;⑤ 采集 · 波次合并（均由插件调用）" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="860" y="680" width="300" height="56" as="geometry" />
+        </mxCell>
+
+        <!-- 存储 / 工具连线 -->
+        <mxCell id="e_storage_pg" value="框架落库" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#6c8ebf;fontSize=10;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="s_storage" target="pg_frame">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_splugin_pg" value="⑥ 插件结算 · 检查点" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#82b366;fontSize=10;fontStyle=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.4;entryY=0;entryDx=0;entryDy=0;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="s_cov" target="pg_biz">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_cplugin_pg" value="⑤ 插件直写点集 / .cov" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#82b366;fontSize=10;fontStyle=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.8;entryY=0;entryDx=0;entryDy=0;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="c_cov" target="pg_biz">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_cplugin_occ" value="⑤ 插件采集" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#82b366;fontSize=10;fontStyle=1;exitX=0.8;exitY=1;exitDx=0;exitDy=0;entryX=0.6;entryY=0;entryDx=0;entryDy=0;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="c_cov" target="occ">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ============ 图例 ============ -->
+        <mxCell id="legend" value="&lt;b&gt;图例&lt;/b&gt;&lt;br&gt;&lt;font color=#6c8ebf&gt;■&lt;/font&gt; 框架模块　&lt;font color=#82b366&gt;■&lt;/font&gt; 业务插件&lt;br&gt;&lt;font color=#82b366&gt;▨&lt;/font&gt; 插件宿主（多插件槽）&lt;br&gt;&lt;font color=#9673a6&gt;■&lt;/font&gt; 信封协议 / common.dll　&lt;font color=#d79b00&gt;■&lt;/font&gt; 存储&lt;br&gt;&lt;font color=#b85450&gt;- -→&lt;/font&gt; ZMQ 消息　&lt;font color=#82b366&gt;——→&lt;/font&gt; 插件动作&lt;br&gt;①~⑥ 任务流转顺序" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;align=left;spacingLeft=8;verticalAlign=top;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="1260" y="680" width="230" height="160" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

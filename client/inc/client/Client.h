@@ -61,7 +61,7 @@ private:
     bool LoadPlugins();
     bool RegisterWithServer();  // INIT: synchronous validation, true on success
     bool SendRegisterOnce();
-    bool WaitForRegisterResult(common::Envelope& out);
+    bool WaitForRegisterResult(common::Envelope& out, const std::string& registration_id);
     void RunStateMachine();
     void HandleEnvelope(const common::Envelope& env);
     void HandleTask(const common::TaskCommand& command, const std::string& plugin_type);
@@ -97,6 +97,8 @@ private:
     std::chrono::milliseconds backoff_;
 
     std::string worker_id_;
+    std::string registration_id_;
+    std::string session_id_;
     std::string ip_;
     std::chrono::milliseconds heartbeat_interval_;
     std::chrono::milliseconds poll_timeout_;

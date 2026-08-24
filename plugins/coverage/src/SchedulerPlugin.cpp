@@ -726,55 +726,133 @@ bool SchedulerPlugin::MergeWaveCoverage(int wave) {
         return false;
     }
 
+    // Keep every OpenCppCoverage invocation bounded to two input artifacts.
+    // A whole wave can contain thousands of files, which otherwise exceeds
+    // Windows' command-line limit before OpenCppCoverage gets a chance to run.
+    const auto cleanup = [&]() {
+        std::error_code cleanup_ec;
+        std::filesystem::remove_all(work_dir, cleanup_ec);
+        if (cleanup_ec) {
+            LOG_WARN("coverage plugin: cannot clean cov work dir " << work_dir << ": "
+                                                                   << cleanup_ec.message());
+        }
+    };
+    const auto fail = [&]() {
+        cleanup();
+        return false;
+    };
+    const auto quote = [](const std::string& value) {
+        std::string result = "\"";
+        for (const char ch : value) {
+            if (ch == '\"') {
+                result += "\\\"";
+            } else {
+                result += ch;
+            }
+        }
+        result += '\"';
+        return result;
+    };
+    const auto build_command = [&](const std::vector<std::string>& inputs,
+                                   const std::string& output_cov,
+                                   const std::string* output_xml) {
+        std::string command = quote(opencppcoverage_) + " --quiet";
+        for (const std::string& input : inputs) {
+            command += " --input_coverage=" + quote(input);
+        }
+        command += " --export_type=binary:" + quote(output_cov);
+        if (output_xml != nullptr) {
+            command += " --export_type=cobertura:" + quote(*output_xml);
+        }
+        return command;
+    };
+
     std::vector<std::string> wave_covs;
     if (!store_->exportWaveCovs(run_id_, wave, work_dir.string(), wave_covs)) {
         LOG_ERROR("coverage plugin: exportWaveCovs failed for wave " << wave);
-        return false;
+        return fail();
     }
     std::string cumulative_path;
     if (!store_->exportCumulativeCov(run_id_, work_dir.string(), cumulative_path)) {
         LOG_ERROR("coverage plugin: exportCumulativeCov failed for wave " << wave);
-        return false;
+        return fail();
     }
     if (wave_covs.empty() && cumulative_path.empty()) {
         LOG_ERROR("coverage plugin: wave " << wave << " has no cov artifacts to merge");
-        return false;
+        return fail();
     }
 
-    std::string command = "\"" + opencppcoverage_ + "\" --quiet";
+    std::vector<std::string> inputs;
     if (!cumulative_path.empty()) {
-        command += " --input_coverage=\"" + cumulative_path + "\"";
+        inputs.push_back(cumulative_path);
     }
-    for (const std::string& path : wave_covs) {
-        command += " --input_coverage=\"" + path + "\"";
+    std::sort(wave_covs.begin(), wave_covs.end());
+    inputs.insert(inputs.end(), wave_covs.begin(), wave_covs.end());
+
+    // Reduce the inputs as a binary tree. Odd artifacts are carried to the
+    // next round unchanged; the final invocation emits both the cumulative
+    // binary and the cobertura report used for the wave summary.
+    int round = 0;
+    while (inputs.size() > 2) {
+        std::vector<std::string> next_round;
+        next_round.reserve((inputs.size() + 1) / 2);
+        for (size_t i = 0; i < inputs.size(); i += 2) {
+            if (i + 1 == inputs.size()) {
+                next_round.push_back(inputs[i]);
+                continue;
+            }
+            const std::string merged_path =
+                (work_dir / ("merge-r" + std::to_string(round) + "-p" +
+                             std::to_string(i / 2) + ".cov"))
+                    .string();
+            const std::vector<std::string> pair = {inputs[i], inputs[i + 1]};
+            const int exit_code = RunCommand(build_command(pair, merged_path, nullptr));
+            if (exit_code != 0) {
+                LOG_ERROR("coverage plugin: intermediate cov merge failed for wave " << wave
+                                                                                       << " round="
+                                                                                       << round
+                                                                                       << " pair="
+                                                                                       << (i / 2)
+                                                                                       << " exit="
+                                                                                       << exit_code);
+                return fail();
+            }
+            std::error_code exists_ec;
+            if (!std::filesystem::is_regular_file(merged_path, exists_ec) || exists_ec) {
+                LOG_ERROR("coverage plugin: intermediate cov merge produced no file: "
+                          << merged_path);
+                return fail();
+            }
+            next_round.push_back(merged_path);
+        }
+        inputs.swap(next_round);
+        ++round;
     }
+
     const std::string out_cov = (work_dir / "cumulative.cov").string();
     const std::string out_xml = (work_dir / "summary.xml").string();
-    command += " --export_type=binary:" + out_cov;
-    command += " --export_type=cobertura:" + out_xml;
-
-    const int exit_code = RunCommand(command);
+    const int exit_code = RunCommand(build_command(inputs, out_cov, &out_xml));
     if (exit_code != 0) {
         LOG_ERROR("coverage plugin: cov merge failed for wave " << wave
                                                                << " exit=" << exit_code);
-        return false;
+        return fail();
     }
     std::int64_t covered = 0;
     std::int64_t total = 0;
     if (!ParseCoverageTotals(out_xml, &covered, &total)) {
         LOG_ERROR("coverage plugin: cannot parse merged cobertura for wave " << wave);
-        return false;
+        return fail();
     }
     if (!store_->saveCumulativeCov(run_id_, wave, out_cov)) {
         LOG_ERROR("coverage plugin: saveCumulativeCov failed for wave " << wave);
-        return false;
+        return fail();
     }
     const double percent = total > 0 ? static_cast<double>(covered) / total : 0.0;
     if (!store_->saveWaveSummary(run_id_, wave, covered, total, percent)) {
         LOG_ERROR("coverage plugin: saveWaveSummary failed for wave " << wave);
-        return false;
+        return fail();
     }
-    std::filesystem::remove_all(work_dir, ec);
+    cleanup();
     LOG_INFO("coverage plugin: wave " << wave << " total coverage=" << covered << "/"
                                       << total << " (" << (percent * 100.0) << "%)");
     return true;

@@ -42,6 +42,13 @@ std::string GenerateRunId() {
     return "run-" + std::to_string(now.time_since_epoch().count());
 }
 
+std::string GenerateSessionId() {
+    static std::atomic<unsigned long long> sequence{0};
+    const auto now = std::chrono::steady_clock::now();
+    return "session-" + std::to_string(now.time_since_epoch().count()) + "-" +
+           std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
+}
+
 }  // namespace
 
 Scheduler::Scheduler(common::Config& config)
@@ -135,12 +142,12 @@ bool Scheduler::stopRun(const std::string& plugin_type) {
 }
 
 void Scheduler::wakeupClients(const std::string& plugin_type) {
-    std::vector<std::string> identities;
+    std::vector<std::pair<std::string, std::string>> clients_to_wake;
     {
         std::lock_guard<std::mutex> lock(clients_mutex_);
         for (const auto& entry : clients_) {
             if (plugin_type.empty() || entry.second.info.plugin_type == plugin_type) {
-                identities.push_back(entry.first);
+                clients_to_wake.emplace_back(entry.first, entry.second.session_id);
             }
         }
     }
@@ -149,9 +156,10 @@ void Scheduler::wakeupClients(const std::string& plugin_type) {
     if (!plugin_type.empty()) {
         env.set_plugin_type(plugin_type);
     }
-    for (const std::string& identity : identities) {
-        server_.sendTo(identity, env);
-        LOG_INFO("wakeup sent to " << identity);
+    for (const auto& client : clients_to_wake) {
+        env.set_session_id(client.second);
+        server_.sendTo(client.first, env);
+        LOG_INFO("wakeup sent to " << client.first);
     }
 }
 
@@ -306,7 +314,12 @@ void Scheduler::HandleMessage(const IncomingMessage& msg) {
             break;
         case common::HEARTBEAT:
             if (env.has_heartbeat()) {
-                UpdateClient(msg.identity, env.plugin_type(), env.heartbeat());
+                if (IsCurrentSession(msg)) {
+                    UpdateClient(msg.identity, env.plugin_type(), env.heartbeat());
+                } else {
+                    LOG_WARN("heartbeat from stale or unregistered session of " << msg.identity
+                                                                                 << ", dropped");
+                }
             }
             break;
         case common::REQUEST_TASK:
@@ -349,7 +362,8 @@ void Scheduler::HandleRegister(const IncomingMessage& msg) {
     if (it == plugins_by_type_.end()) {
         LOG_ERROR("register: no plugin for plugin_type " << plugin_type);
         SendRegisterResult(msg.identity, plugin_type, false, false,
-                           "no plugin for plugin_type " + plugin_type, std::string());
+                           "no plugin for plugin_type " + plugin_type, std::string(),
+                           std::string(), reg.registration_id());
         return;
     }
 
@@ -357,11 +371,17 @@ void Scheduler::HandleRegister(const IncomingMessage& msg) {
     common::ClientInfo client;
     client.identity = msg.identity;
     client.plugin_type = plugin_type;
+    client.peer_address = msg.peer_address;
+    std::string old_session_id;
     {
         std::lock_guard<std::mutex> lock(clients_mutex_);
         const auto cit = clients_.find(msg.identity);
         if (cit != clients_.end()) {
             client.heartbeat = cit->second.info.heartbeat;
+            if (client.peer_address.empty()) {
+                client.peer_address = cit->second.info.peer_address;
+            }
+            old_session_id = cit->second.session_id;
         }
     }
 
@@ -370,45 +390,74 @@ void Scheduler::HandleRegister(const IncomingMessage& msg) {
         if (!plugin->validateClient(client, reg.payload(), result)) {
             LOG_ERROR("plugin " << plugin_type << ": validateClient failed");
             SendRegisterResult(msg.identity, plugin_type, true, false, result.reason,
-                               result.reply_payload);
+                               result.reply_payload, std::string(), reg.registration_id());
             return;
         }
     } catch (const std::exception& e) {
         LOG_ERROR("plugin " << plugin_type << ": validateClient threw: " << e.what());
         SendRegisterResult(msg.identity, plugin_type, true, false, "validateClient threw",
-                           std::string());
+                           std::string(), std::string(), reg.registration_id());
         return;
     } catch (...) {
         LOG_ERROR("plugin " << plugin_type << ": validateClient threw unknown exception");
         SendRegisterResult(msg.identity, plugin_type, true, false,
-                           "validateClient threw unknown exception", std::string());
+                           "validateClient threw unknown exception", std::string(),
+                           std::string(), reg.registration_id());
         return;
+    }
+
+    if (!result.accepted) {
+        TouchClient(msg.identity, plugin_type);
+        {
+            std::lock_guard<std::mutex> lock(clients_mutex_);
+            clients_[msg.identity].registered_plugins.erase(plugin_type);
+        }
+        SendRegisterResult(msg.identity, plugin_type, true, false, result.reason,
+                           result.reply_payload, std::string(), reg.registration_id());
+        LOG_INFO("register: client " << msg.identity << " plugin_type=" << plugin_type
+                                     << " rejected");
+        return;
+    }
+
+    const std::string new_session_id = GenerateSessionId();
+    if (!old_session_id.empty()) {
+        LOG_WARN("register: replacing session for client " << msg.identity
+                                                             << ", reclaiming old tasks");
+        ReclaimClientTasks(msg.identity, old_session_id);
     }
 
     TouchClient(msg.identity, plugin_type);
     {
         std::lock_guard<std::mutex> lock(clients_mutex_);
-        auto& plugins = clients_[msg.identity].registered_plugins;
-        if (result.accepted) {
-            plugins.insert(plugin_type);
-        } else {
-            plugins.erase(plugin_type);
+        ClientEntry& entry = clients_[msg.identity];
+        entry.info.identity = msg.identity;
+        if (!msg.peer_address.empty()) {
+            entry.info.peer_address = msg.peer_address;
         }
+        entry.session_id = new_session_id;
+        entry.registered_plugins.clear();
+        entry.registered_plugins.insert(plugin_type);
     }
     SendRegisterResult(msg.identity, plugin_type, true, result.accepted, result.reason,
-                       result.reply_payload);
+                       result.reply_payload, new_session_id, reg.registration_id());
     LOG_INFO("register: client " << msg.identity << " plugin_type=" << plugin_type
-                                 << (result.accepted ? " accepted" : " rejected"));
+                                 << " accepted session=" << new_session_id);
 }
 
 void Scheduler::HandleRequestTask(const IncomingMessage& msg) {
     const common::RequestTaskCommand& request = msg.envelope.request_task();
     const std::string& plugin_type = msg.envelope.plugin_type();
+    const std::string& session_id = msg.envelope.session_id();
+    if (!IsCurrentSession(msg)) {
+        LOG_WARN("request_task from stale or unregistered session of " << msg.identity
+                                                                       << ", no task granted");
+        return;
+    }
     const auto it = plugins_by_type_.find(plugin_type);
     if (it == plugins_by_type_.end()) {
         LOG_WARN("request_task: no plugin for plugin_type " << plugin_type
                                                             << " from " << msg.identity);
-        SendNoTask(msg.identity, plugin_type);
+        SendNoTask(msg.identity, plugin_type, session_id);
         return;
     }
 
@@ -421,7 +470,7 @@ void Scheduler::HandleRequestTask(const IncomingMessage& msg) {
         if (cit == clients_.end() || cit->second.registered_plugins.count(plugin_type) == 0) {
             LOG_WARN("request_task: unregistered client " << msg.identity
                                                           << ", no task granted");
-            SendNoTask(msg.identity, plugin_type);
+            SendNoTask(msg.identity, plugin_type, session_id);
             return;
         }
     }
@@ -441,7 +490,7 @@ void Scheduler::HandleRequestTask(const IncomingMessage& msg) {
     const int count = request.count();
     if (count <= 0) {
         LOG_WARN("request_task: invalid count " << count << " from " << msg.identity);
-        SendNoTask(msg.identity, plugin_type);
+        SendNoTask(msg.identity, plugin_type, session_id);
         return;
     }
 
@@ -466,15 +515,20 @@ void Scheduler::HandleRequestTask(const IncomingMessage& msg) {
     }
 
     if (tasks.empty()) {
-        SendNoTask(msg.identity, plugin_type);
+        SendNoTask(msg.identity, plugin_type, session_id);
     } else {
-        SendTasks(plugin, msg.identity, tasks);
+        SendTasks(plugin, msg.identity, tasks, session_id);
     }
 }
 
 void Scheduler::HandleTaskReport(const IncomingMessage& msg) {
     const common::TaskReport& report = msg.envelope.task_report();
     const std::string& plugin_type = msg.envelope.plugin_type();
+    if (!IsCurrentSession(msg)) {
+        LOG_WARN("completion from stale or unregistered session of " << msg.identity
+                                                                      << ", dropped");
+        return;
+    }
     const auto pit = plugins_by_type_.find(plugin_type);
     if (pit == plugins_by_type_.end()) {
         LOG_ERROR("task_report: no plugin for plugin_type " << plugin_type);
@@ -503,6 +557,11 @@ void Scheduler::HandleTaskReport(const IncomingMessage& msg) {
                                             << it->second.plugin_type << "), dropped");
             return;
         }
+        if (it->second.session_id != msg.envelope.session_id()) {
+            LOG_WARN("completion for task " << report.result().task_id() << " from stale session of "
+                                            << msg.identity << ", dropped");
+            return;
+        }
         in_flight_.erase(it);
     }
 
@@ -518,6 +577,10 @@ void Scheduler::HandleTaskReport(const IncomingMessage& msg) {
 
 void Scheduler::HandleTaskAck(const IncomingMessage& msg) {
     const common::TaskAck& ack = msg.envelope.task_ack();
+    if (!IsCurrentSession(msg)) {
+        LOG_WARN("ack from stale or unregistered session of " << msg.identity << ", dropped");
+        return;
+    }
     TouchClient(msg.identity, msg.envelope.plugin_type());
 
     std::lock_guard<std::mutex> lock(in_flight_mutex_);
@@ -531,6 +594,11 @@ void Scheduler::HandleTaskAck(const IncomingMessage& msg) {
                                  << msg.envelope.plugin_type() << " (assigned to "
                                  << it->second.identity << "/" << it->second.plugin_type
                                  << "), dropped");
+        return;
+    }
+    if (it->second.session_id != msg.envelope.session_id()) {
+        LOG_WARN("ack for task " << ack.task_id() << " from stale session of " << msg.identity
+                                 << ", dropped");
         return;
     }
     it->second.acked = true;
@@ -618,12 +686,12 @@ void Scheduler::HandleStopRun(const StopRunCommand& command) {
     const std::string run_id = run_it->second.run_id;
 
     // Send STOP to every client of this plugin type and reclaim in-flight tasks.
-    std::vector<std::string> clients_of_type;
+    std::vector<std::pair<std::string, std::string>> clients_of_type;
     {
         std::lock_guard<std::mutex> lock(clients_mutex_);
         for (const auto& entry : clients_) {
             if (entry.second.info.plugin_type == command.plugin_type) {
-                clients_of_type.push_back(entry.first);
+                clients_of_type.emplace_back(entry.first, entry.second.session_id);
             }
         }
     }
@@ -633,10 +701,11 @@ void Scheduler::HandleStopRun(const StopRunCommand& command) {
     env.set_plugin_type(command.plugin_type);
     env.mutable_stop()->set_run_id(run_id);
     env.mutable_stop()->set_reason("manual stop");
-    for (const std::string& identity : clients_of_type) {
-        ReclaimClientTasks(identity);
-        server_.sendTo(identity, env);
-        LOG_INFO("stop sent to client " << identity);
+    for (const auto& client : clients_of_type) {
+        ReclaimClientTasks(client.first, client.second);
+        env.set_session_id(client.second);
+        server_.sendTo(client.first, env);
+        LOG_INFO("stop sent to client " << client.first);
     }
     bool checkpoint_ok = false;
 
@@ -674,13 +743,15 @@ void Scheduler::HandleStopRun(const StopRunCommand& command) {
     LOG_INFO("run stopped: " << run_id << " plugin_type=" << command.plugin_type);
 }
 
-void Scheduler::ReclaimClientTasks(const std::string& identity) {
+void Scheduler::ReclaimClientTasks(const std::string& identity,
+                                   const std::string& session_id) {
     std::unordered_map<std::string, std::vector<std::string>> by_type;
     std::vector<std::string> all_ids;
     {
         std::lock_guard<std::mutex> lock(in_flight_mutex_);
         for (auto it = in_flight_.begin(); it != in_flight_.end();) {
-            if (it->second.identity == identity) {
+            if (it->second.identity == identity &&
+                (session_id.empty() || it->second.session_id == session_id)) {
                 by_type[it->second.plugin_type].push_back(it->first);
                 all_ids.push_back(it->first);
                 it = in_flight_.erase(it);
@@ -696,6 +767,8 @@ void Scheduler::ReclaimClientTasks(const std::string& identity) {
         const auto pit = plugins_by_type_.find(item.first);
         if (pit != plugins_by_type_.end()) {
             LOG_WARN("reclaim " << item.second.size() << " tasks of client " << identity
+                                << (session_id.empty() ? std::string() :
+                                    " session=" + session_id)
                                 << " plugin_type=" << item.first);
             try {
                 pit->second->requeue(item.second);
@@ -708,10 +781,20 @@ void Scheduler::ReclaimClientTasks(const std::string& identity) {
     }
 }
 
+bool Scheduler::IsCurrentSession(const IncomingMessage& msg) const {
+    if (msg.envelope.session_id().empty()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(clients_mutex_);
+    const auto it = clients_.find(msg.identity);
+    return it != clients_.end() && it->second.session_id == msg.envelope.session_id();
+}
+
 void Scheduler::TouchClient(const std::string& identity, const std::string& plugin_type) {
     std::lock_guard<std::mutex> lock(clients_mutex_);
     const bool is_new = clients_.find(identity) == clients_.end();
     ClientEntry& entry = clients_[identity];
+    entry.info.identity = identity;
     entry.info.plugin_type = plugin_type;
     entry.last_seen = std::chrono::steady_clock::now();
     if (is_new) {
@@ -843,20 +926,28 @@ void Scheduler::RunTimeoutChecks() {
 
 void Scheduler::SendRegisterResult(const std::string& identity, const std::string& plugin_type,
                                    bool plugin_found, bool accepted, const std::string& reason,
-                                   const std::string& reply_payload) {
+                                   const std::string& reply_payload,
+                                   const std::string& session_id,
+                                   const std::string& registration_id) {
     common::Envelope env;
     env.set_type(common::REGISTER_RESULT);
     env.set_plugin_type(plugin_type);
+    env.set_session_id(session_id);
     common::RegisterResult* result = env.mutable_register_result();
     result->set_plugin_found(plugin_found);
     result->set_accepted(accepted);
     result->set_reason(reason);
     result->set_payload(reply_payload);
+    result->set_registration_id(registration_id);
     server_.sendTo(identity, env);
 }
 
 void Scheduler::HandleTaskReject(const IncomingMessage& msg) {
     const common::TaskRejectCommand& reject = msg.envelope.task_reject();
+    if (!IsCurrentSession(msg)) {
+        LOG_WARN("reject from stale or unregistered session of " << msg.identity << ", dropped");
+        return;
+    }
     TouchClient(msg.identity, msg.envelope.plugin_type());
 
     std::string plugin_type;
@@ -879,6 +970,11 @@ void Scheduler::HandleTaskReject(const IncomingMessage& msg) {
             LOG_WARN("reject for task " << reject.task_id() << " plugin_type "
                                         << msg.envelope.plugin_type() << " (assigned to "
                                         << it->second.plugin_type << "), dropped");
+            return;
+        }
+        if (it->second.session_id != msg.envelope.session_id()) {
+            LOG_WARN("reject for task " << reject.task_id() << " from stale session of "
+                                         << msg.identity << ", dropped");
             return;
         }
         plugin_type = it->second.plugin_type;
@@ -905,7 +1001,8 @@ void Scheduler::HandleTaskReject(const IncomingMessage& msg) {
 }
 
 void Scheduler::SendTasks(common::TaskPlugin* plugin, const std::string& identity,
-                          const std::vector<common::Task>& tasks) {
+                           const std::vector<common::Task>& tasks,
+                           const std::string& session_id) {
     const auto it = active_runs_.find(plugin);
     if (it == active_runs_.end()) {
         LOG_ERROR("no active run for plugin " << plugin->pluginType() << ", returning "
@@ -931,6 +1028,7 @@ void Scheduler::SendTasks(common::TaskPlugin* plugin, const std::string& identit
     common::Envelope env;
     env.set_type(common::TASK);
     env.set_plugin_type(run.plugin_type);
+    env.set_session_id(session_id);
     common::TaskCommand* cmd = env.mutable_task();
     cmd->set_run_id(run.run_id);
 
@@ -945,7 +1043,7 @@ void Scheduler::SendTasks(common::TaskPlugin* plugin, const std::string& identit
                 continue;
             }
             *cmd->add_tasks() = task;
-            in_flight_[task.task_id()] = {identity, run.plugin_type,
+            in_flight_[task.task_id()] = {identity, session_id, run.plugin_type,
                                           std::chrono::steady_clock::now(), false};
             accepted.push_back(task);
         }
@@ -965,10 +1063,12 @@ void Scheduler::SendTasks(common::TaskPlugin* plugin, const std::string& identit
     }
 }
 
-void Scheduler::SendNoTask(const std::string& identity, const std::string& plugin_type) {
+void Scheduler::SendNoTask(const std::string& identity, const std::string& plugin_type,
+                           const std::string& session_id) {
     common::Envelope env;
     env.set_type(common::NO_TASK);
     env.set_plugin_type(plugin_type);
+    env.set_session_id(session_id);
     server_.sendTo(identity, env);
 }
 

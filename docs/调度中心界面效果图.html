@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; font-family: "Microsoft YaHei", "Segoe UI", sans-serif; }
+  body { background: #f4f6fa; color: #2b3445; padding: 0; }
+
+  /* 顶栏 */
+  .topbar { height: 56px; background: #fff; border-bottom: 1px solid #e5e9f0;
+    display: flex; align-items: center; padding: 0 24px; }
+  .logo { width: 28px; height: 28px; border-radius: 7px; background: linear-gradient(135deg,#4a7fdd,#6c8ebf);
+    display: flex; align-items: center; justify-content: center; color: #fff; font-size: 15px; font-weight: 700; margin-right: 10px; }
+  .topbar .title { font-size: 16px; font-weight: 600; letter-spacing: .5px; }
+  .topbar .sub { font-size: 12px; color: #8a94a6; margin-left: 10px; }
+  .topbar .right { margin-left: auto; display: flex; align-items: center; gap: 18px; font-size: 12px; color: #5b6676; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; vertical-align: 1px; }
+  .dot.g { background: #52b06e; } .dot.b { background: #4a7fdd; }
+
+  .page { display: grid; grid-template-columns: 292px 1fr; gap: 16px; padding: 16px 24px 20px; }
+
+  .card { background: #fff; border: 1px solid #e7ebf2; border-radius: 10px; padding: 16px 18px; margin-bottom: 16px; }
+  .card h3 { font-size: 13px; font-weight: 600; color: #3a4356; margin-bottom: 14px; display: flex; align-items: center; }
+  .card h3 .tag { margin-left: auto; font-size: 11px; font-weight: 400; color: #8a94a6; }
+
+  /* 运行控制 */
+  .field { margin-bottom: 12px; }
+  .field label { display: block; font-size: 11px; color: #8a94a6; margin-bottom: 5px; }
+  .field .val, .field select, .field input { width: 100%; font-size: 13px; padding: 7px 10px; border: 1px solid #dde3ec;
+    border-radius: 6px; background: #fafbfd; color: #2b3445; }
+  .btns { display: flex; gap: 8px; margin-top: 14px; }
+  .btn { flex: 1; text-align: center; font-size: 12px; padding: 8px 0; border-radius: 6px; border: 1px solid transparent; cursor: default; }
+  .btn.primary { background: #4a7fdd; color: #fff; }
+  .btn.danger { background: #fff; color: #d0574f; border-color: #e8c4c2; }
+  .btn.ghost { background: #fff; color: #5b6676; border-color: #dde3ec; }
+
+  /* 概览数字 */
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .stat { background: #f8fafd; border: 1px solid #edf1f7; border-radius: 8px; padding: 10px 12px; }
+  .stat .n { font-size: 20px; font-weight: 700; color: #2f3a4f; }
+  .stat .n em { font-style: normal; font-size: 11px; font-weight: 400; color: #8a94a6; margin-left: 2px; }
+  .stat .t { font-size: 11px; color: #8a94a6; margin-top: 2px; }
+  .stat.hl .n { color: #3d9e5f; }
+
+  /* Run 进度 */
+  .runhead { display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px; }
+  .runhead .rid { font-size: 14px; font-weight: 600; }
+  .badge { font-size: 10px; padding: 2px 8px; border-radius: 10px; font-weight: 500; }
+  .badge.run { background: #e5f4ea; color: #3d9e5f; }
+  .badge.busy { background: #e7effc; color: #4a7fdd; }
+  .badge.idle { background: #f1f3f7; color: #7b8598; }
+  .runmeta { font-size: 11px; color: #8a94a6; margin-bottom: 14px; }
+  .prog-row { display: flex; justify-content: space-between; font-size: 11px; color: #5b6676; margin: 10px 0 5px; }
+  .prog-row b { color: #2f3a4f; font-weight: 600; }
+  .bar { height: 8px; background: #eef1f6; border-radius: 4px; overflow: hidden; }
+  .bar i { display: block; height: 100%; border-radius: 4px; background: linear-gradient(90deg,#4a7fdd,#6ea3ec); }
+  .bar.g i { background: linear-gradient(90deg,#48a467,#7cc491); }
+
+  /* 客户端表格 */
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; font-size: 11px; font-weight: 500; color: #8a94a6; padding: 7px 10px; border-bottom: 1px solid #edf1f7; }
+  td { padding: 9px 10px; border-bottom: 1px solid #f2f5f9; color: #3a4356; }
+  tr:last-child td { border-bottom: none; }
+  td .mono { font-family: Consolas, monospace; font-size: 11px; color: #5b6676; }
+  .res { color: #8a94a6; font-size: 11px; }
+
+  /* 日志 */
+  .log { background: #1f2632; border-radius: 8px; padding: 12px 14px; font-family: Consolas, monospace;
+    font-size: 11px; line-height: 1.9; color: #b9c4d4; }
+  .log .t { color: #64718a; margin-right: 8px; }
+  .log .ok { color: #6fc98a; } .log .info { color: #7aa8ec; } .log .warn { color: #e0b45c; }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="logo">T</div>
+  <div class="title">TestTracking 调度中心</div>
+  <div class="sub">分布式测试执行调度 · 主控台</div>
+  <div class="right">
+    <span><i class="dot g"></i>调度服务运行中</span>
+    <span><i class="dot b"></i>ZMQ tcp://*:5555</span>
+    <span><i class="dot g"></i>PostgreSQL 已连接</span>
+  </div>
+</div>
+
+<div class="page">
+  <!-- 左栏 -->
+  <div>
+    <div class="card">
+      <h3>运行控制</h3>
+      <div class="field"><label>业务插件</label>
+        <select><option>coverage（覆盖率）</option><option>demo</option></select></div>
+      <div class="field"><label>数据集版本</label><input value="d1"></div>
+      <div class="btns">
+        <div class="btn primary">启动 Run</div>
+        <div class="btn danger">停止</div>
+        <div class="btn ghost">唤醒</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>概览<span class="tag">2026-08-18 12:20</span></h3>
+      <div class="stats">
+        <div class="stat"><div class="n">4</div><div class="t">在线客户端</div></div>
+        <div class="stat"><div class="n">12</div><div class="t">在飞任务</div></div>
+        <div class="stat"><div class="n">268<em>/1600</em></div><div class="t">已完成任务</div></div>
+        <div class="stat hl"><div class="n">312</div><div class="t">已选最小集合（文件）</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 右栏 -->
+  <div>
+    <div class="card">
+      <h3>当前 Run</h3>
+      <div class="runhead">
+        <span class="rid">run-20260818-01</span>
+        <span class="badge run">运行中</span>
+        <span class="badge busy">coverage</span>
+      </div>
+      <div class="runmeta">数据集版本 d1 · 启动于 12:01 · 中断自动恢复（第 7 波检查点）</div>
+      <div class="prog-row"><span>波次进度</span><span><b>7 / 40</b> 波</span></div>
+      <div class="bar"><i style="width:17.5%"></i></div>
+      <div class="prog-row"><span>本波任务（波次 7）</span><span><b>28 / 40</b> 个</span></div>
+      <div class="bar g"><i style="width:70%"></i></div>
+      <div class="prog-row"><span>累计覆盖点</span><span><b>18,106</b> 点 · 失败文件重试 0</span></div>
+    </div>
+
+    <div class="card">
+      <h3>客户端<span class="tag">超时离线 5s · 心跳 1s</span></h3>
+      <table>
+        <tr><th>Worker</th><th>地址</th><th>状态</th><th>执行中</th><th>版本</th><th>资源</th><th>最后心跳</th></tr>
+        <tr><td>worker-01</td><td class="mono">192.168.1.21:5231</td><td><span class="badge busy">BUSY</span></td><td>4 任务</td><td class="mono">prog 1.0 / data d1</td><td class="res">CPU 62% · 内存 41%</td><td>1 秒前</td></tr>
+        <tr><td>worker-02</td><td class="mono">192.168.1.22:5098</td><td><span class="badge busy">BUSY</span></td><td>4 任务</td><td class="mono">prog 1.0 / data d1</td><td class="res">CPU 57% · 内存 38%</td><td>1 秒前</td></tr>
+        <tr><td>worker-03</td><td class="mono">192.168.1.23:5340</td><td><span class="badge busy">BUSY</span></td><td>4 任务</td><td class="mono">prog 1.0 / data d1</td><td class="res">CPU 71% · 内存 45%</td><td>2 秒前</td></tr>
+        <tr><td>worker-04</td><td class="mono">192.168.1.24:5012</td><td><span class="badge idle">IDLE</span></td><td>—</td><td class="mono">prog 1.0 / data d1</td><td class="res">CPU 8% · 内存 33%</td><td>1 秒前</td></tr>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3>调度日志</h3>
+      <div class="log">
+        <div><span class="t">12:01:03</span><span class="info">[Scheduler]</span> 启动完成，加载插件 coverage.dll，恢复未完成 run（第 7 波检查点）</div>
+        <div><span class="t">12:02:41</span><span class="ok">[Register]</span> worker-03 注册通过：program=1.0, dataset=d1</div>
+        <div><span class="t">12:11:26</span><span class="info">[Dispatch]</span> worker-02 请求 4 个任务 → 批量下发（波次 7）</div>
+        <div><span class="t">12:20:15</span><span class="ok">[Settle]</span> 第 6 波结算完成：新增入选 41 个文件，累计覆盖 18,106 点</div>
+        <div><span class="t">12:20:16</span><span class="warn">[Checkpoint]</span> 检查点已保存（run-20260818-01 / wave 7）</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

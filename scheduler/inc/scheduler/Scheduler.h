@@ -82,10 +82,12 @@ private:
         common::ClientInfo info;
         std::chrono::steady_clock::time_point last_seen;
         std::unordered_set<std::string> registered_plugins;  // REGISTER accepted per plugin_type
+        std::string session_id;
     };
 
     struct InFlight {
         std::string identity;
+        std::string session_id;
         std::string plugin_type;
         std::chrono::steady_clock::time_point sent_at;
         bool acked = false;  // client confirmed receipt via TASK_ACK
@@ -125,7 +127,9 @@ private:
     void HandleTaskReject(const IncomingMessage& msg);
     void HandleCreateRun(const CreateRunCommand& command);
     void HandleStopRun(const StopRunCommand& command);
-    void ReclaimClientTasks(const std::string& identity);
+    void ReclaimClientTasks(const std::string& identity,
+                            const std::string& session_id = std::string());
+    bool IsCurrentSession(const IncomingMessage& msg) const;
     void TouchClient(const std::string& identity, const std::string& plugin_type);
     bool UpdateClient(const std::string& identity, const std::string& plugin_type,
                       const common::Heartbeat& heartbeat);
@@ -133,10 +137,13 @@ private:
     void RunTimeoutChecks();
     void SendRegisterResult(const std::string& identity, const std::string& plugin_type,
                             bool plugin_found, bool accepted, const std::string& reason,
-                            const std::string& reply_payload);
+                            const std::string& reply_payload,
+                            const std::string& session_id = std::string(),
+                            const std::string& registration_id = std::string());
     void SendTasks(common::TaskPlugin* plugin, const std::string& identity,
-                   const std::vector<common::Task>& tasks);
-    void SendNoTask(const std::string& identity, const std::string& plugin_type);
+                   const std::vector<common::Task>& tasks, const std::string& session_id);
+    void SendNoTask(const std::string& identity, const std::string& plugin_type,
+                    const std::string& session_id);
 
     common::Config& config_;
     Server server_;

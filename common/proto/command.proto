@@ -10,6 +10,9 @@ import "common.proto";
 // identity is the ZMQ identity frame; its IP is carried by Heartbeat.
 message RegisterCommand {
   bytes payload = 1;
+  // Client-generated nonce used to match a response to this registration
+  // attempt when an earlier response is delayed in the transport.
+  string registration_id = 2;
 }
 
 // Registration validation result. payload is the opaque business reply
@@ -23,6 +26,7 @@ message RegisterResult {
   bool plugin_found = 2;
   string reason = 3;
   bool accepted = 4;
+  string registration_id = 5;
 }
 
 // Client task request. count is the desired number of tasks: the scheduler

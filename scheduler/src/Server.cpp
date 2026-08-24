@@ -16,6 +16,11 @@ Server::~Server() {
 }
 
 void Server::start() {
+    // A replacement DEALER using the same worker identity must take over the
+    // route immediately; otherwise the ROUTER can keep sending to a crashed
+    // client's stale connection until its transport state expires.
+    const int handover = 1;
+    router_.setOption(ZMQ_ROUTER_HANDOVER, &handover, sizeof(handover));
     router_.bind();
     running_.store(true);
     thread_ = std::thread(&Server::RunLoop, this);

@@ -66,6 +66,7 @@ int main() {
     reg.set_type(common::REGISTER);
     reg.set_plugin_type("coverage");
     reg.mutable_register_()->set_payload("client-info-bytes");
+    reg.mutable_register_()->set_registration_id("register-1");
 
     std::string reg_bytes;
     rc |= Check(reg.SerializeToString(&reg_bytes), "serialize register");
@@ -73,6 +74,8 @@ int main() {
     rc |= Check(reg_parsed.ParseFromString(reg_bytes), "parse register");
     rc |= Check(reg_parsed.has_register_(), "register present");
     rc |= Check(reg_parsed.plugin_type() == "coverage", "register plugin_type");
+    rc |= Check(reg_parsed.register_().registration_id() == "register-1",
+                "registration id preserved");
     rc |= Check(reg_parsed.register_().payload() == "client-info-bytes",
                 "register payload preserved");
 
@@ -80,13 +83,18 @@ int main() {
     common::Envelope result_env;
     result_env.set_type(common::REGISTER_RESULT);
     result_env.set_plugin_type("coverage");
+    result_env.set_session_id("session-1");
     result_env.mutable_register_result()->set_payload("deploy-instructions");
+    result_env.mutable_register_result()->set_registration_id("register-1");
 
     std::string result_bytes;
     rc |= Check(result_env.SerializeToString(&result_bytes), "serialize register result");
     common::Envelope result_parsed;
     rc |= Check(result_parsed.ParseFromString(result_bytes), "parse register result");
     rc |= Check(result_parsed.has_register_result(), "register result present");
+    rc |= Check(result_parsed.session_id() == "session-1", "session id preserved");
+    rc |= Check(result_parsed.register_result().registration_id() == "register-1",
+                "registration id preserved");
     rc |= Check(result_parsed.register_result().payload() == "deploy-instructions",
                 "register result payload preserved");
 

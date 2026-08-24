@@ -11,6 +11,10 @@ import "heartbeat.proto";
 message Envelope {
   MessageType type = 1;
   string plugin_type = 2;  // empty for non-plugin messages (reply/notify)
+  // Scheduler-assigned client session. REGISTER requests leave this empty;
+  // every other client message and server reply is bound to the session that
+  // registered the client.
+  string session_id = 14;
 
   oneof payload {
     RegisterCommand register = 3;

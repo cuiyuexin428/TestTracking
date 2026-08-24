@@ -81,6 +81,14 @@ std::string DetectLocalIp() {
 #endif
     return std::string();
 }
+
+std::string GenerateRegistrationId() {
+    static std::atomic<unsigned long long> sequence{0};
+    const auto now = std::chrono::steady_clock::now();
+    return "register-" + std::to_string(now.time_since_epoch().count()) + "-" +
+           std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
+}
+
 #ifdef _WIN32
 int SampleProcessCpuPercent() {
     // Process CPU usage since the previous heartbeat, clamped to [0, 100].
@@ -288,7 +296,7 @@ bool Client::RegisterWithServer() {
                                      << plugin_->pluginType());
 
         common::Envelope reply;
-        if (!WaitForRegisterResult(reply)) {
+        if (!WaitForRegisterResult(reply, registration_id_)) {
             LOG_WARN("register attempt " << attempt << " timed out, retrying");
             continue;
         }
@@ -307,9 +315,14 @@ bool Client::RegisterWithServer() {
             LOG_ERROR("client: registration rejected: " << result.reason());
             return false;
         }
+        if (reply.session_id().empty()) {
+            LOG_ERROR("client: registration accepted without a session id");
+            return false;
+        }
         try {
             switch (plugin_->handleValidationReply(result.payload())) {
                 case common::RegisterOutcome::kReady:
+                    session_id_ = reply.session_id();
                     LOG_INFO("registered: plugin_type=" << plugin_->pluginType());
                     return true;
                 case common::RegisterOutcome::kRetry:
@@ -348,6 +361,8 @@ bool Client::SendRegisterOnce() {
     env.set_plugin_type(plugin_->pluginType());
     common::RegisterCommand* reg = env.mutable_register_();
     reg->set_payload(payload);
+    registration_id_ = GenerateRegistrationId();
+    reg->set_registration_id(registration_id_);
 
     std::string bytes;
     if (!env.SerializeToString(&bytes)) {
@@ -363,7 +378,8 @@ bool Client::SendRegisterOnce() {
     return true;
 }
 
-bool Client::WaitForRegisterResult(common::Envelope& out) {
+bool Client::WaitForRegisterResult(common::Envelope& out,
+                                   const std::string& registration_id) {
     const auto start = std::chrono::steady_clock::now();
     const bool infinite = register_timeout_ms_ <= 0;
     const auto deadline = start + std::chrono::milliseconds(register_timeout_ms_);
@@ -382,6 +398,11 @@ bool Client::WaitForRegisterResult(common::Envelope& out) {
                     continue;
                 }
                 if (env.type() == common::REGISTER_RESULT) {
+                    if (!env.has_register_result() ||
+                        env.register_result().registration_id() != registration_id) {
+                        LOG_WARN("client: ignoring stale registration result");
+                        continue;
+                    }
                     out = std::move(env);
                     return true;
                 }
@@ -470,6 +491,10 @@ void Client::RunStateMachine() {
 }
 
 void Client::HandleEnvelope(const common::Envelope& env) {
+    if (env.session_id() != session_id_) {
+        LOG_WARN("client: ignoring message for stale session id=" << env.session_id());
+        return;
+    }
     switch (env.type()) {
         case common::TASK:
             if (env.has_task()) {
@@ -568,6 +593,7 @@ void Client::HandleTask(const common::TaskCommand& command, const std::string& p
             common::Envelope reject;
             reject.set_type(common::TASK_REJECT);
             reject.set_plugin_type(plugin_type);
+            reject.set_session_id(session_id_);
             reject.mutable_task_reject()->set_task_id(task.task_id());
             reject.mutable_task_reject()->set_reason("plugin_type mismatch");
             outgoing_.push(std::move(reject));
@@ -584,6 +610,7 @@ void Client::HandleTask(const common::TaskCommand& command, const std::string& p
         common::Envelope ack;
         ack.set_type(common::TASK_ACK);
         ack.set_plugin_type(plugin_type);
+        ack.set_session_id(session_id_);
         ack.mutable_task_ack()->set_task_id(task.task_id());
         outgoing_.push(std::move(ack));
         executor_.push(task);
@@ -599,6 +626,7 @@ void Client::SendHeartbeat() {
     common::Envelope env;
     env.set_type(common::HEARTBEAT);
     env.set_plugin_type(plugin_ != nullptr ? plugin_->pluginType() : std::string());
+    env.set_session_id(session_id_);
     common::Heartbeat* heartbeat = env.mutable_heartbeat();
     heartbeat->set_ip(ip_);
     if (plugin_ != nullptr) {
@@ -647,6 +675,7 @@ bool Client::SendRequestTask(int count) {
     common::Envelope env;
     env.set_type(common::REQUEST_TASK);
     env.set_plugin_type(plugin_->pluginType());
+    env.set_session_id(session_id_);
     common::RequestTaskCommand* request = env.mutable_request_task();
     request->set_count(count);
 
@@ -671,6 +700,7 @@ void Client::SendTaskReport(const common::TaskResult& result) {
     common::Envelope env;
     env.set_type(common::TASK_REPORT);
     env.set_plugin_type(plugin_ != nullptr ? plugin_->pluginType() : std::string());
+    env.set_session_id(session_id_);
     common::TaskReport* report = env.mutable_task_report();
     *report->mutable_result() = result;
     outgoing_.push(std::move(env));
