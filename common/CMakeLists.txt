@@ -39,6 +39,8 @@ add_library(common SHARED
     src/Logger.cpp
     src/Config.cpp
     src/DynamicLibrary.cpp
+    src/Util.cpp
+    src/PgUtil.cpp
     ${PROTO_SRCS}
 )
 
@@ -48,7 +50,11 @@ target_include_directories(common PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/inc
     ${CMAKE_CURRENT_BINARY_DIR}
     ${THIRD_PARTY_INCLUDE_DIRS}
+    ${PG_INCLUDE_DIR}
 )
+# PgUtil.cpp (Windows) needs libpq; link the import library so common.dll resolves
+# PQ* symbols. DB-backed plugins already link ${PG_LIBRARY} themselves.
+target_link_libraries(common PRIVATE ${PG_LIBRARY})
 
 # libzmq is linked PRIVATE into this DLL; nobody needs its symbols across the
 # boundary. protobuf is a shared DLL and its import library propagates to
