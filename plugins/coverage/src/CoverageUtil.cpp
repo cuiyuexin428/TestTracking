@@ -2,39 +2,137 @@
 
 #include "tinyxml2.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <set>
+#include <unordered_set>
 #include <utility>
-
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <cstdlib>
-#endif
 
 namespace coverage_plugin {
 
-int RunCommand(const std::string& command) {
-#ifdef _WIN32
-    STARTUPINFOA si{};
-    si.cb = sizeof(si);
-    PROCESS_INFORMATION pi{};
-    std::string mutable_command = command;
-    if (!CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr, FALSE,
-                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-        return -1;
+std::string PackPoints(const std::vector<std::uint64_t>& points) {
+    std::string out;
+    out.reserve(points.size() * sizeof(std::uint64_t));
+    for (std::uint64_t p : points) {
+        for (int i = 0; i < 8; ++i) {
+            out.push_back(static_cast<char>((p >> (8 * i)) & 0xFF));
+        }
     }
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD exit_code = 0;
-    GetExitCodeProcess(pi.hProcess, &exit_code);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    return static_cast<int>(exit_code);
-#else
-    return std::system(command.c_str());
-#endif
+    return out;
+}
+
+std::vector<std::uint64_t> UnpackPoints(const std::string& data) {
+    std::vector<std::uint64_t> out;
+    out.reserve(data.size() / sizeof(std::uint64_t));
+    for (size_t i = 0; i + 8 <= data.size(); i += 8) {
+        std::uint64_t p = 0;
+        for (int j = 0; j < 8; ++j) {
+            p |= static_cast<std::uint64_t>(static_cast<unsigned char>(data[i + j])) << (8 * j);
+        }
+        out.push_back(p);
+    }
+    return out;
+}
+
+std::vector<std::string> SelectGreedyMinSet(
+    const std::unordered_map<std::string, std::set<std::uint64_t>>& file_points,
+    std::set<std::uint64_t>* cumulative) {
+    std::vector<std::string> selected;
+    std::unordered_set<std::string> taken;
+    while (true) {
+        std::string best;
+        size_t best_new = 0;
+        for (const auto& item : file_points) {
+            if (taken.count(item.first)) {
+                continue;
+            }
+            size_t new_count = 0;
+            for (std::uint64_t point : item.second) {
+                if (!cumulative->count(point)) {
+                    ++new_count;
+                }
+            }
+            if (new_count > best_new) {
+                best_new = new_count;
+                best = item.first;
+            }
+        }
+        if (best.empty() || best_new == 0) {
+            break;
+        }
+        selected.push_back(best);
+        taken.insert(best);
+        cumulative->insert(file_points.at(best).begin(), file_points.at(best).end());
+    }
+    return selected;
+}
+
+bool MergeCoverageFiles(const std::string& opencppcoverage,
+                        const std::vector<std::string>& cov_files,
+                        const std::string& out_cov,
+                        const std::string& out_xml) {
+    if (cov_files.empty()) {
+        return false;
+    }
+    const auto quote = [](const std::string& value) {
+        std::string result = "\"";
+        for (const char ch : value) {
+            if (ch == '\"') {
+                result += "\\\"";
+            } else {
+                result += ch;
+            }
+        }
+        result += '\"';
+        return result;
+    };
+    const auto build_command = [&](const std::vector<std::string>& inputs,
+                                   const std::string& output_cov,
+                                   const std::string* output_xml) {
+        std::string command = quote(opencppcoverage) + " --quiet";
+        for (const std::string& input : inputs) {
+            command += " --input_coverage=" + quote(input);
+        }
+        command += " --export_type=binary:" + quote(output_cov);
+        if (output_xml != nullptr) {
+            command += " --export_type=cobertura:" + quote(*output_xml);
+        }
+        return command;
+    };
+
+    std::vector<std::string> inputs = cov_files;
+    std::sort(inputs.begin(), inputs.end());
+    int round = 0;
+    while (inputs.size() > 2) {
+        std::vector<std::string> next_round;
+        next_round.reserve((inputs.size() + 1) / 2);
+        for (size_t i = 0; i < inputs.size(); i += 2) {
+            if (i + 1 == inputs.size()) {
+                next_round.push_back(inputs[i]);
+                continue;
+            }
+            const std::string merged_path =
+                (std::filesystem::path(out_cov).parent_path() /
+                 ("merge-r" + std::to_string(round) + "-p" + std::to_string(i / 2) + ".cov"))
+                    .string();
+            const std::vector<std::string> pair = {inputs[i], inputs[i + 1]};
+            const int exit_code = common::RunCommand(build_command(pair, merged_path, nullptr));
+            if (exit_code != 0) {
+                return false;
+            }
+            std::error_code exists_ec;
+            if (!std::filesystem::is_regular_file(merged_path, exists_ec) || exists_ec) {
+                return false;
+            }
+            next_round.push_back(merged_path);
+        }
+        inputs.swap(next_round);
+        ++round;
+    }
+    const int exit_code = common::RunCommand(build_command(inputs, out_cov, &out_xml));
+    return exit_code == 0;
 }
 
 bool ParseCoverageTotals(const std::string& xml_path, std::int64_t* covered_lines,

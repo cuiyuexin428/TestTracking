@@ -1,6 +1,7 @@
 #include "coverage/ClientPlugin.h"
 
 #include "common/Logger.h"
+#include "common/Util.h"
 
 #include "coverage.pb.h"
 #include "coverage/CoverageUtil.h"
@@ -22,23 +23,8 @@ namespace coverage_plugin {
 
 namespace {
 
-#ifdef _WIN32
-std::string NormalizePath(std::string path) {
-    for (char& c : path) {
-        if (c == '/') {
-            c = '\\';
-        }
-    }
-    return path;
-}
-#else
-std::string NormalizePath(const std::string& path) {
-    return path;
-}
-#endif
-
 std::vector<std::uint64_t> SyntheticPoints(const std::string& file) {
-    const std::uint64_t seed = Fnv1a64(file);
+    const std::uint64_t seed = common::Fnv1a64(file);
     const std::uint64_t count = 10 + (seed % 40);
     std::vector<std::uint64_t> points;
     points.reserve(count);
@@ -166,7 +152,7 @@ bool ClientPlugin::init(const std::string& config) {
         std::filesystem::create_directories(export_dir_, ec);
     }
 
-    store_ = CreateCoverageStore(config);
+    store_ = CreateCoverageResultStore(config);
     if (!store_->init(config)) {
         LOG_ERROR("coverage plugin: coverage store init failed");
         return false;
@@ -191,25 +177,25 @@ std::string ClientPlugin::heartbeatInfo() const {
     return "program=" + program_version_ + ",dataset=" + dataset_version_;
 }
 
-bool ClientPlugin::RunOneFile(const std::string& run_id, int wave, const std::string& file,
+bool ClientPlugin::RunOneFile(const std::string& run_id, const std::string& file,
                               std::vector<std::uint64_t>& points) {
     const std::string stp_path = stp_root_ + "/" + file;
     const std::string xml_path =
-        NormalizePath(export_dir_ + "/" + std::to_string(Fnv1a64(file)) + ".xml");
+        common::NormalizePath(export_dir_ + "/" + std::to_string(common::Fnv1a64(file)) + ".xml");
     const std::string cov_path =
-        NormalizePath(export_dir_ + "/" + std::to_string(Fnv1a64(file)) + ".cov");
+        common::NormalizePath(export_dir_ + "/" + std::to_string(common::Fnv1a64(file)) + ".cov");
 
     std::string command = "\"" + opencppcoverage_ + "\" --quiet";
     for (const std::string& module : engine_dlls_) {
-        command += " --modules=" + NormalizePath(module);
+        command += " --modules=" + common::NormalizePath(module);
     }
     command += " --export_type=cobertura:" + xml_path;
     if (store_cov_) {
         command += " --export_type=binary:" + cov_path;
     }
-    command += " -- \"" + NormalizePath(target_exe_) + "\" \"" + NormalizePath(stp_path) + "\"";
+    command += " -- \"" + common::NormalizePath(target_exe_) + "\" \"" + common::NormalizePath(stp_path) + "\"";
 
-    const int exit_code = RunCommand(command);
+    const int exit_code = common::RunCommand(command);
     if (exit_code != 0) {
         LOG_WARN("coverage plugin: opencppcoverage exit=" << exit_code << " for " << file);
         return false;
@@ -225,7 +211,7 @@ bool ClientPlugin::RunOneFile(const std::string& run_id, int wave, const std::st
             std::string data(static_cast<size_t>(size), '\0');
             cov_in.seekg(0);
             cov_in.read(&data[0], size);
-            if (!store_->saveFileCov(run_id, wave, file, data,
+            if (!store_->saveFileCov(run_id, file, data,
                                      static_cast<std::int64_t>(size))) {
                 LOG_WARN("coverage plugin: failed to store cov for " << file);
                 return false;
@@ -260,7 +246,7 @@ bool ClientPlugin::execute(const common::Task& task, common::TaskResult& result)
         bool ok = false;
         std::set<std::uint64_t> existing;
         const bool already_covered =
-            store_->loadFileCoverage(cov_task.run_id(), cov_task.wave_id(), file, &existing);
+            store_->loadFileCoverage(cov_task.run_id(), file, &existing);
         if (already_covered) {
             points.assign(existing.begin(), existing.end());
             ok = true;
@@ -273,14 +259,14 @@ bool ClientPlugin::execute(const common::Task& task, common::TaskResult& result)
                 std::this_thread::sleep_for(std::chrono::milliseconds(dry_run_delay_ms_));
             }
         } else {
-            ok = RunOneFile(cov_task.run_id(), cov_task.wave_id(), file, points);
+            ok = RunOneFile(cov_task.run_id(), file, points);
         }
         // The same (path, line) can appear once per module; dedupe so counts
         // and the point sets are exact.
         std::sort(points.begin(), points.end());
         points.erase(std::unique(points.begin(), points.end()), points.end());
         if (ok) {
-            ok = store_->saveFileCoverage(cov_task.run_id(), cov_task.wave_id(), file, points);
+            ok = store_->saveFileCoverage(cov_task.run_id(), file, points);
             if (!ok) {
                 LOG_WARN("coverage plugin: failed to store points for " << file);
             }

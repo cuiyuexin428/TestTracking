@@ -1,5 +1,6 @@
-# Deletes old runs (framework runs/tasks + coverage business rows), keeping
-# the most recent -Keep runs. Use -DryRun to preview what would be removed.
+# Deletes old runs (framework runs/tasks + derived coverage rows), keeping
+# the most recent -Keep runs. Raw per-file coverage rows are retained forever
+# and are never pruned here. Use -DryRun to preview what would be removed.
 param(
     [int]$Keep = 10,
     [switch]$DryRun,
@@ -22,14 +23,13 @@ if ($DryRun) {
 }
 
 foreach ($runId in $ids) {
+    # Raw per-file rows (coverage_file_points / coverage_cov_files) are
+    # intentionally retained forever (per project decision), so they are NOT
+    # deleted here. Only derived and framework rows are pruned.
     $sql = @"
 BEGIN;
-DELETE FROM coverage_wave_points WHERE run_id='$runId';
-DELETE FROM coverage_cov_files WHERE run_id='$runId';
-DELETE FROM coverage_cumulative WHERE run_id='$runId';
 DELETE FROM coverage_selected WHERE run_id='$runId';
 DELETE FROM coverage_run_summary WHERE run_id='$runId';
-DELETE FROM coverage_wave_summary WHERE run_id='$runId';
 DELETE FROM coverage_cumulative_cov WHERE run_id='$runId';
 DELETE FROM coverage_checkpoints WHERE run_id='$runId';
 DELETE FROM tasks WHERE run_id='$runId';
@@ -37,6 +37,6 @@ DELETE FROM runs WHERE run_id='$runId';
 COMMIT;
 "@
     & $Psql $DbConn -c $sql 2>&1 | Out-Null
-    Write-Host "pruned $runId"
+    Write-Host "pruned $runId (raw per-file rows retained)"
 }
 Write-Host 'done'

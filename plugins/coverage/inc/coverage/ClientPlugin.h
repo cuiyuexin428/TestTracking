@@ -13,9 +13,9 @@ namespace coverage_plugin {
 
 // Client-side coverage plugin: executes one task (a list of stp files) with
 // OpenCppCoverage over the target program, parses the cobertura report into
-// line-level point sets, and writes them into the CoverageStore. Concurrency
-// is owned by the client framework: one framework worker executes one task,
-// and the files inside a task run sequentially.
+// line-level point sets, and writes them into the CoverageResultStore.
+// Concurrency is owned by the client framework: one framework worker executes
+// one task, and the files inside a task run sequentially.
 class ClientPlugin : public common::WorkerPlugin {
 public:
     std::string pluginType() const override;
@@ -26,10 +26,10 @@ public:
     bool execute(const common::Task& task, common::TaskResult& result) override;
 
 private:
-    bool RunOneFile(const std::string& run_id, int wave, const std::string& file,
+    bool RunOneFile(const std::string& run_id, const std::string& file,
                     std::vector<std::uint64_t>& points);
 
-    std::unique_ptr<CoverageStore> store_;
+    std::unique_ptr<CoverageResultStore> store_;
     bool dry_run_ = true;
     std::string stp_root_;
     std::string program_dir_;  // testenv/program in the client package

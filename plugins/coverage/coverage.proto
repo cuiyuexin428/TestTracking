@@ -2,13 +2,17 @@ syntax = "proto3";
 
 package coverage;
 
-// One task = a list of stp file names (relative paths).
+// One task = a list of stp file names (relative paths). The server distributes
+// tasks as a flat pool; there are no waves and no server-side settlement. The
+// client owns execution and writes raw per-file results into the store.
 message CoverageTask {
   string run_id = 1;
-  int32 wave_id = 2;
-  repeated string files = 3;
-  // Reserved for client-side retries; the server no longer performs file-level retries.
-  int32 retry_count = 4;
+  repeated string files = 2;
+  // Reserved for client-side retries; the server performs no file-level retries.
+  int32 retry_count = 3;
+  // Legacy field (removed): tasks used to carry a wave id. Kept reserved so
+  // stale generated code cannot silently reuse the tag.
+  reserved 4;
 }
 
 // Summary of a single stp file. The covered point set itself travels via the
@@ -23,29 +27,22 @@ message CoverageResult {
   repeated FileCoverage files = 1;
 }
 
-// Run checkpoint for resume after STOP or crash. remaining_tasks are the
-// current wave's tasks not yet reported (excluding priority_tasks); future
-// waves are rebuilt from the manifest on restore.
+// Run checkpoint for resume after STOP or crash. The run is a flat task pool:
+// at snapshot time remaining_tasks hold every task that is not finished yet
+// (pending + in-flight), so restore re-dispatches them instead of dropping them.
 message CoverageCheckpoint {
-  int32 current_wave = 1;
+  // Checkpoint format version: 3 = flat dispatch (no waves, no settlement).
+  int32 checkpoint_version = 1;
   int32 total_files = 2;
-  int32 selected_files = 3;
-  repeated bytes remaining_tasks = 4;  // serialized common::Task
-  repeated bytes priority_tasks = 5;   // serialized common::Task
   // Fingerprint of the stp manifest the run was planned from, so restore
   // refuses to resume when the input dataset changed underneath it.
-  string manifest_fingerprint = 6;
-  // Legacy checkpoint field kept for compatibility; no longer used.
-  int32 task_seq = 7;
-  // Waves whose settlement is still pending (in progress or queued), in order.
-  repeated int32 pending_settle_waves = 8;
-  // Wave whose settlement failed; absent means none. When set, the settlement
-  // chain is paused (dispatch continues) and no automatic retry is attempted.
-  optional int32 settle_failed_wave = 9;
-  // Waves already settled (ordered prefix); used by multi-wave restore.
-  repeated int32 settled_waves = 10;
-  // Checkpoint format version: 0 = legacy single-wave, 2 = multi-wave dispatch.
-  int32 checkpoint_version = 11;
+  string manifest_fingerprint = 3;
+  // Serialized common::Task payloads still pending or in flight at snapshot.
+  repeated bytes remaining_tasks = 4;
+  // Serialized common::Task payloads reclaimed from clients; re-sent first.
+  repeated bytes priority_tasks = 5;
+  // Legacy fields removed by v3; preserved so old code cannot reuse the tags.
+  reserved 6, 7, 8, 9, 10, 11;
 }
 
 // Registration validation: component versions of the client package. It is

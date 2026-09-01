@@ -117,7 +117,6 @@ $programVersion = if ($ProgramVersion) { $ProgramVersion } else { [string](Get-D
 $outDirRaw = if ($OutDir) { $OutDir } else { [string](Get-DeployValue 'package_out_dir' 'dist\client_package') }
 $workerId = if ($WorkerId) { $WorkerId } else { [string](Get-DeployValue 'worker_id' 'worker-1') }
 $taskThreads = [int](Get-DeployValue 'task_threads' 2)
-$batchSize = [int](Get-DeployValue 'batch_size' 1000)
 $taskSize = [int](Get-DeployValue 'task_size' 25)
 $storeCov = [bool](Get-DeployValue 'store_cov' $true)
 
@@ -220,10 +219,7 @@ $sched.plugins.coverage.db_conn = $localConn
 $sched.plugins.coverage.stp_manifest = ($datasetStage + '/manifest.txt').Replace('\', '/')
 $sched.plugins.coverage.expected_program_version = [string]$programVersion
 $sched.plugins.coverage.expected_dataset_version = [string]$datasetVersion
-$sched.plugins.coverage.opencppcoverage = (Join-Path $opencppcoverageDir 'OpenCppCoverage.exe').Replace('\', '/')
-$sched.plugins.coverage.batch_size = $batchSize
 $sched.plugins.coverage.task_size = $taskSize
-$sched.plugins.coverage.store_cov = $storeCov
 $outCfgDir = Join-Path $binDir 'config'
 New-Item -ItemType Directory -Force -Path $outCfgDir | Out-Null
 $outCfg = Join-Path $outCfgDir 'scheduler.json'
