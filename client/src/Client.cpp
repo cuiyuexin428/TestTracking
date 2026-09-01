@@ -156,7 +156,8 @@ Client::Client(common::Config& config)
       request_backoff_initial_(config.get("client.request_backoff_initial_ms", 200)),
       request_backoff_max_(config.get("client.request_backoff_max_ms", 30000)),
       register_timeout_ms_(config.get("client.register_timeout_ms", 5000)),
-      register_max_attempts_(config.get("client.register_max_attempts", 5)) {
+      register_max_attempts_(config.get("client.register_max_attempts", 5)),
+      request_timeout_ms_(config.get("client.request_timeout_ms", 5000)) {
 }
 
 Client::~Client() {
@@ -442,6 +443,35 @@ void Client::RunStateMachine() {
         }
 
         const auto now = std::chrono::steady_clock::now();
+
+        // Session can go stale (e.g. the scheduler restarted and forgot this
+        // client). When idle, an unanswered request is the signal: the server
+        // drops stale-session requests silently, so outstanding_requests_
+        // would otherwise stay 1 forever and the client would never ask again.
+        // Re-register to obtain a fresh session and resume.
+        bool re_registered = false;
+        if (!silent_.load(std::memory_order_relaxed)) {
+            std::lock_guard<std::mutex> lock(counters_mutex_);
+            if (in_flight_ == 0 && outstanding_requests_ == 1 &&
+                now - request_sent_at_ >
+                    std::chrono::milliseconds(request_timeout_ms_)) {
+                outstanding_requests_ = 0;
+                re_registered = true;
+            }
+        }
+        if (re_registered) {
+            LOG_WARN("client: idle request timed out; re-registering (stale session?)");
+            if (RegisterWithServer()) {
+                backoff_ = request_backoff_initial_;
+            } else {
+                LOG_WARN("client: re-register failed; will retry on next timeout");
+            }
+            {
+                std::lock_guard<std::mutex> lock(counters_mutex_);
+                next_request_ = std::chrono::steady_clock::now();
+            }
+        }
+
         if (now - last_heartbeat_ >= heartbeat_interval_) {
             last_heartbeat_ = now;
             SendHeartbeat();
@@ -467,6 +497,7 @@ void Client::RunStateMachine() {
                     std::lock_guard<std::mutex> lock(counters_mutex_);
                     outstanding_requests_ = 1;
                 }
+                request_sent_at_ = now;
             }
         }
 

@@ -94,6 +94,7 @@ private:
     // State machine timing (main thread only).
     std::chrono::steady_clock::time_point last_heartbeat_;
     std::chrono::steady_clock::time_point next_request_;
+    std::chrono::steady_clock::time_point request_sent_at_;
     std::chrono::milliseconds backoff_;
 
     std::string worker_id_;
@@ -106,6 +107,7 @@ private:
     std::chrono::milliseconds request_backoff_max_;
     int register_timeout_ms_ = 0;  // <=0 means registration waits forever
     int register_max_attempts_ = 5;
+    int request_timeout_ms_ = 5000;  // re-register when an idle request is unanswered
 };
 
 }  // namespace client
