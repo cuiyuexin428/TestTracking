@@ -1,68 +1,74 @@
 #include "common/EventManager.h"
+#include "common/Logger.h"
 
-#include <cassert>
 #include <chrono>
 #include <stdexcept>
 
 namespace common {
 
-	namespace {
+EventManager::EventManager(int thread_num) {
+    if (thread_num < 1) {
+        throw std::invalid_argument("EventManager: thread_num must be >= 1");
+    }
+    thread_group.reserve(thread_num);
+    try {
+        for (int i = 0; i < thread_num; ++i) {
+            running_workers_.fetch_add(1);
+            try {
+                thread_group.emplace_back([this] {
+                    std::unique_ptr<Event> event;
+                    while (queue_.pop(event, std::chrono::hours(24))) {
+                        if (stop_.load(std::memory_order_acquire)) break;
+                        try {
+                            event->execute();
+                        } catch (const std::exception& error) {
+                            LOG_ERROR("worker event failed: " << error.what());
+                        } catch (...) {
+                            LOG_ERROR("worker event failed: unknown exception");
+                        }
+                        event.reset();
+                    }
+                    event.reset();
+                    running_workers_.fetch_sub(1, std::memory_order_release);
+                });
+            } catch (...) {
+                running_workers_.fetch_sub(1);
+                throw;
+            }
+        }
+    } catch (...) {
+        requestStop();
+        join();
+        throw;
+    }
+}
 
-		const auto kPopTimeout = std::chrono::milliseconds(100);
+EventManager::~EventManager() {
+    requestStop();
+    join();
+}
 
-	}  // namespace
+bool EventManager::push(Event* event) {
+    return push(std::unique_ptr<Event>(event));
+}
 
-	EventManager::EventManager(int thread_num) {
-		if (thread_num < 1) {
-			throw std::invalid_argument("EventManager: thread_num must be >= 1");
-		}
+bool EventManager::push(std::unique_ptr<Event> event) {
+    return event && queue_.push(std::move(event));
+}
 
-		thread_group.reserve(thread_num);
-		for (int i = 0; i < thread_num; ++i) {
-			thread_group.emplace_back([this] {
-				while (!stop_.load(std::memory_order_relaxed)) {
-					std::unique_ptr<Event> event;
-					if (queue_.pop(event, kPopTimeout)) {
-						event->execute();
-					}
-				}
-				});
-		}
-	}
+void EventManager::requestStop() {
+    stop_.store(true, std::memory_order_release);
+    queue_.close(true);
+}
 
-	EventManager::~EventManager() {
-		stop_.store(true, std::memory_order_relaxed);
-		// Drop queued events before waking workers so nothing queued runs after stop.
-		{
-			std::lock_guard<std::mutex> lock(push_mutex_);
-			queue_.clear();
-		}
-		// Wake blocked workers immediately so they notice stop_ without waiting
-		// for the pop timeout. Workers busy executing finish, then exit.
-		queue_.notifyAll();
-		for (std::thread& t : thread_group) {
-			if (t.joinable()) {
-				t.join();
-			}
-		}
-	}
+bool EventManager::isStopped() const {
+    return running_workers_.load(std::memory_order_acquire) == 0;
+}
 
-	void EventManager::push(Event* event) {
-		// The queue owns events as unique_ptr; ownership transfers to the manager.
-		// Fail fast in debug builds; keep the guard for release builds where
-		// assert() is compiled out.
-		assert(event != nullptr);
-		if (event == nullptr) {
-			return;
-		}
-		{
-			std::lock_guard<std::mutex> lock(push_mutex_);
-			if (stop_.load(std::memory_order_relaxed)) {
-				delete event;
-				return;
-			}
-			queue_.push(std::unique_ptr<Event>(event));
-		}
-	}
+void EventManager::join() {
+    for (auto& worker : thread_group) {
+        if (worker.joinable()) worker.join();
+    }
+}
 
 }  // namespace common

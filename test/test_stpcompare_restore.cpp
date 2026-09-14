@@ -15,6 +15,7 @@
 #include <json.hpp>
 
 #include <cstdio>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -45,9 +46,9 @@ bool Contains(const std::vector<std::string>& v, const std::string& s) {
 
 int main() {
     const std::filesystem::path root =
-        std::filesystem::temp_directory_path() / "stpcompare_test";
+        std::filesystem::temp_directory_path() / ("stpcompare-test-"+
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::error_code ec;
-    std::filesystem::remove_all(root, ec);
     std::filesystem::create_directories(root / "store", ec);
 
     const std::filesystem::path manifest = root / "manifest.txt";

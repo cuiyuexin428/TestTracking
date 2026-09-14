@@ -39,11 +39,16 @@ public:
 
     virtual std::string recvMsg();
     virtual void sendMsg(const std::string& msg);
+    // Never wait for capacity. false retains caller ownership for retry;
+    // permanent transport errors throw.
+    bool trySendMsg(const std::string& msg);
 
     // Multi-part messages. ROUTER sockets carry an identity frame before the
     // payload; replies must echo it back as the first part.
     virtual std::vector<std::string> recvMsgParts();
     virtual void sendMsgParts(const std::vector<std::string>& parts);
+    // false only before multipart starts; failure mid-message throws.
+    bool trySendMsgParts(const std::vector<std::string>& parts);
 
     // Pass-through for zmq_setsockopt, e.g. ZMQ_RCVTIMEO, ZMQ_SUBSCRIBE.
     void setOption(int option, const void* value, size_t size);

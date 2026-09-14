@@ -24,10 +24,12 @@ public:
     common::RegisterOutcome handleValidationReply(const std::string& reply_payload) override;
     std::string heartbeatInfo() const override;
     bool execute(const common::Task& task, common::TaskResult& result) override;
+    bool execute(const common::Task& task, common::TaskResult& result,
+                 const common::CancellationToken& cancellation) override;
 
 private:
     bool RunOneFile(const std::string& run_id, const std::string& file,
-                    std::vector<std::uint64_t>& points);
+                    FileCoverageResult* output, const common::CancellationToken& cancellation);
 
     std::unique_ptr<CoverageResultStore> store_;
     bool dry_run_ = true;
@@ -39,6 +41,7 @@ private:
     bool keep_reports_ = false;  // validation only: keep cobertura XMLs
     bool store_cov_ = false;     // keep OpenCppCoverage .cov binaries in the store
     int dry_run_delay_ms_ = 0;   // test only: per-file delay in dry run mode
+    int process_timeout_ms_ = 300000;
     std::vector<std::string> engine_dlls_;
 
     // Component versions read from version.txt files in the package.

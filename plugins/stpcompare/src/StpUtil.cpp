@@ -1,25 +1,28 @@
 #include "stpcompare/StpUtil.h"
-
-#include "common/Util.h"
-
 namespace stpcompare {
-
-std::string BuildProgramCommand(const std::string& program_cmd,
-                                const std::string& exe,
-                                const std::string& stp_path,
-                                const std::string& outdir,
-                                const std::string& file,
-                                const std::string& run_id) {
-    std::string cmd = program_cmd;
-    if (cmd.empty()) {
-        cmd = "\"" + exe + "\" {stp}";
+bool ParseProgramArguments(const std::string& command,std::vector<std::string>* arguments) {
+    if(!arguments) return false;
+    arguments->clear();
+    std::size_t i=0;
+    while(i<command.size()) {
+        while(i<command.size() && (command[i]==' ' || command[i]=='\t')) ++i;
+        if(i==command.size()) break;
+        std::string argument; bool quoted=false;
+        while(i<command.size() && (quoted || (command[i]!=' ' && command[i]!='\t'))) {
+            std::size_t slashes=0;
+            while(i<command.size() && command[i]=='\\') { ++slashes; ++i; }
+            if(i<command.size() && command[i]=='"') {
+                argument.append(slashes/2,'\\');
+                if(slashes%2) argument+='"'; else quoted=!quoted;
+                ++i;
+            } else {
+                argument.append(slashes,'\\');
+                if(i<command.size()) argument+=command[i++];
+            }
+        }
+        if(quoted) return false;
+        arguments->push_back(argument);
     }
-    common::ReplaceAll(cmd, "{stp}", stp_path);
-    common::ReplaceAll(cmd, "{outdir}", outdir);
-    common::ReplaceAll(cmd, "{workdir}", outdir);
-    common::ReplaceAll(cmd, "{file}", file);
-    common::ReplaceAll(cmd, "{run_id}", run_id);
-    return cmd;
+    return !arguments->empty();
 }
-
-}  // namespace stpcompare
+}

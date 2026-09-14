@@ -1,16 +1,8 @@
 #pragma once
-
 #include <string>
-
+#include <vector>
 namespace stpcompare {
-
-// Substitutes {stp} {outdir} {workdir} {file} {run_id} in program_cmd. Falls
-// back to "<exe> {stp}" when program_cmd is empty.
-std::string BuildProgramCommand(const std::string& program_cmd,
-                                const std::string& exe,
-                                const std::string& stp_path,
-                                const std::string& outdir,
-                                const std::string& file,
-                                const std::string& run_id);
-
-}  // namespace stpcompare
+// Parse an old command template into literal argv before replacing placeholders.
+// Supports quotes and Windows backslash-before-quote rules; invokes no shell.
+bool ParseProgramArguments(const std::string& command,std::vector<std::string>* arguments);
+}

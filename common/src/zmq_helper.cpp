@@ -1,6 +1,7 @@
 #include "common/zmq_helper.h"
 
 #include <stdexcept>
+#include <cerrno>
 
 namespace common {
 
@@ -101,6 +102,15 @@ void ZmqBase<SocketType>::sendMsg(const std::string& msg) {
 }
 
 template <int SocketType>
+bool ZmqBase<SocketType>::trySendMsg(const std::string& msg) {
+    const int rc = zmq_send(socket_, msg.data(), msg.size(), ZMQ_DONTWAIT);
+    if (rc >= 0) return true;
+    const int error = zmq_errno();
+    if (error == EAGAIN || error == EINTR || error == EHOSTUNREACH) return false;
+    throw std::runtime_error(std::string("zmq_send: ") + zmq_strerror(error));
+}
+
+template <int SocketType>
 std::vector<std::string> ZmqBase<SocketType>::recvMsgParts() {
     std::vector<std::string> parts;
     while (true) {
@@ -140,6 +150,21 @@ void ZmqBase<SocketType>::sendMsgParts(const std::vector<std::string>& parts) {
             throw std::runtime_error(std::string("zmq_send: ") + zmq_strerror(zmq_errno()));
         }
     }
+}
+
+template <int SocketType>
+bool ZmqBase<SocketType>::trySendMsgParts(const std::vector<std::string>& parts) {
+    if (parts.empty()) throw std::invalid_argument("trySendMsgParts(): parts is empty");
+    for (size_t i = 0; i < parts.size(); ++i) {
+        const int flags = (i + 1 < parts.size() ? ZMQ_SNDMORE : 0) | ZMQ_DONTWAIT;
+        const int rc = zmq_send(socket_, parts[i].data(), parts[i].size(), flags);
+        if (rc < 0) {
+            const int error = zmq_errno();
+            if (i == 0 && (error == EAGAIN || error == EINTR || error == EHOSTUNREACH)) return false;
+            throw std::runtime_error(std::string("zmq_send: ") + zmq_strerror(error));
+        }
+    }
+    return true;
 }
 
 template <int SocketType>

@@ -2,6 +2,9 @@
 
 #include "common/Logger.h"
 #include "common/Util.h"
+#include "common/AtomicFile.h"
+#include "common/ProcessRunner.h"
+#include <atomic>
 
 #include "stpcompare.pb.h"
 #include "stpcompare/StpUtil.h"
@@ -17,6 +20,40 @@
 namespace stpcompare {
 
 namespace {
+
+std::string ExpandArgumentTemplate(const std::string& input,
+                                   const std::string& stp_path,
+                                   const std::string& outdir,
+                                   const std::string& file,
+                                   const std::string& run_id) {
+    struct Placeholder { const char* token; const std::string* value; };
+    const Placeholder placeholders[] = {
+        {"{stp}", &stp_path},
+        {"{outdir}", &outdir},
+        {"{workdir}", &outdir},
+        {"{file}", &file},
+        {"{run_id}", &run_id},
+    };
+    std::string output;
+    output.reserve(input.size());
+    for (std::size_t pos = 0; pos < input.size();) {
+        const Placeholder* match = nullptr;
+        for (const auto& placeholder : placeholders) {
+            const std::string token(placeholder.token);
+            if (input.compare(pos, token.size(), token) == 0) {
+                match = &placeholder;
+                break;
+            }
+        }
+        if (match != nullptr) {
+            output += *match->value;
+            pos += std::char_traits<char>::length(match->token);
+        } else {
+            output += input[pos++];
+        }
+    }
+    return output;
+}
 
 std::string ReadVersionFile(const std::string& path) {
     if (path.empty()) {
@@ -46,6 +83,15 @@ bool ClientPlugin::init(const std::string& config) {
     stp_root_ = cfg.value("stp_root", std::string());
     program_exe_ = cfg.value("program_exe", std::string());
     program_cmd_ = cfg.value("program_cmd", std::string());
+    program_args_=cfg.value("program_args",std::vector<std::string>{"{stp}"});
+    // Legacy templates are tokenized before substitution, so filenames can
+    // never create additional arguments or shell syntax.
+    if(!program_cmd_.empty()) {
+        std::vector<std::string> parsed;
+        if(!ParseProgramArguments(program_cmd_,&parsed) || parsed.empty()) return false;
+        program_exe_=parsed.front();
+        program_args_.assign(parsed.begin()+1,parsed.end());
+    }
     info_file_ = cfg.value("info_file", std::string("info.txt"));
     info_new_file_ = cfg.value("info_new_file", std::string("info_new.txt"));
     work_base_ = cfg.value("work_dir", std::string("stp_compare_work"));
@@ -54,6 +100,8 @@ bool ClientPlugin::init(const std::string& config) {
     }
     keep_work_ = cfg.value("keep_work", false);
     dry_run_delay_ms_ = cfg.value("dry_run_delay_ms", 0);
+    process_timeout_ms_=cfg.value("process_timeout_ms",300000);
+    if(process_timeout_ms_<=0) return false;
     const std::string program_dir = cfg.value("program_dir", std::string());
     const std::string dataset_version_file =
         cfg.value("dataset_version_file", std::string());
@@ -109,108 +157,79 @@ std::string ClientPlugin::heartbeatInfo() const {
 }
 
 bool ClientPlugin::RunOneFile(const std::string& run_id, const std::string& file,
-                              std::string* info_txt, std::string* info_new_txt,
-                              std::string* detail) {
-    const std::filesystem::path outdir =
-        std::filesystem::path(work_base_) / run_id / std::to_string(common::Fnv1a64(file));
-    const auto cleanup = [&]() {
-        if (!keep_work_) {
-            std::error_code cleanup_ec;
-            std::filesystem::remove_all(outdir, cleanup_ec);
-        }
-    };
+                              FileResult* output, const common::CancellationToken& cancellation) {
+    static std::atomic<std::uint64_t> sequence{0};
+    const auto stamp=std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto outdir=std::filesystem::absolute(work_base_)/
+        (std::to_string(stamp)+"-"+std::to_string(sequence.fetch_add(1)));
     std::error_code ec;
-    std::filesystem::create_directories(outdir, ec);
-    if (ec) {
-        if (detail != nullptr) {
-            *detail = "cannot create work dir: " + ec.message();
-        }
+    if(!std::filesystem::create_directory(outdir,ec) || ec) {
+        output->detail="cannot create work directory"; return false;
+    }
+    struct Cleanup {
+        std::filesystem::path path; bool keep;
+        ~Cleanup() { if(!keep) { std::error_code ignored; std::filesystem::remove_all(path,ignored); } }
+    } cleanup{outdir,keep_work_};
+    const auto stp_path=std::filesystem::absolute(std::filesystem::path(stp_root_)/file).string();
+    common::ProcessOptions options;
+    options.executable=std::filesystem::absolute(program_exe_).string();
+    options.arguments=program_args_;
+    options.working_directory=outdir.string();
+    options.timeout=std::chrono::milliseconds(process_timeout_ms_);
+    for (auto& argument : options.arguments)
+        argument = ExpandArgumentTemplate(argument, stp_path, outdir.string(), file, run_id);
+    const auto process=common::ProcessRunner::run(options,cancellation);
+    if(!process.started || process.exit_code!=0 || process.cancelled || process.timed_out) {
+        output->detail=process.cancelled?"cancelled":process.timed_out?"process timed out":
+            "converter failed: "+std::to_string(process.exit_code)+" "+process.error;
         return false;
     }
-
-    const std::string stp_path = common::NormalizePath(stp_root_ + "/" + file);
-    const std::string cmd =
-        BuildProgramCommand(program_cmd_, program_exe_, stp_path, outdir.string(),
-                            file, run_id);
-    const int exit_code = common::RunCommand(cmd);
-    if (exit_code != 0) {
-        if (detail != nullptr) {
-            *detail = "program exit=" + std::to_string(exit_code);
-        }
-        LOG_WARN("stp_compare plugin: program exit=" << exit_code << " for " << file);
-        cleanup();
-        return false;
+    if(!common::ReadCompleteFile(outdir/info_file_,&output->info_txt) ||
+       !common::ReadCompleteFile(outdir/info_new_file_,&output->info_new_txt)) {
+        output->detail="missing converter output"; return false;
     }
-
-    const std::string info_path = (outdir / info_file_).string();
-    const std::string info_new_path = (outdir / info_new_file_).string();
-    if (!common::ReadTextFile(info_path, info_txt)) {
-        if (detail != nullptr) {
-            *detail = "missing " + info_file_;
-        }
-        LOG_WARN("stp_compare plugin: missing " << info_path << " for " << file);
-        cleanup();
-        return false;
-    }
-    if (!common::ReadTextFile(info_new_path, info_new_txt)) {
-        if (detail != nullptr) {
-            *detail = "missing " + info_new_file_;
-        }
-        LOG_WARN("stp_compare plugin: missing " << info_new_path << " for " << file);
-        cleanup();
-        return false;
-    }
-    cleanup();
     return true;
 }
 
 bool ClientPlugin::execute(const common::Task& task, common::TaskResult& result) {
-    stpcompare::StpCompareTask stp_task;
-    if (!stp_task.ParseFromString(task.payload())) {
-        result.set_exit_code(-1);
-        return false;
-    }
-
-    stpcompare::StpCompareResult stp_result;
-    for (const std::string& file : stp_task.files()) {
-        stpcompare::FileOutcome outcome;
-        outcome.set_file(file);
-
-        std::string info_txt;
-        std::string info_new_txt;
-        std::string detail;
-        bool ok = false;
-        if (dry_run_) {
-            ok = true;
-            info_txt = "dry-run file=" + file + "\n";
-            info_new_txt = "dry-run file=" + file + " (converted)\n";
-            if (dry_run_delay_ms_ > 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(dry_run_delay_ms_));
-            }
-        } else {
-            ok = RunOneFile(stp_task.run_id(), file, &info_txt, &info_new_txt, &detail);
-        }
-        if (ok) {
-            if (!store_->saveFileResult(stp_task.run_id(), file, info_txt, info_new_txt)) {
-                ok = false;
-                detail = "failed to save to store";
-            }
-        }
-
-        outcome.set_ok(ok);
-        outcome.set_detail(detail);
-        LOG_INFO("stp_compare plugin: file " << file << (ok ? " ok" : " failed")
-                                             << (detail.empty() ? "" : (" (" + detail + ")")));
-        *stp_result.add_files() = outcome;
-    }
-
-    if (!stp_result.SerializeToString(result.mutable_result())) {
-        LOG_ERROR("stp_compare plugin: failed to serialize task result " << task.task_id());
-        result.set_exit_code(-1);
-        return false;
-    }
-    result.set_exit_code(0);
-    return true;
+    return execute(task,result,common::CancellationToken{});
 }
-
+bool ClientPlugin::execute(const common::Task& task, common::TaskResult& result,
+                           const common::CancellationToken& cancellation) {
+    if (cancellation.isCancellationRequested()) {
+        result.set_exit_code(-2);
+        return false;
+    }
+    StpCompareTask payload;
+    if(!payload.ParseFromString(task.payload()) ||
+       (!task.run_id().empty() && task.run_id()!=payload.run_id())) {
+        result.set_exit_code(-1); return false;
+    }
+    StpCompareResult summary; bool all_ok=true,all_persisted=true;
+    for(const auto& file:payload.files()) {
+        if(cancellation.isCancellationRequested()) { result.set_exit_code(-2); return false; }
+        FileResult output;
+        output.run_id=payload.run_id(); output.file=file; output.attempt_id=task.attempt_id();
+        if(dry_run_) {
+            if(cancellation.waitFor(std::chrono::milliseconds(dry_run_delay_ms_))) {
+                result.set_exit_code(-2); return false;
+            }
+            output.successful=true;
+            output.info_txt="dry-run file="+file+"\n";
+            output.info_new_txt="dry-run file="+file+" (converted)\n";
+        } else output.successful=RunOneFile(payload.run_id(),file,&output,cancellation);
+        if(cancellation.isCancellationRequested()) { result.set_exit_code(-2); return false; }
+        if(!store_->publish(output)) {
+            output.successful=false; all_persisted=false;
+            output.detail="failed to publish raw execution result";
+        }
+        auto* entry=summary.add_files(); entry->set_file(file);
+        entry->set_ok(output.successful); entry->set_detail(output.detail);
+        all_ok=all_ok && output.successful;
+        LOG_INFO("stpcompare: file "<<file<<(output.successful?" ok":" failed")<<" "<<output.detail);
+    }
+    if(!summary.SerializeToString(result.mutable_result())) { result.set_exit_code(-1); return false; }
+    result.set_exit_code(all_persisted?(all_ok?0:1):-1);
+    return all_persisted;
+}
 }  // namespace stpcompare

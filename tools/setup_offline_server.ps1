@@ -51,6 +51,7 @@ param(
     [switch]$StartScheduler
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'ToolSupport.ps1')
 
 if (-not $DeployConfig) {
     $DeployConfig = Join-Path $PSScriptRoot 'offline_deploy.json'
@@ -90,9 +91,7 @@ function Get-LocalIPv4 {
 }
 
 function Build-DbConn([string]$HostName, [int]$Port, [string]$Db, [string]$User, [string]$Password) {
-    $conn = "host=$HostName port=$Port dbname=$Db user=$User"
-    if ($Password) { $conn += " password=$Password" }
-    return $conn
+    return New-PostgresConnection $HostName $Port $Db $User $Password
 }
 
 $buildConfig = if ($Config) { $Config } else { [string](Get-DeployValue 'build_config' 'Debug') }
@@ -120,6 +119,7 @@ $taskThreads = [int](Get-DeployValue 'task_threads' 2)
 $taskSize = [int](Get-DeployValue 'task_size' 25)
 $storeCov = [bool](Get-DeployValue 'store_cov' $true)
 
+if (-not $serverIp) { $serverIp = [string](Get-DeployValue 'server_ip' '') }
 if (-not $serverIp) {
     $candidateIps = @(Get-LocalIPv4)
     $serverIp = $candidateIps[0]
@@ -177,6 +177,7 @@ if (-not $SkipDataset) {
         throw "dataset source not found: $datasetDir"
     }
     if (Test-Path $datasetStage) {
+        Assert-OwnedPath $datasetStage $runtimeDir | Out-Null
         Remove-Item -LiteralPath $datasetStage -Recurse -Force
     }
     New-Item -ItemType Directory -Force -Path $datasetStage | Out-Null
@@ -215,18 +216,24 @@ if (-not (Test-Path $schedTemplate)) {
 $sched = Get-Content -Raw $schedTemplate | ConvertFrom-Json
 $localConn = Build-DbConn '127.0.0.1' $dbPort $dbName $dbUser $dbPassword
 $sched.server.db_conn = $localConn
+$sched.server.router_endpoint = "tcp://*:$serverPort"
 $sched.plugins.coverage.db_conn = $localConn
 $sched.plugins.coverage.stp_manifest = ($datasetStage + '/manifest.txt').Replace('\', '/')
 $sched.plugins.coverage.expected_program_version = [string]$programVersion
 $sched.plugins.coverage.expected_dataset_version = [string]$datasetVersion
 $sched.plugins.coverage.task_size = $taskSize
+foreach ($pluginName in @('coverage', 'stpcompare')) {
+    $pluginConfig = $sched.plugins.$pluginName
+    $pluginConfig.db_conn = $localConn
+    $pluginConfig.stp_manifest = ($datasetStage + '/manifest.txt').Replace('\', '/')
+    $pluginConfig.task_size = $taskSize
+    $pluginConfig | Add-Member -NotePropertyName expected_program_version -NotePropertyValue ([string]$programVersion) -Force
+    $pluginConfig | Add-Member -NotePropertyName expected_dataset_version -NotePropertyValue ([string]$datasetVersion) -Force
+}
 $outCfgDir = Join-Path $binDir 'config'
 New-Item -ItemType Directory -Force -Path $outCfgDir | Out-Null
 $outCfg = Join-Path $outCfgDir 'scheduler.json'
-[System.IO.File]::WriteAllText(
-    $outCfg,
-    ($sched | ConvertTo-Json -Depth 10),
-    (New-Object System.Text.UTF8Encoding($false)))
+Write-AtomicText $outCfg ($sched | ConvertTo-Json -Depth 10)
 Write-Host "Scheduler config written: $outCfg"
 
 Write-Host ''

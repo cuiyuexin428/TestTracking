@@ -1,45 +1,35 @@
-# Post-processes a stpcompare run. The server only dispatches tasks; each
-# client writes per-file info.txt / info_new.txt into the configured data table
-# (the client config key "table"). This script reads those rows for a run and
-# produces a comparison report: how many files differ between the two outputs
-# and which ones. Run it manually after a run finishes.
-param(
-    [string]$RunId = '',
-    [string]$Table = 'stp_compare_old',
-    [string]$DbConn = 'host=127.0.0.1 port=5432 dbname=testtracking user=postgres',
-    [string]$Psql = 'C:\WorkSpace\ThirdParty\pgsql\bin\psql.exe',
-    [string]$OutFile = 'stpcompare_report.txt'
+# Compare stpcompare outputs using durable run metadata and report incomplete files.
+param([string]$RunId='', [string]$Table='stp_compare_old', [string]$DbConn='host=127.0.0.1 port=5432 dbname=testtracking user=postgres', [string]$Psql='', [string]$OutFile='stpcompare_report.txt')
+$ErrorActionPreference='Stop'; . (Join-Path $PSScriptRoot 'ToolSupport.ps1'); $Psql=Resolve-ProjectPsql $Psql
+if($Table -notmatch '^[a-zA-Z_][a-zA-Z0-9_]*$'){throw 'Table must be a plain PostgreSQL table identifier'}
+if(-not $RunId){$RunId=((Invoke-ProjectSql $Psql $DbConn "SELECT run_id FROM plugin_runs WHERE plugin_type='stpcompare' AND status='finished' ORDER BY finished_at DESC,run_id DESC LIMIT 1;") -join "`n").Trim()}
+if(-not $RunId){throw 'No completed stpcompare run found; pass -RunId'}
+$sql=@'
+WITH run AS (
+ SELECT expected_files,status FROM plugin_runs WHERE run_id=:'run_id' AND plugin_type='stpcompare'
+), files AS (
+ SELECT f.file,o.status,o.detail,
+ CASE WHEN o.status IS DISTINCT FROM 'success' OR r.file IS NULL OR r.info_txt IS NULL OR r.info_new_txt IS NULL THEN 'incomplete'
+      WHEN r.info_txt IS DISTINCT FROM r.info_new_txt THEN 'different' ELSE 'same' END AS comparison
+ FROM plugin_run_files f
+ LEFT JOIN plugin_file_outcomes o ON (o.run_id,o.plugin_type,o.file)=(f.run_id,f.plugin_type,f.file)
+ LEFT JOIN :"result_table" r ON (r.run_id,r.file)=(f.run_id,f.file)
+ WHERE f.run_id=:'run_id' AND f.plugin_type='stpcompare'
 )
-$ErrorActionPreference = 'Stop'
-
-if (-not $RunId) {
-    $RunId = (& $Psql $DbConn -c "SELECT run_id FROM stp_compare_checkpoints ORDER BY updated_at DESC LIMIT 1;" -t -A 2>$null).Trim()
-}
-if (-not $RunId) {
-    throw 'No stpcompare run found; pass -RunId <run_id>'
-}
-
-$total = (& $Psql $DbConn -t -A -c "SELECT count(*) FROM $Table WHERE run_id='$RunId';" 2>$null).Trim()
-if (-not $total -or $total -eq '0') {
-    Write-Host "no results for run=$RunId in table $Table"
-    exit 0
-}
-$different = (& $Psql $DbConn -t -A -c "SELECT count(*) FROM $Table WHERE run_id='$RunId' AND info_txt IS DISTINCT FROM info_new_txt;" 2>$null).Trim()
-$same = [int]$total - [int]$different
-
-Write-Host "stpcompare run=$RunId table=$Table total=$total different=$different same=$same"
-
-# Report the differing files.
-$diffFiles = & $Psql $DbConn -t -A -c "SELECT file FROM $Table WHERE run_id='$RunId' AND info_txt IS DISTINCT FROM info_new_txt ORDER BY file;" 2>$null
-if ($diffFiles) {
-    $diffFiles | Set-Content -Path $OutFile -Encoding UTF8
-    Write-Host "differing files written: $OutFile"
-} else {
-    Write-Host "no differing files"
-}
-
-# A detection-heavy run: flag if any file is missing one of the two outputs.
-$missing = (& $Psql $DbConn -t -A -c "SELECT count(*) FROM $Table WHERE run_id='$RunId' AND (info_txt IS NULL OR info_new_txt IS NULL);" 2>$null).Trim()
-if ($missing -and [int]$missing -gt 0) {
-    Write-Host "WARN: $missing rows with a missing output"
-}
+SELECT json_build_object('run',(SELECT row_to_json(run) FROM run),
+ 'files',COALESCE((SELECT json_agg(files ORDER BY file) FROM files),'[]'::json));
+'@
+$json=(@(Invoke-ProjectSql $Psql $DbConn $sql @{run_id=$RunId;result_table=$Table}) -join "`n")|ConvertFrom-Json
+if(-not $json.run){throw "No durable manifest for run=$RunId; legacy runs must be restored before comparison"}
+$files=@($json.files)
+$missingManifest=[long]$json.run.expected_files-$files.Count
+$incomplete=@($files|Where-Object {$_.comparison -eq 'incomplete'})
+$different=@($files|Where-Object {$_.comparison -eq 'different'})
+$same=@($files|Where-Object {$_.comparison -eq 'same'})
+$lines=@("run=$RunId table=$Table expected=$($json.run.expected_files) same=$($same.Count) different=$($different.Count) incomplete=$($incomplete.Count) missing_manifest=$missingManifest")
+$lines+=@($different|ForEach-Object {"different`t$($_.file)"})
+$lines+=@($incomplete|ForEach-Object {"incomplete`t$($_.file)`t$($_.status)`t$($_.detail)"})
+Write-AtomicText $OutFile (($lines -join "`n")+"`n")
+Write-Host $lines[0]
+Write-Host "comparison report written: $OutFile"
+if($json.run.status -ne 'finished' -or $missingManifest -ne 0 -or $incomplete.Count -gt 0){throw 'Comparison is incomplete; the report includes missing/failed files'}

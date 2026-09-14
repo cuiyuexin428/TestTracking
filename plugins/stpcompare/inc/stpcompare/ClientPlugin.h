@@ -21,24 +21,27 @@ public:
     common::RegisterOutcome handleValidationReply(const std::string& reply_payload) override;
     std::string heartbeatInfo() const override;
     bool execute(const common::Task& task, common::TaskResult& result) override;
+    bool execute(const common::Task& task, common::TaskResult& result,
+                 const common::CancellationToken& cancellation) override;
 
 private:
     // Runs the converter once for one stp file and fills the two txt outputs.
     // Returns true on success (both txt produced); on failure fills detail.
     bool RunOneFile(const std::string& run_id, const std::string& file,
-                    std::string* info_txt, std::string* info_new_txt,
-                    std::string* detail);
+                    FileResult* output, const common::CancellationToken& cancellation);
 
     std::unique_ptr<StpResultStore> store_;
     bool dry_run_ = true;
     std::string stp_root_;
     std::string program_exe_;
     std::string program_cmd_;
+    std::vector<std::string> program_args_;
     std::string info_file_;
     std::string info_new_file_;
     std::string work_base_;
     bool keep_work_ = false;
     int dry_run_delay_ms_ = 0;
+    int process_timeout_ms_ = 300000;
 
     // Component versions read from version.txt files in the package.
     std::string program_version_;

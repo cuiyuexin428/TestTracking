@@ -1,199 +1,442 @@
 #include "scheduler/Scheduler.h"
 
-#include "common/Logger.h"
-
 #include <algorithm>
-#include <chrono>
-#include <cstdio>
 #include <stdexcept>
-#include <string>
 #include <unordered_set>
 #include <utility>
-#include <vector>
+
+#include "common/Logger.h"
 
 namespace scheduler {
-
 namespace {
-
-class ProcessResultEvent : public common::Event {
-public:
-    explicit ProcessResultEvent(common::TaskPlugin* plugin, common::TaskResult result)
-        : plugin_(plugin), result_(std::move(result)) {
-    }
-
-    void execute() override {
-        try {
-            plugin_->processResult(result_);
-        } catch (const std::exception& e) {
-            LOG_ERROR("plugin " << plugin_->pluginType() << ": processResult threw: " << e.what());
-        } catch (...) {
-            LOG_ERROR("plugin " << plugin_->pluginType()
-                               << ": processResult threw unknown exception");
-        }
-    }
-
-private:
-    common::TaskPlugin* plugin_;
-    common::TaskResult result_;
-};
-
 std::string GenerateRunId() {
-    const auto now = std::chrono::system_clock::now();
-    return "run-" + std::to_string(now.time_since_epoch().count());
+    return "run-" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
 }
 
-std::string GenerateSessionId() {
-    static std::atomic<unsigned long long> sequence{0};
-    const auto now = std::chrono::steady_clock::now();
-    return "session-" + std::to_string(now.time_since_epoch().count()) + "-" +
-           std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
+void CancelAfterRecoveryFailure(common::TaskPlugin* plugin, const std::string& run_id) {
+    try {
+        plugin->cancel();
+    } catch (const std::exception& error) {
+        LOG_ERROR("recovery: cancel threw for run " << run_id << ": " << error.what());
+    } catch (...) {
+        LOG_ERROR("recovery: cancel threw unknown exception for run " << run_id);
+    }
 }
-
 }  // namespace
 
 Scheduler::Scheduler(common::Config& config)
     : config_(config),
       server_(config.get("server.router_endpoint", std::string("tcp://*:5555")),
               std::chrono::milliseconds(config.get("server.poll_timeout_ms", 50))) {
+    server_.onHeartbeat([this](const IncomingMessage& msg) { HandleHeartbeat(msg); });
 }
-
 Scheduler::~Scheduler() {
     stop();
 }
 
 void Scheduler::start() {
-    if (!LoadPlugins()) {
-        throw std::runtime_error("Scheduler: plugin loading failed");
-    }
-    const std::string db_conn = config_.get("server.db_conn", std::string());
-    if (!db_conn.empty()) {
-        if (!storage_.init(db_conn)) {
-            throw std::runtime_error("Scheduler: storage init failed");
-        }
-        // Try to resume runs left running/stopped by a previous process;
-        // runs that cannot be restored are marked interrupted.
-        std::unordered_set<std::string> restored_plugins;
-        for (const Storage::RunRecord& run : storage_.LoadUnfinishedRuns()) {
-            const auto pit = plugins_by_type_.find(run.plugin_type);
-            if (pit == plugins_by_type_.end()) {
-                LOG_WARN("storage: run " << run.run_id << " plugin_type=" << run.plugin_type
-                                         << " has no loaded plugin, marked interrupted");
-                storage_.FinishRun(run.run_id, "interrupted");
-                continue;
-            }
-            if (!restored_plugins.insert(run.plugin_type).second) {
-                LOG_WARN("storage: run " << run.run_id << " skipped, plugin "
-                                         << run.plugin_type << " already restored");
-                storage_.FinishRun(run.run_id, "interrupted");
-                continue;
-            }
-            bool restored = false;
-            try {
-                restored = pit->second->restore(run.run_id);
-            } catch (const std::exception& e) {
-                LOG_ERROR("plugin " << run.plugin_type << ": restore threw: " << e.what());
-            } catch (...) {
-                LOG_ERROR("plugin " << run.plugin_type
-                                    << ": restore threw unknown exception");
-            }
-            if (restored) {
-                storage_.ResumeRun(run.run_id);
-                active_runs_[pit->second] = {run.run_id, run.plugin_type};
-                active_run_count_.fetch_add(1, std::memory_order_relaxed);
-                LOG_INFO("run restored: " << run.run_id
-                                          << " plugin_type=" << run.plugin_type);
-            } else {
-                LOG_WARN("storage: run " << run.run_id
-                                         << " cannot be restored, marked interrupted");
-                storage_.FinishRun(run.run_id, "interrupted");
-            }
-        }
+    if (!LoadPlugins()) throw std::runtime_error("Scheduler: plugin loading failed");
+    const auto connection = config_.get("server.db_conn", std::string());
+    if (!connection.empty()) {
+        if (!storage_.init(connection)) throw std::runtime_error("Scheduler: storage init failed");
+        RestoreRuns();
     }
     server_.start();
-    const int process_threads = config_.get("server.process_threads", 4);
-    event_manager_ = std::make_unique<common::EventManager>(process_threads);
     running_.store(true);
+    accepting_.store(true);
     processing_ = std::thread(&Scheduler::RunProcessing, this);
 }
 
-void Scheduler::stop() {
-    if (!running_.exchange(false)) {
-        return;
+void Scheduler::RestoreRuns() {
+    std::vector<Storage::RunRecord> runs;
+    if (!storage_.LoadUnfinishedRuns(runs)) {
+        throw std::runtime_error("Scheduler: failed to load unfinished runs");
     }
-    server_.stop();
-    if (processing_.joinable()) {
-        processing_.join();
-    }
-    // Join result-processing workers. Events still queued are dropped by
-    // design: a stopped scheduler means "work resumes next run".
-    event_manager_.reset();
-    plugins_.clear();
-}
-
-bool Scheduler::createRun(const std::string& plugin_type, const std::string& dataset_version,
-                          const std::string& params) {
-    commands_.push({plugin_type, dataset_version, params});
-    return true;
-}
-
-bool Scheduler::stopRun(const std::string& plugin_type) {
-    stop_commands_.push({plugin_type});
-    return true;
-}
-
-void Scheduler::wakeupClients(const std::string& plugin_type) {
-    std::vector<std::pair<std::string, std::string>> clients_to_wake;
-    {
-        std::lock_guard<std::mutex> lock(clients_mutex_);
-        for (const auto& entry : clients_) {
-            if (plugin_type.empty() || entry.second.info.plugin_type == plugin_type) {
-                clients_to_wake.emplace_back(entry.first, entry.second.session_id);
-            }
+    const auto abort_recovery = [this](const std::string& message) -> void {
+        for (const auto& active : active_runs_) {
+            CancelAfterRecoveryFailure(active.first, active.second.run_id);
         }
+        active_runs_.clear();
+        active_run_count_.store(0);
+        throw std::runtime_error(message);
+    };
+    // A run whose plugin state cannot be read must never block an older
+    // resumable run. Closing it is part of recovery and therefore must persist
+    // before startup can continue.
+    const auto mark_interrupted = [this, &abort_recovery](const std::string& run_id) {
+        if (!storage_.FinishRun(run_id, "interrupted")) {
+            abort_recovery("Scheduler: cannot mark unrecoverable run " + run_id +
+                           " interrupted");
+        }
+    };
+    std::unordered_set<std::string> restored;
+    for (const auto& run : runs) {
+        const auto plugin = plugins_by_type_.find(run.plugin_type);
+        if (plugin == plugins_by_type_.end()) {
+            // The plugin may simply be disabled in this configuration, so keep
+            // the recovery index rather than discarding a resumable run.
+            LOG_WARN("recovery: no resumable plugin for run " << run.run_id
+                                                              << " plugin_type=" << run.plugin_type
+                                                              << "; retained for a later start");
+            continue;
+        }
+        if (restored.count(run.plugin_type) != 0) continue;
+        bool plugin_restored = false;
+        try {
+            plugin_restored = plugin->second->restore(run.run_id);
+        } catch (const std::exception& e) {
+            LOG_ERROR("recovery: restore threw for run " << run.run_id << ": " << e.what());
+        } catch (...) {
+            LOG_ERROR("recovery: restore threw unknown exception for run " << run.run_id);
+        }
+        if (!plugin_restored) {
+            LOG_ERROR("recovery: cannot restore run " << run.run_id << "; closing as interrupted");
+            CancelAfterRecoveryFailure(plugin->second, run.run_id);
+            mark_interrupted(run.run_id);
+            continue;
+        }
+        // processResult() durably writes the plugin completion before the framework task row.
+        // A crash between those commits is repaired from the completion journal before the run
+        // becomes active again.
+        if (!storage_.ReconcileCompletedTasks(run.run_id, run.plugin_type)) {
+            CancelAfterRecoveryFailure(plugin->second, run.run_id);
+            abort_recovery("Scheduler: cannot reconcile completed tasks for run " + run.run_id);
+        }
+        if (!storage_.ResumeRun(run.run_id)) {
+            CancelAfterRecoveryFailure(plugin->second, run.run_id);
+            abort_recovery("Scheduler: cannot persist resume for run " + run.run_id);
+        }
+        active_runs_[plugin->second] = {run.run_id, run.plugin_type, false};
+        restored.insert(run.plugin_type);
+        LOG_INFO("run restored: " << run.run_id << " plugin_type=" << run.plugin_type);
     }
-    common::Envelope env;
-    env.set_type(common::WAKE);
-    if (!plugin_type.empty()) {
-        env.set_plugin_type(plugin_type);
+    active_run_count_.store(active_runs_.size());
+}
+
+bool Scheduler::Submit(ControlCommand command) {
+    std::future<bool> result;
+    {
+        std::lock_guard<std::mutex> lock(submit_mutex_);
+        if (!accepting_.load()) return false;
+        if (command.kind == ControlCommand::Kind::Shutdown) accepting_.store(false);
+        command.completion = std::make_shared<std::promise<bool>>();
+        result = command.completion->get_future();
+        commands_.push(std::move(command));
     }
-    for (const auto& client : clients_to_wake) {
-        env.set_session_id(client.second);
-        server_.sendTo(client.first, env);
-        LOG_INFO("wakeup sent to " << client.first);
-    }
+    return result.get();
+}
+
+void Scheduler::stop() {
+    if (accepting_.load()) Submit({ControlCommand::Kind::Shutdown, {}, {}, {}, {}});
+    if (processing_.joinable()) processing_.join();
+    server_.stop();
+}
+bool Scheduler::createRun(const std::string& plugin, const std::string& dataset,
+                          const std::string& params) {
+    return Submit({ControlCommand::Kind::Run, plugin, dataset, params, {}});
+}
+bool Scheduler::stopRun(const std::string& plugin) {
+    return Submit({ControlCommand::Kind::Stop, plugin, {}, {}, {}});
+}
+bool Scheduler::wakeupClients(const std::string& plugin) {
+    return Submit({ControlCommand::Kind::Wake, plugin, {}, {}, {}});
 }
 
 std::vector<common::ClientInfo> Scheduler::clients() const {
     std::lock_guard<std::mutex> lock(clients_mutex_);
-    std::vector<common::ClientInfo> out;
-    out.reserve(clients_.size());
-    const auto now = std::chrono::steady_clock::now();
-    for (const auto& entry : clients_) {
-        common::ClientInfo info = entry.second.info;
+    std::vector<common::ClientInfo> result;
+    for (const auto& pair : clients_) {
+        auto info = pair.second.info;
         info.last_seen_age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    now - entry.second.last_seen)
+                                    Clock::now() - pair.second.last_seen)
                                     .count();
-        info.registered = entry.second.registered_plugins.count(entry.second.info.plugin_type) > 0;
-        out.push_back(std::move(info));
+        result.push_back(std::move(info));
     }
-    return out;
+    return result;
 }
-
 size_t Scheduler::pluginCount() const {
     return plugins_by_type_.size();
 }
-
 size_t Scheduler::inFlightCount() const {
-    std::lock_guard<std::mutex> lock(in_flight_mutex_);
-    return in_flight_.size();
+    return in_flight_count_.load();
+}
+std::vector<std::string> Scheduler::pluginTypes() const {
+    std::vector<std::string> types;
+    for (const auto& pair : plugins_by_type_) types.push_back(pair.first);
+    return types;
 }
 
-std::vector<std::string> Scheduler::pluginTypes() const {
-    std::vector<std::string> out;
-    for (const auto& entry : plugins_by_type_) {
-        out.push_back(entry.first);
+void Scheduler::RunProcessing() {
+    auto last_check = Clock::now();
+    while (running_.load()) {
+        ControlCommand command;
+        if (commands_.pop(command, std::chrono::milliseconds(0))) {
+            bool ok = false;
+            try {
+                ok = HandleCommand(command);
+            } catch (const std::exception& e) {
+                LOG_ERROR("command failed: " << e.what());
+            } catch (...) {
+                LOG_ERROR("command failed: unknown exception");
+            }
+            if (command.kind == ControlCommand::Kind::Shutdown) running_.store(false);
+            command.completion->set_value(ok);
+            continue;
+        }
+        try {
+            IncomingMessage msg;
+            if (server_.tryRecv(msg, std::chrono::milliseconds(20))) HandleMessage(msg);
+            if (Clock::now() - last_check >= std::chrono::milliseconds(200)) {
+                last_check = Clock::now();
+                RunTimeoutChecks();
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR("scheduler operation failed; retained state for retry: " << e.what());
+        } catch (...) {
+            LOG_ERROR("scheduler operation failed");
+        }
     }
-    return out;
+}
+
+bool Scheduler::HandleCommand(const ControlCommand& command) {
+    switch (command.kind) {
+        case ControlCommand::Kind::Run:
+            return HandleCreateRun(command);
+        case ControlCommand::Kind::Stop:
+            return HandleStopRun(command.plugin_type);
+        case ControlCommand::Kind::Wake:
+            SendWake(command.plugin_type);
+            return true;
+        case ControlCommand::Kind::Shutdown: {
+            bool ok = true;
+            for (const auto& type : pluginTypes()) {
+                if (active_runs_.count(plugins_by_type_.at(type))) ok = HandleStopRun(type) && ok;
+            }
+            if (!ok) LOG_WARN("shutdown: incomplete persistence retained for recovery");
+            return ok;
+        }
+    }
+    return false;
+}
+
+bool Scheduler::HandleCreateRun(const ControlCommand& command) {
+    const auto found = plugins_by_type_.find(command.plugin_type);
+    if (found == plugins_by_type_.end()) {
+        LOG_ERROR("createRun: no plugin for plugin_type " << command.plugin_type);
+        return false;
+    }
+    auto* plugin = found->second;
+    if (active_runs_.count(plugin) && !CommitFinished(plugin)) {
+        LOG_ERROR("createRun: run already active for plugin_type " << command.plugin_type);
+        return false;
+    }
+    common::RunRequest request{GenerateRunId(), command.dataset_version, command.params};
+    // Persist the recovery index before creating plugin state or dispatching.
+    if (storage_.enabled() && !storage_.SaveRun(request.run_id, command.plugin_type,
+                                                request.dataset_version, request.params)) {
+        LOG_ERROR("createRun: SaveRun failed; no task dispatched");
+        return false;
+    }
+    bool planned = false;
+    try {
+        planned = plugin->plan(request, clients());
+    } catch (const std::exception& e) {
+        LOG_ERROR("createRun: plan threw for " << command.plugin_type << ": " << e.what());
+    } catch (...) {
+        LOG_ERROR("createRun: plan threw for " << command.plugin_type << ": unknown exception");
+    }
+    if (!planned) {
+        // Leave a terminal status so recovery never retries a run whose plan was
+        // never persisted; the recovery path closes any row this write misses.
+        if (storage_.enabled() && !storage_.FinishRun(request.run_id, "failed")) {
+            LOG_ERROR("createRun: cannot mark run " << request.run_id
+                                                    << " failed; recovery will close it as "
+                                                       "interrupted on the next start");
+        }
+        try {
+            plugin->cancel();
+        } catch (const std::exception& e) {
+            LOG_ERROR("createRun: cancel after plan failure threw for " << command.plugin_type
+                                                                        << ": " << e.what());
+        } catch (...) {
+            LOG_ERROR("createRun: cancel after plan failure threw for " << command.plugin_type
+                                                                        << ": unknown exception");
+        }
+        LOG_ERROR("createRun: plan failed for " << command.plugin_type);
+        return false;
+    }
+    if (storage_.enabled() && !storage_.ActivateRun(request.run_id, command.plugin_type)) {
+        LOG_ERROR("createRun: cannot activate run " << request.run_id << "; no task dispatched");
+        if (!storage_.FinishRun(request.run_id, "failed")) {
+            LOG_ERROR("createRun: cannot mark unactivated run " << request.run_id
+                                                                << " failed; recovery will close "
+                                                                   "a planning row on the next "
+                                                                   "start");
+        }
+        try {
+            plugin->cancel();
+        } catch (const std::exception& e) {
+            LOG_ERROR("createRun: cancel after activation failure threw for "
+                      << command.plugin_type << ": " << e.what());
+        } catch (...) {
+            LOG_ERROR("createRun: cancel after activation failure threw for "
+                      << command.plugin_type << ": unknown exception");
+        }
+        return false;
+    }
+    active_runs_[plugin] = {request.run_id, command.plugin_type, false};
+    active_run_count_.store(active_runs_.size());
+    LOG_INFO("run started: " << request.run_id << " plugin_type=" << command.plugin_type);
+    return true;
+}
+
+void Scheduler::SendWake(const std::string& plugin_type) {
+    std::vector<std::pair<std::string, std::string>> peers;
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex_);
+        for (const auto& pair : clients_) {
+            if (plugin_type.empty() || pair.second.info.plugin_type == plugin_type)
+                peers.emplace_back(pair.first, pair.second.session_id);
+        }
+    }
+    for (const auto& peer : peers) {
+        common::Envelope env;
+        env.set_type(common::WAKE);
+        env.set_plugin_type(plugin_type);
+        env.set_session_id(peer.second);
+        env.mutable_wake();
+        server_.sendTo(peer.first, env);
+        LOG_INFO("wakeup sent to " << peer.first);
+    }
+}
+
+bool Scheduler::HandleStopRun(const std::string& type) {
+    const auto found = plugins_by_type_.find(type);
+    if (found == plugins_by_type_.end()) return false;
+    auto run = active_runs_.find(found->second);
+    if (run == active_runs_.end()) return true;
+    run->second.stopping = true;
+    std::vector<std::pair<std::string, std::string>> peers;
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex_);
+        for (const auto& pair : clients_) {
+            if (pair.second.info.plugin_type == type)
+                peers.emplace_back(pair.first, pair.second.session_id);
+        }
+    }
+    for (const auto& peer : peers) {
+        common::Envelope env;
+        env.set_type(common::STOP);
+        env.set_plugin_type(type);
+        env.set_session_id(peer.second);
+        env.mutable_stop()->set_run_id(run->second.run_id);
+        env.mutable_stop()->set_reason("manual stop");
+        server_.sendTo(peer.first, env);
+        ReclaimClientTasks(peer.first, peer.second);
+    }
+    return CommitStop(found->second);
+}
+
+bool Scheduler::CommitStop(common::TaskPlugin* plugin) {
+    const auto run = active_runs_.find(plugin);
+    if (run == active_runs_.end()) return true;
+    if (HasInFlight(run->second.run_id) || !plugin->saveCheckpoint(run->second.run_id))
+        return false;
+    if (storage_.enabled() && !storage_.FinishRun(run->second.run_id, "stopped")) return false;
+    plugin->cancel();
+    LOG_INFO("run stopped: " << run->second.run_id << " plugin_type=" << run->second.plugin_type);
+    active_runs_.erase(run);
+    active_run_count_.store(active_runs_.size());
+    return true;
+}
+
+bool Scheduler::HasInFlight(const std::string& run) const {
+    for (const auto& pair : in_flight_)
+        if (pair.second.run_id == run) return true;
+    return false;
+}
+bool Scheduler::CommitFinished(common::TaskPlugin* plugin) {
+    const auto run = active_runs_.find(plugin);
+    if (run == active_runs_.end()) return true;
+    if (run->second.stopping || HasInFlight(run->second.run_id) || !plugin->runFinished())
+        return false;
+    if (storage_.enabled() && !storage_.FinishRun(run->second.run_id, "finished")) return false;
+    LOG_INFO("run finished: " << run->second.run_id << " plugin_type=" << run->second.plugin_type);
+    active_runs_.erase(run);
+    active_run_count_.store(active_runs_.size());
+    return true;
+}
+
+void Scheduler::ReclaimTasks(const std::vector<std::string>& ids) {
+    std::unordered_map<std::string, std::vector<std::string>> groups;
+    for (const auto& id : ids) {
+        const auto found = in_flight_.find(id);
+        if (found == in_flight_.end() || found->second.received) continue;
+        groups[found->second.plugin_type].push_back(id);
+    }
+    for (const auto& group : groups) {
+        // Required reclaim persistence must precede re-dispatch.
+        if (storage_.enabled() && !storage_.ReclaimTasks(group.second)) continue;
+        plugins_by_type_.at(group.first)->requeue(group.second);
+        for (const auto& id : group.second) in_flight_.erase(id);
+    }
+    in_flight_count_.store(in_flight_.size());
+}
+void Scheduler::ReclaimClientTasks(const std::string& identity, const std::string& session) {
+    std::vector<std::string> ids;
+    for (const auto& pair : in_flight_)
+        if (pair.second.identity == identity && pair.second.session_id == session)
+            ids.push_back(pair.first);
+    ReclaimTasks(ids);
+}
+
+void Scheduler::RunTimeoutChecks() {
+    std::vector<std::string> received;
+    for (const auto& pair : in_flight_)
+        if (pair.second.received) received.push_back(pair.first);
+    for (const auto& id : received) CommitReport(id);
+
+    const int timeout = config_.get("server.client_timeout_ms", 0);
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex_);
+        for (auto it = clients_.begin(); it != clients_.end();) {
+            if (timeout > 0 &&
+                Clock::now() - it->second.last_seen > std::chrono::milliseconds(timeout)) {
+                LOG_WARN("client offline: " << it->first);
+                it = clients_.erase(it);
+            } else
+                ++it;
+        }
+    }
+    std::vector<std::string> expired;
+    const int lease = config_.get("server.task_lease_timeout_ms", 0);
+    const int receipt_timeout = config_.get("server.task_ack_timeout_ms", 10000);
+    for (const auto& pair : in_flight_) {
+        const auto& task = pair.second;
+        bool offline;
+        {
+            std::lock_guard<std::mutex> lock(clients_mutex_);
+            const auto peer = clients_.find(task.identity);
+            offline = peer == clients_.end() || peer->second.session_id != task.session_id;
+        }
+        const auto age =
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - task.sent_at)
+                .count();
+        const auto plugin = plugins_by_type_.at(task.plugin_type);
+        const auto run = active_runs_.find(plugin);
+        if (offline || (lease > 0 && age > lease) || (!task.acked && age > receipt_timeout) ||
+            (run != active_runs_.end() && run->second.stopping))
+            expired.push_back(pair.first);
+    }
+    ReclaimTasks(expired);
+    std::vector<common::TaskPlugin*> active;
+    for (const auto& pair : active_runs_) active.push_back(pair.first);
+    for (auto* plugin : active) {
+        if (active_runs_.at(plugin).stopping)
+            CommitStop(plugin);
+        else
+            CommitFinished(plugin);
+    }
 }
 
 bool Scheduler::LoadPlugins() {
@@ -266,810 +509,11 @@ bool Scheduler::LoadPlugins() {
         }
         plugins_by_type_[plugin_type] = plugin;
 
-        plugins_.push_back(
-            {std::move(library),
-             std::unique_ptr<common::TaskPlugin, PluginDeleter>(plugin, PluginDeleter{destroy})});
+        plugins_.push_back({std::move(library), std::unique_ptr<common::TaskPlugin, PluginDeleter>(
+                                                    plugin, PluginDeleter{destroy})});
         LOG_INFO("plugin loaded: " << name << " plugin_type=" << plugin->pluginType());
     }
     return true;
-}
-
-void Scheduler::RunProcessing() {
-    auto last_check = std::chrono::steady_clock::now();
-    while (running_.load(std::memory_order_relaxed)) {
-        IncomingMessage msg;
-        if (server_.tryRecv(msg, std::chrono::milliseconds(100))) {
-            HandleMessage(msg);
-        }
-
-        CreateRunCommand cmd;
-        while (commands_.pop(cmd, std::chrono::milliseconds(0))) {
-            HandleCreateRun(cmd);
-        }
-
-        StopRunCommand stop_cmd;
-        while (stop_commands_.pop(stop_cmd, std::chrono::milliseconds(0))) {
-            HandleStopRun(stop_cmd);
-        }
-
-        const auto now = std::chrono::steady_clock::now();
-        if (now - last_check >= std::chrono::milliseconds(500)) {
-            last_check = now;
-            RunTimeoutChecks();
-        }
-    }
-}
-
-void Scheduler::HandleMessage(const IncomingMessage& msg) {
-    const common::Envelope& env = msg.envelope;
-    if (!msg.peer_address.empty()) {
-        std::lock_guard<std::mutex> lock(clients_mutex_);
-        clients_[msg.identity].info.peer_address = msg.peer_address;
-    }
-    switch (env.type()) {
-        case common::REGISTER:
-            if (env.has_register_()) {
-                HandleRegister(msg);
-            }
-            break;
-        case common::HEARTBEAT:
-            if (env.has_heartbeat()) {
-                if (IsCurrentSession(msg)) {
-                    UpdateClient(msg.identity, env.plugin_type(), env.heartbeat());
-                } else {
-                    LOG_WARN("heartbeat from stale or unregistered session of " << msg.identity
-                                                                                 << ", dropped");
-                }
-            }
-            break;
-        case common::REQUEST_TASK:
-            if (env.has_request_task()) {
-                HandleRequestTask(msg);
-            }
-            break;
-        case common::TASK_REPORT:
-            if (env.has_task_report()) {
-                HandleTaskReport(msg);
-            }
-            break;
-        case common::TASK_ACK:
-            if (env.has_task_ack()) {
-                HandleTaskAck(msg);
-            }
-            break;
-        case common::TASK_REJECT:
-            if (env.has_task_reject()) {
-                HandleTaskReject(msg);
-            }
-            break;
-        case common::REGISTER_RESULT:
-        case common::TASK:
-        case common::NO_TASK:
-        case common::WAKE:
-        case common::STOP:
-            LOG_WARN("unexpected message type " << env.type() << " from " << msg.identity);
-            break;
-        default:
-            LOG_WARN("unhandled message type " << env.type() << " from " << msg.identity);
-            break;
-    }
-}
-
-void Scheduler::HandleRegister(const IncomingMessage& msg) {
-    const common::RegisterCommand& reg = msg.envelope.register_();
-    const std::string& plugin_type = msg.envelope.plugin_type();
-    const auto it = plugins_by_type_.find(plugin_type);
-    if (it == plugins_by_type_.end()) {
-        LOG_ERROR("register: no plugin for plugin_type " << plugin_type);
-        SendRegisterResult(msg.identity, plugin_type, false, false,
-                           "no plugin for plugin_type " + plugin_type, std::string(),
-                           std::string(), reg.registration_id());
-        return;
-    }
-
-    common::TaskPlugin* plugin = it->second;
-    common::ClientInfo client;
-    client.identity = msg.identity;
-    client.plugin_type = plugin_type;
-    client.peer_address = msg.peer_address;
-    std::string old_session_id;
-    {
-        std::lock_guard<std::mutex> lock(clients_mutex_);
-        const auto cit = clients_.find(msg.identity);
-        if (cit != clients_.end()) {
-            client.heartbeat = cit->second.info.heartbeat;
-            if (client.peer_address.empty()) {
-                client.peer_address = cit->second.info.peer_address;
-            }
-            old_session_id = cit->second.session_id;
-        }
-    }
-
-    common::ValidationResult result;
-    try {
-        if (!plugin->validateClient(client, reg.payload(), result)) {
-            LOG_ERROR("plugin " << plugin_type << ": validateClient failed");
-            SendRegisterResult(msg.identity, plugin_type, true, false, result.reason,
-                               result.reply_payload, std::string(), reg.registration_id());
-            return;
-        }
-    } catch (const std::exception& e) {
-        LOG_ERROR("plugin " << plugin_type << ": validateClient threw: " << e.what());
-        SendRegisterResult(msg.identity, plugin_type, true, false, "validateClient threw",
-                           std::string(), std::string(), reg.registration_id());
-        return;
-    } catch (...) {
-        LOG_ERROR("plugin " << plugin_type << ": validateClient threw unknown exception");
-        SendRegisterResult(msg.identity, plugin_type, true, false,
-                           "validateClient threw unknown exception", std::string(),
-                           std::string(), reg.registration_id());
-        return;
-    }
-
-    if (!result.accepted) {
-        TouchClient(msg.identity, plugin_type);
-        {
-            std::lock_guard<std::mutex> lock(clients_mutex_);
-            clients_[msg.identity].registered_plugins.erase(plugin_type);
-        }
-        SendRegisterResult(msg.identity, plugin_type, true, false, result.reason,
-                           result.reply_payload, std::string(), reg.registration_id());
-        LOG_INFO("register: client " << msg.identity << " plugin_type=" << plugin_type
-                                     << " rejected");
-        return;
-    }
-
-    const std::string new_session_id = GenerateSessionId();
-    if (!old_session_id.empty()) {
-        LOG_WARN("register: replacing session for client " << msg.identity
-                                                             << ", reclaiming old tasks");
-        ReclaimClientTasks(msg.identity, old_session_id);
-    }
-
-    TouchClient(msg.identity, plugin_type);
-    {
-        std::lock_guard<std::mutex> lock(clients_mutex_);
-        ClientEntry& entry = clients_[msg.identity];
-        entry.info.identity = msg.identity;
-        if (!msg.peer_address.empty()) {
-            entry.info.peer_address = msg.peer_address;
-        }
-        entry.session_id = new_session_id;
-        entry.registered_plugins.clear();
-        entry.registered_plugins.insert(plugin_type);
-    }
-    SendRegisterResult(msg.identity, plugin_type, true, result.accepted, result.reason,
-                       result.reply_payload, new_session_id, reg.registration_id());
-    LOG_INFO("register: client " << msg.identity << " plugin_type=" << plugin_type
-                                 << " accepted session=" << new_session_id);
-}
-
-void Scheduler::HandleRequestTask(const IncomingMessage& msg) {
-    const common::RequestTaskCommand& request = msg.envelope.request_task();
-    const std::string& plugin_type = msg.envelope.plugin_type();
-    const std::string& session_id = msg.envelope.session_id();
-    if (!IsCurrentSession(msg)) {
-        LOG_WARN("request_task from stale or unregistered session of " << msg.identity
-                                                                       << ", no task granted");
-        return;
-    }
-    const auto it = plugins_by_type_.find(plugin_type);
-    if (it == plugins_by_type_.end()) {
-        LOG_WARN("request_task: no plugin for plugin_type " << plugin_type
-                                                            << " from " << msg.identity);
-        SendNoTask(msg.identity, plugin_type, session_id);
-        return;
-    }
-
-    TouchClient(msg.identity, plugin_type);
-
-    // Only registered clients may pull tasks.
-    {
-        std::lock_guard<std::mutex> lock(clients_mutex_);
-        const auto cit = clients_.find(msg.identity);
-        if (cit == clients_.end() || cit->second.registered_plugins.count(plugin_type) == 0) {
-            LOG_WARN("request_task: unregistered client " << msg.identity
-                                                          << ", no task granted");
-            SendNoTask(msg.identity, plugin_type, session_id);
-            return;
-        }
-    }
-
-    common::TaskPlugin* plugin = it->second;
-    common::ClientInfo client;
-    client.identity = msg.identity;
-    client.plugin_type = plugin_type;
-    {
-        std::lock_guard<std::mutex> lock(clients_mutex_);
-        const auto cit = clients_.find(msg.identity);
-        if (cit != clients_.end()) {
-            client.heartbeat = cit->second.info.heartbeat;
-        }
-    }
-
-    const int count = request.count();
-    if (count <= 0) {
-        LOG_WARN("request_task: invalid count " << count << " from " << msg.identity);
-        SendNoTask(msg.identity, plugin_type, session_id);
-        return;
-    }
-
-    std::vector<common::Task> tasks;
-    tasks.reserve(static_cast<size_t>(count));
-    for (int i = 0; i < count; ++i) {
-        common::Task task;
-        bool has_task = false;
-        try {
-            has_task = plugin->requestTask(client, request.payload(), task);
-        } catch (const std::exception& e) {
-            LOG_ERROR("plugin " << plugin_type << ": requestTask threw: " << e.what());
-            break;
-        } catch (...) {
-            LOG_ERROR("plugin " << plugin_type << ": requestTask threw unknown exception");
-            break;
-        }
-        if (!has_task) {
-            break;
-        }
-        tasks.push_back(std::move(task));
-    }
-
-    if (tasks.empty()) {
-        SendNoTask(msg.identity, plugin_type, session_id);
-    } else {
-        SendTasks(plugin, msg.identity, tasks, session_id);
-    }
-}
-
-void Scheduler::HandleTaskReport(const IncomingMessage& msg) {
-    const common::TaskReport& report = msg.envelope.task_report();
-    const std::string& plugin_type = msg.envelope.plugin_type();
-    if (!IsCurrentSession(msg)) {
-        LOG_WARN("completion from stale or unregistered session of " << msg.identity
-                                                                      << ", dropped");
-        return;
-    }
-    const auto pit = plugins_by_type_.find(plugin_type);
-    if (pit == plugins_by_type_.end()) {
-        LOG_ERROR("task_report: no plugin for plugin_type " << plugin_type);
-        return;
-    }
-
-    TouchClient(msg.identity, plugin_type);
-
-    {
-        std::lock_guard<std::mutex> lock(in_flight_mutex_);
-        const auto it = in_flight_.find(report.result().task_id());
-        if (it == in_flight_.end()) {
-            LOG_WARN("completion for unknown task " << report.result().task_id()
-                                                    << " from " << msg.identity << ", dropped");
-            return;
-        }
-        if (it->second.identity != msg.identity) {
-            LOG_WARN("completion for task " << report.result().task_id() << " from "
-                                            << msg.identity << " (assigned to "
-                                            << it->second.identity << "), dropped");
-            return;
-        }
-        if (it->second.plugin_type != plugin_type) {
-            LOG_WARN("completion for task " << report.result().task_id() << " plugin_type "
-                                            << plugin_type << " (assigned to "
-                                            << it->second.plugin_type << "), dropped");
-            return;
-        }
-        if (it->second.session_id != msg.envelope.session_id()) {
-            LOG_WARN("completion for task " << report.result().task_id() << " from stale session of "
-                                            << msg.identity << ", dropped");
-            return;
-        }
-        in_flight_.erase(it);
-    }
-
-    if (event_manager_ == nullptr) {
-        LOG_ERROR("result processing pool is not running");
-        return;
-    }
-    if (storage_.enabled()) {
-        storage_.ReportTask(report.result().task_id(), report.result());
-    }
-    event_manager_->push(new ProcessResultEvent(pit->second, report.result()));
-}
-
-void Scheduler::HandleTaskAck(const IncomingMessage& msg) {
-    const common::TaskAck& ack = msg.envelope.task_ack();
-    if (!IsCurrentSession(msg)) {
-        LOG_WARN("ack from stale or unregistered session of " << msg.identity << ", dropped");
-        return;
-    }
-    TouchClient(msg.identity, msg.envelope.plugin_type());
-
-    std::lock_guard<std::mutex> lock(in_flight_mutex_);
-    const auto it = in_flight_.find(ack.task_id());
-    if (it == in_flight_.end()) {
-        LOG_WARN("ack for unknown task " << ack.task_id() << " from " << msg.identity);
-        return;
-    }
-    if (it->second.identity != msg.identity || it->second.plugin_type != msg.envelope.plugin_type()) {
-        LOG_WARN("ack for task " << ack.task_id() << " from " << msg.identity << "/"
-                                 << msg.envelope.plugin_type() << " (assigned to "
-                                 << it->second.identity << "/" << it->second.plugin_type
-                                 << "), dropped");
-        return;
-    }
-    if (it->second.session_id != msg.envelope.session_id()) {
-        LOG_WARN("ack for task " << ack.task_id() << " from stale session of " << msg.identity
-                                 << ", dropped");
-        return;
-    }
-    it->second.acked = true;
-    if (storage_.enabled()) {
-        storage_.AckTask(ack.task_id());
-    }
-    LOG_INFO("task " << ack.task_id() << " acked by " << msg.identity);
-}
-
-void Scheduler::HandleCreateRun(const CreateRunCommand& command) {
-    const auto it = plugins_by_type_.find(command.plugin_type);
-    if (it == plugins_by_type_.end()) {
-        LOG_ERROR("createRun: no plugin for plugin_type " << command.plugin_type);
-        return;
-    }
-
-    common::RunRequest request;
-    request.run_id = GenerateRunId();
-    request.dataset_version = command.dataset_version;
-    request.params = command.params;
-
-    common::TaskPlugin* plugin = it->second;
-    if (active_runs_.count(plugin) > 0) {
-        bool finished = false;
-        try {
-            finished = plugin->runFinished();
-        } catch (const std::exception& e) {
-            LOG_ERROR("plugin " << command.plugin_type
-                                << ": runFinished threw: " << e.what());
-        } catch (...) {
-            LOG_ERROR("plugin " << command.plugin_type
-                                << ": runFinished threw unknown exception");
-        }
-        if (!finished) {
-            LOG_ERROR("createRun: run already active for plugin_type " << command.plugin_type);
-            return;
-        }
-        // The previous run is already finished but has not been swept by the
-        // periodic timeout check yet. Clean it up before starting the new run,
-        // otherwise active_run_count_ drifts and the old run stays 'running' in DB.
-        const std::string old_run_id = active_runs_[plugin].run_id;
-        LOG_INFO("run already finished, cleaning up before new run: " << old_run_id);
-        if (storage_.enabled()) {
-            storage_.FinishRun(old_run_id, "finished");
-        }
-        active_runs_.erase(plugin);
-        active_run_count_.fetch_sub(1, std::memory_order_relaxed);
-    }
-    try {
-        if (!plugin->plan(request, SnapshotClients())) {
-            LOG_ERROR("createRun: plan failed for " << command.plugin_type);
-            return;
-        }
-    } catch (const std::exception& e) {
-        LOG_ERROR("createRun: plugin " << command.plugin_type << " plan threw: " << e.what());
-        return;
-    } catch (...) {
-        LOG_ERROR("createRun: plugin " << command.plugin_type
-                                       << " plan threw unknown exception");
-        return;
-    }
-
-    active_runs_[plugin] = {request.run_id, command.plugin_type};
-    active_run_count_.fetch_add(1, std::memory_order_relaxed);
-    if (storage_.enabled()) {
-        storage_.SaveRun(request.run_id, command.plugin_type, request.dataset_version,
-                         request.params);
-    }
-    LOG_INFO("run started: " << request.run_id << " plugin_type=" << command.plugin_type);
-}
-
-void Scheduler::HandleStopRun(const StopRunCommand& command) {
-    const auto it = plugins_by_type_.find(command.plugin_type);
-    if (it == plugins_by_type_.end()) {
-        LOG_ERROR("stop: no plugin for plugin_type " << command.plugin_type);
-        return;
-    }
-
-    common::TaskPlugin* plugin = it->second;
-    const auto run_it = active_runs_.find(plugin);
-    if (run_it == active_runs_.end()) {
-        LOG_WARN("stop: no active run for plugin_type " << command.plugin_type);
-        return;
-    }
-    const std::string run_id = run_it->second.run_id;
-
-    // Send STOP to every client of this plugin type and reclaim in-flight tasks.
-    std::vector<std::pair<std::string, std::string>> clients_of_type;
-    {
-        std::lock_guard<std::mutex> lock(clients_mutex_);
-        for (const auto& entry : clients_) {
-            if (entry.second.info.plugin_type == command.plugin_type) {
-                clients_of_type.emplace_back(entry.first, entry.second.session_id);
-            }
-        }
-    }
-
-    common::Envelope env;
-    env.set_type(common::STOP);
-    env.set_plugin_type(command.plugin_type);
-    env.mutable_stop()->set_run_id(run_id);
-    env.mutable_stop()->set_reason("manual stop");
-    for (const auto& client : clients_of_type) {
-        ReclaimClientTasks(client.first, client.second);
-        env.set_session_id(client.second);
-        server_.sendTo(client.first, env);
-        LOG_INFO("stop sent to client " << client.first);
-    }
-    bool checkpoint_ok = false;
-
-    try {
-        checkpoint_ok = plugin->saveCheckpoint(run_id);
-        if (!checkpoint_ok) {
-            LOG_ERROR("plugin " << command.plugin_type << ": saveCheckpoint failed");
-        }
-    } catch (const std::exception& e) {
-        LOG_ERROR("plugin " << command.plugin_type << ": saveCheckpoint threw: " << e.what());
-    } catch (...) {
-        LOG_ERROR("plugin " << command.plugin_type
-                            << ": saveCheckpoint threw unknown exception");
-    }
-    if (!checkpoint_ok) {
-        LOG_ERROR("plugin " << command.plugin_type
-                            << ": checkpoint save failed; keeping the active run so progress "
-                               "is not discarded. Fix the store/db and retry stop.");
-        return;
-    }
-
-    try {
-        plugin->cancel();
-    } catch (const std::exception& e) {
-        LOG_ERROR("plugin " << command.plugin_type << ": cancel threw: " << e.what());
-    } catch (...) {
-        LOG_ERROR("plugin " << command.plugin_type << ": cancel threw unknown exception");
-    }
-
-    active_runs_.erase(run_it);
-    active_run_count_.fetch_sub(1, std::memory_order_relaxed);
-    if (storage_.enabled()) {
-        storage_.FinishRun(run_id, "stopped");
-    }
-    LOG_INFO("run stopped: " << run_id << " plugin_type=" << command.plugin_type);
-}
-
-void Scheduler::ReclaimClientTasks(const std::string& identity,
-                                   const std::string& session_id) {
-    std::unordered_map<std::string, std::vector<std::string>> by_type;
-    std::vector<std::string> all_ids;
-    {
-        std::lock_guard<std::mutex> lock(in_flight_mutex_);
-        for (auto it = in_flight_.begin(); it != in_flight_.end();) {
-            if (it->second.identity == identity &&
-                (session_id.empty() || it->second.session_id == session_id)) {
-                by_type[it->second.plugin_type].push_back(it->first);
-                all_ids.push_back(it->first);
-                it = in_flight_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
-    if (storage_.enabled()) {
-        storage_.ReclaimTasks(all_ids);
-    }
-    for (const auto& item : by_type) {
-        const auto pit = plugins_by_type_.find(item.first);
-        if (pit != plugins_by_type_.end()) {
-            LOG_WARN("reclaim " << item.second.size() << " tasks of client " << identity
-                                << (session_id.empty() ? std::string() :
-                                    " session=" + session_id)
-                                << " plugin_type=" << item.first);
-            try {
-                pit->second->requeue(item.second);
-            } catch (const std::exception& e) {
-                LOG_ERROR("plugin " << item.first << ": requeue threw: " << e.what());
-            } catch (...) {
-                LOG_ERROR("plugin " << item.first << ": requeue threw unknown exception");
-            }
-        }
-    }
-}
-
-bool Scheduler::IsCurrentSession(const IncomingMessage& msg) const {
-    if (msg.envelope.session_id().empty()) {
-        return false;
-    }
-    std::lock_guard<std::mutex> lock(clients_mutex_);
-    const auto it = clients_.find(msg.identity);
-    return it != clients_.end() && it->second.session_id == msg.envelope.session_id();
-}
-
-void Scheduler::TouchClient(const std::string& identity, const std::string& plugin_type) {
-    std::lock_guard<std::mutex> lock(clients_mutex_);
-    const bool is_new = clients_.find(identity) == clients_.end();
-    ClientEntry& entry = clients_[identity];
-    entry.info.identity = identity;
-    entry.info.plugin_type = plugin_type;
-    entry.last_seen = std::chrono::steady_clock::now();
-    if (is_new) {
-        LOG_INFO("client online: " << identity);
-    }
-}
-
-bool Scheduler::UpdateClient(const std::string& identity, const std::string& plugin_type,
-                             const common::Heartbeat& heartbeat) {
-    std::lock_guard<std::mutex> lock(clients_mutex_);
-
-    const auto it = clients_.find(identity);
-    bool changed = it == clients_.end();
-    if (!changed) {
-        const common::Heartbeat& old = it->second.info.heartbeat;
-        changed = old.status() != heartbeat.status() ||
-                  old.ip() != heartbeat.ip();
-    }
-
-    ClientEntry& entry = clients_[identity];
-    entry.info.identity = identity;
-    entry.info.plugin_type = plugin_type;
-    entry.info.heartbeat = heartbeat;
-    entry.last_seen = std::chrono::steady_clock::now();
-    return changed;
-}
-
-std::vector<common::ClientInfo> Scheduler::SnapshotClients() const {
-    std::lock_guard<std::mutex> lock(clients_mutex_);
-    std::vector<common::ClientInfo> snapshot;
-    snapshot.reserve(clients_.size());
-    for (const auto& entry : clients_) {
-        common::ClientInfo info = entry.second.info;
-        info.registered = entry.second.registered_plugins.count(info.plugin_type) > 0;
-        snapshot.push_back(std::move(info));
-    }
-    return snapshot;
-}
-
-void Scheduler::RunTimeoutChecks() {
-    // Clear finished run contexts so new runs can start.
-    for (auto it = active_runs_.begin(); it != active_runs_.end();) {
-        bool finished = false;
-        try {
-            finished = it->first->runFinished();
-        } catch (const std::exception& e) {
-            LOG_ERROR("plugin " << it->second.plugin_type
-                                << ": runFinished threw: " << e.what());
-        } catch (...) {
-            LOG_ERROR("plugin " << it->second.plugin_type
-                                << ": runFinished threw unknown exception");
-        }
-        if (finished) {
-            LOG_INFO("run finished: " << it->second.run_id
-                                      << " plugin_type=" << it->second.plugin_type);
-            if (storage_.enabled()) {
-                storage_.FinishRun(it->second.run_id, "finished");
-            }
-            it = active_runs_.erase(it);
-            active_run_count_.fetch_sub(1, std::memory_order_relaxed);
-        } else {
-            ++it;
-        }
-    }
-
-    // Conservative by default: the framework does not know how long a plugin
-    // task may legitimately run (e.g. coverage on large stp files), so both
-    // recovery timeouts default to disabled (0). Users opt in based on their
-    // own task duration expectations.
-    const int client_timeout_ms = config_.get("server.client_timeout_ms", 0);
-    const int lease_timeout_ms = config_.get("server.task_lease_timeout_ms", 0);
-    const auto timeout = std::chrono::milliseconds(client_timeout_ms);
-    const auto lease = std::chrono::milliseconds(lease_timeout_ms);
-    const auto now = std::chrono::steady_clock::now();
-
-    std::vector<std::string> offline;
-    if (client_timeout_ms > 0) {
-        std::lock_guard<std::mutex> lock(clients_mutex_);
-        for (auto it = clients_.begin(); it != clients_.end();) {
-            if (now - it->second.last_seen > timeout) {
-                offline.push_back(it->first);
-                it = clients_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
-    for (const std::string& identity : offline) {
-        LOG_WARN("client offline: " << identity);
-        ReclaimClientTasks(identity);
-    }
-
-    if (lease_timeout_ms > 0) {
-        std::unordered_map<std::string, std::vector<std::string>> by_type;
-        std::vector<std::string> lease_ids;
-        {
-            std::lock_guard<std::mutex> lock(in_flight_mutex_);
-            for (auto it = in_flight_.begin(); it != in_flight_.end();) {
-                if (now - it->second.sent_at > lease) {
-                    LOG_WARN("reclaim task " << it->first << ": lease expired"
-                                             << (it->second.acked ? " (acked)"
-                                                                  : " (not acked)"));
-                    by_type[it->second.plugin_type].push_back(it->first);
-                    lease_ids.push_back(it->first);
-                    it = in_flight_.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-        }
-        if (storage_.enabled()) {
-            storage_.ReclaimTasks(lease_ids);
-        }
-        for (const auto& item : by_type) {
-            const auto pit = plugins_by_type_.find(item.first);
-            if (pit != plugins_by_type_.end()) {
-                LOG_WARN("requeue " << item.second.size() << " tasks of plugin " << item.first);
-                try {
-                    pit->second->requeue(item.second);
-                } catch (const std::exception& e) {
-                    LOG_ERROR("plugin " << item.first << ": requeue threw: " << e.what());
-                } catch (...) {
-                    LOG_ERROR("plugin " << item.first << ": requeue threw unknown exception");
-                }
-            }
-        }
-    }
-}
-
-void Scheduler::SendRegisterResult(const std::string& identity, const std::string& plugin_type,
-                                   bool plugin_found, bool accepted, const std::string& reason,
-                                   const std::string& reply_payload,
-                                   const std::string& session_id,
-                                   const std::string& registration_id) {
-    common::Envelope env;
-    env.set_type(common::REGISTER_RESULT);
-    env.set_plugin_type(plugin_type);
-    env.set_session_id(session_id);
-    common::RegisterResult* result = env.mutable_register_result();
-    result->set_plugin_found(plugin_found);
-    result->set_accepted(accepted);
-    result->set_reason(reason);
-    result->set_payload(reply_payload);
-    result->set_registration_id(registration_id);
-    server_.sendTo(identity, env);
-}
-
-void Scheduler::HandleTaskReject(const IncomingMessage& msg) {
-    const common::TaskRejectCommand& reject = msg.envelope.task_reject();
-    if (!IsCurrentSession(msg)) {
-        LOG_WARN("reject from stale or unregistered session of " << msg.identity << ", dropped");
-        return;
-    }
-    TouchClient(msg.identity, msg.envelope.plugin_type());
-
-    std::string plugin_type;
-    std::vector<std::string> task_ids;
-    {
-        std::lock_guard<std::mutex> lock(in_flight_mutex_);
-        const auto it = in_flight_.find(reject.task_id());
-        if (it == in_flight_.end()) {
-            LOG_WARN("reject for unknown task " << reject.task_id() << " from "
-                                                << msg.identity);
-            return;
-        }
-        if (it->second.identity != msg.identity) {
-            LOG_WARN("reject for task " << reject.task_id() << " from " << msg.identity
-                                        << " (assigned to " << it->second.identity
-                                        << "), dropped");
-            return;
-        }
-        if (it->second.plugin_type != msg.envelope.plugin_type()) {
-            LOG_WARN("reject for task " << reject.task_id() << " plugin_type "
-                                        << msg.envelope.plugin_type() << " (assigned to "
-                                        << it->second.plugin_type << "), dropped");
-            return;
-        }
-        if (it->second.session_id != msg.envelope.session_id()) {
-            LOG_WARN("reject for task " << reject.task_id() << " from stale session of "
-                                         << msg.identity << ", dropped");
-            return;
-        }
-        plugin_type = it->second.plugin_type;
-        task_ids.push_back(it->first);
-        in_flight_.erase(it);
-    }
-
-    if (storage_.enabled()) {
-        storage_.ReclaimTasks(task_ids);
-    }
-    const auto pit = plugins_by_type_.find(plugin_type);
-    if (pit != plugins_by_type_.end()) {
-        LOG_WARN("task rejected by client " << msg.identity << ": " << reject.task_id()
-                                            << " reason=" << reject.reason()
-                                            << ", requeue to plugin " << plugin_type);
-        try {
-            pit->second->requeue(task_ids);
-        } catch (const std::exception& e) {
-            LOG_ERROR("plugin " << plugin_type << ": requeue threw: " << e.what());
-        } catch (...) {
-            LOG_ERROR("plugin " << plugin_type << ": requeue threw unknown exception");
-        }
-    }
-}
-
-void Scheduler::SendTasks(common::TaskPlugin* plugin, const std::string& identity,
-                           const std::vector<common::Task>& tasks,
-                           const std::string& session_id) {
-    const auto it = active_runs_.find(plugin);
-    if (it == active_runs_.end()) {
-        LOG_ERROR("no active run for plugin " << plugin->pluginType() << ", returning "
-                                              << tasks.size() << " tasks to the plugin");
-        std::vector<std::string> task_ids;
-        task_ids.reserve(tasks.size());
-        for (const common::Task& task : tasks) {
-            task_ids.push_back(task.task_id());
-        }
-        try {
-            plugin->requeue(task_ids);
-        } catch (const std::exception& e) {
-            LOG_ERROR("plugin " << plugin->pluginType()
-                                << ": requeue on send failure threw: " << e.what());
-        } catch (...) {
-            LOG_ERROR("plugin " << plugin->pluginType()
-                                << ": requeue on send failure threw unknown exception");
-        }
-        return;
-    }
-    const RunContext& run = it->second;
-
-    common::Envelope env;
-    env.set_type(common::TASK);
-    env.set_plugin_type(run.plugin_type);
-    env.set_session_id(session_id);
-    common::TaskCommand* cmd = env.mutable_task();
-    cmd->set_run_id(run.run_id);
-
-    std::vector<common::Task> accepted;
-    accepted.reserve(tasks.size());
-    {
-        std::lock_guard<std::mutex> lock(in_flight_mutex_);
-        for (const common::Task& task : tasks) {
-            if (in_flight_.count(task.task_id()) > 0) {
-                LOG_ERROR("task " << task.task_id()
-                                  << " already in flight, duplicate dispatch dropped");
-                continue;
-            }
-            *cmd->add_tasks() = task;
-            in_flight_[task.task_id()] = {identity, session_id, run.plugin_type,
-                                          std::chrono::steady_clock::now(), false};
-            accepted.push_back(task);
-        }
-    }
-    if (accepted.empty()) {
-        return;
-    }
-
-    server_.sendTo(identity, env);
-    if (storage_.enabled()) {
-        for (const common::Task& task : accepted) {
-            storage_.SaveTask(task.task_id(), run.run_id, identity, task.payload());
-        }
-    }
-    for (const common::Task& task : accepted) {
-        LOG_INFO("task " << task.task_id() << " -> client " << identity);
-    }
-}
-
-void Scheduler::SendNoTask(const std::string& identity, const std::string& plugin_type,
-                           const std::string& session_id) {
-    common::Envelope env;
-    env.set_type(common::NO_TASK);
-    env.set_plugin_type(plugin_type);
-    env.set_session_id(session_id);
-    server_.sendTo(identity, env);
 }
 
 }  // namespace scheduler

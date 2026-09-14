@@ -1,16 +1,18 @@
-add_executable(scheduler
-    src/main.cpp
+add_library(scheduler_core STATIC
     src/Server.cpp
     src/Scheduler.cpp
+    src/SchedulerMessages.cpp
     src/Storage.cpp
 )
 
-target_include_directories(scheduler PRIVATE
+target_include_directories(scheduler_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/inc
     ${PG_INCLUDE_DIR}
 )
 
-target_link_libraries(scheduler PRIVATE common ${PG_LIBRARY})
+target_link_libraries(scheduler_core PUBLIC common ${PG_LIBRARY})
+add_executable(scheduler src/main.cpp)
+target_link_libraries(scheduler PRIVATE scheduler_core)
 
 # Keep scheduler.json in a config/ directory next to the executable. This
 # target runs on every build so config changes always reach the output dir.

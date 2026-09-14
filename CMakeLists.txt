@@ -21,11 +21,12 @@ include(cmake/find_package.cmake)
 
 # Core library and unit tests.
 add_subdirectory(common)
-add_subdirectory(test)
+
 add_subdirectory(demo)
 add_subdirectory(scheduler)
 add_subdirectory(client)
 add_subdirectory(plugins)
+add_subdirectory(test)
 
 # Future programs:
 
@@ -37,13 +38,6 @@ add_custom_target(deploy_third_party ALL
         "${CMAKE_BINARY_DIR}/bin/$<CONFIG>/"
 )
 add_dependencies(deploy_third_party common)
-add_dependencies(scheduler deploy_third_party)
-add_dependencies(demo_server deploy_third_party)
-add_dependencies(demo_client deploy_third_party)
-add_dependencies(test_common deploy_third_party)
-add_dependencies(test_zmq deploy_third_party)
-add_dependencies(test_config deploy_third_party)
-add_dependencies(test_messages deploy_third_party)
 
 # Deploy libpq and its dependencies next to every executable so DB-backed
 # storage works without PATH setup.
@@ -58,11 +52,21 @@ add_custom_target(deploy_libpq ALL
         "${CMAKE_BINARY_DIR}/bin/$<CONFIG>/"
 )
 add_dependencies(deploy_libpq common)
-add_dependencies(scheduler deploy_libpq)
-add_dependencies(demo_server deploy_libpq)
-add_dependencies(demo_client deploy_libpq)
-add_dependencies(client deploy_libpq)
-add_dependencies(test_common deploy_libpq)
-add_dependencies(test_zmq deploy_libpq)
-add_dependencies(test_config deploy_libpq)
-add_dependencies(test_messages deploy_libpq)
+
+# All local executable and DLL targets share the same runtime dependencies.
+function(attach_runtime_dependencies directory)
+    get_property(targets DIRECTORY "${directory}" PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(target IN LISTS targets)
+        get_target_property(kind ${target} TYPE)
+        if(kind STREQUAL "EXECUTABLE" OR kind STREQUAL "SHARED_LIBRARY")
+            if(NOT target STREQUAL "common")
+                add_dependencies(${target} deploy_third_party deploy_libpq)
+            endif()
+        endif()
+    endforeach()
+    get_property(children DIRECTORY "${directory}" PROPERTY SUBDIRECTORIES)
+    foreach(child IN LISTS children)
+        attach_runtime_dependencies("${child}")
+    endforeach()
+endfunction()
+attach_runtime_dependencies("${CMAKE_CURRENT_SOURCE_DIR}")

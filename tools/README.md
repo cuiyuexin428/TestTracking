@@ -40,8 +40,8 @@ powershell -ExecutionPolicy Bypass -File .\tools\build_third_party.ps1
 - 项目根 `CMakeLists.txt` 用相对路径 `THIRD_PARTY_ROOT=<项目>/third_party` 引用安装产物，不依赖绝对路径；
 - libzmq / protobuf / abseil 的 CMake 配置都是可重定位的（基于自身安装前缀解析）；
 - 新机器无需联网、无需重新构建第三方库。
-- PostgreSQL/libpq 不随仓库迁移：新机器需安装 PostgreSQL，或配置 `PG_ROOT` 环境变量，或在 CMake 配置时传 `-DPG_ROOT=<postgres-root>`。CMake 会依次检查 `PG_ROOT` 环境变量、常见安装目录以及旧的 `C:\WorkSpace\ThirdParty\pgsql` 开发目录。
-- 首次使用数据库前执行 `tools\init_database.ps1` 创建 `testtracking` 数据库（默认参数与仓库配置一致）。
+- PostgreSQL/libpq 是否可用取决于实际交付目录：完整离线包通常包含 `third_party/pgsql` 和 PostgreSQL 压缩包；纯 Git 工作副本可能没有这些大文件。缺少时需要安装 PostgreSQL，或设置 `PG_ROOT`，或在 CMake 配置时传 `-DPG_ROOT=<postgres-root>`。CMake 也会检查常见安装目录和已有开发目录。
+- 首次使用数据库前执行 `tools\init_database.ps1` 创建 `testtracking` 数据库，或使用 `tools\setup_offline_server.ps1` 准备随包实例。
 - 如需远程客户端直写本地数据库，先运行 `tools\setup_postgres_remote.ps1`，再执行 `tools\build_package.ps1`；后者会自动探测本机 IPv4 并写入 client 配置的 endpoint/db_conn。
 
 如需在新机器上重建第三方库（例如换版本），先删除 `third_party_src\build` 再运行脚本，或直接加 `-Force`。

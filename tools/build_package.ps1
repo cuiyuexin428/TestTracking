@@ -19,6 +19,8 @@ param(
     [string]$BinDir = $null,
     [string]$Endpoint = '',
     [string]$WorkerId = 'worker-1',
+    [ValidateSet('coverage', 'stpcompare')][string]$Plugin = 'coverage',
+    [string]$ConverterExe = '',
     [int]$TaskThreads = 2,
     [string]$StoreType = 'postgres',
     [string]$DbConn = '',
@@ -42,6 +44,13 @@ param(
     [string]$OpenCppCoverageDir = 'C:\Program Files\OpenCppCoverage'
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'ToolSupport.ps1')
+if ($Plugin -eq 'stpcompare') {
+    if (-not $ConverterExe -and -not $OnlyClient -and -not $OnlyDataset) {
+        throw 'Pass -ConverterExe for a stpcompare program package'
+    }
+    $StepTestExe = if ($ConverterExe) { $ConverterExe } else { 'Converter.exe' }
+}
 function Get-LocalIPv4 {
     $candidates = @()
     foreach ($nic in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
@@ -65,8 +74,7 @@ if (-not $ServerIp) {
 }
 if (-not $Endpoint) { $Endpoint = "tcp://${ServerIp}:$ServerPort" }
 if (-not $DbConn -and $StoreType -eq 'postgres') {
-    $DbConn = "host=$ServerIp port=$DbPort dbname=$DbName user=$DbUser"
-    if ($DbPassword) { $DbConn += " password=$DbPassword" }
+    $DbConn = New-PostgresConnection $ServerIp $DbPort $DbName $DbUser $DbPassword
 }
 
 $root = Split-Path $PSScriptRoot -Parent
@@ -97,11 +105,12 @@ if (-not $OnlyClient -and -not $OnlyDataset) {
     if ($EngineSrcDir -and -not (Test-Path $EngineSrcDir)) {
         throw "engine source dir not found: $EngineSrcDir"
     }
-    if (-not (Test-Path (Join-Path $OpenCppCoverageDir 'OpenCppCoverage.exe'))) {
+    if ($Plugin -eq 'coverage' -and -not (Test-Path (Join-Path $OpenCppCoverageDir 'OpenCppCoverage.exe'))) {
         throw "OpenCppCoverage.exe not found under $OpenCppCoverageDir"
     }
     $progDir = Join-Path $testenv 'program'
     if (Test-Path $progDir) {
+        Assert-OwnedPath $progDir $OutDir | Out-Null
         Remove-Item -LiteralPath $progDir -Recurse -Force
     }
     New-Item -ItemType Directory -Force $progDir | Out-Null
@@ -126,13 +135,16 @@ if (-not $OnlyClient -and -not $OnlyDataset) {
         $ProgramVersion,
         (New-Object System.Text.UTF8Encoding($false)))
 
+    if ($Plugin -eq 'coverage') {
     # testenv\opencppcoverage (static tooling).
     $occDir = Join-Path $testenv 'opencppcoverage'
     if (Test-Path $occDir) {
+        Assert-OwnedPath $occDir $OutDir | Out-Null
         Remove-Item -LiteralPath $occDir -Recurse -Force
     }
     $occSourceName = Split-Path $OpenCppCoverageDir -Leaf
     if (Test-Path (Join-Path $testenv $occSourceName)) {
+        Assert-OwnedPath (Join-Path $testenv $occSourceName) $OutDir | Out-Null
         Remove-Item -LiteralPath (Join-Path $testenv $occSourceName) -Recurse -Force
     }
     New-Item -ItemType Directory -Force $occDir | Out-Null
@@ -146,11 +158,13 @@ if (-not $OnlyClient -and -not $OnlyDataset) {
     }
     Get-ChildItem $occDir -Filter 'unins*' | Remove-Item -Force
     Write-Host "built testenv\program (version $ProgramVersion) + opencppcoverage"
+    }
 }
 
 if (-not $OnlyClient -and -not $OnlyProgram) {
     $dataDir = Join-Path $testenv 'dataset'
     if (Test-Path $dataDir) {
+        Assert-OwnedPath $dataDir $OutDir | Out-Null
         Remove-Item -LiteralPath $dataDir -Recurse -Force
     }
     New-Item -ItemType Directory -Force $dataDir | Out-Null
@@ -200,6 +214,16 @@ if (-not $OnlyProgram -and -not $OnlyDataset) {
     if ($DbConn) {
         $coverageCfg['db_conn'] = $DbConn
     }
+    $selectedPlugin = $coverageCfg
+    if ($Plugin -eq 'stpcompare') {
+        $selectedPlugin = @{
+            dll = 'stpcompare.dll'; enabled = $true; dry_run = $false
+            store_type = $StoreType; db_conn = $DbConn; store_dir = 'store'
+            program_dir = 'testenv/program'; program_exe = ('testenv/program/' + (Split-Path -Leaf $StepTestExe))
+            stp_root = 'testenv/dataset'; work_dir = 'stp_compare_work'
+            info_file = 'info.txt'; info_new_file = 'info_new.txt'; table = 'stp_compare_old'
+        }
+    }
     $clientCfg = @{
         scheduler = @{
             endpoint = $Endpoint
@@ -214,10 +238,7 @@ if (-not $OnlyProgram -and -not $OnlyDataset) {
             register_timeout_ms = 5000
             register_max_attempts = 5
         }
-        plugins = @{
-            demo = @{ dll = 'demo.dll'; enabled = $false }
-            coverage = $coverageCfg
-        }
+        plugins = @{ $Plugin = $selectedPlugin }
     } | ConvertTo-Json -Depth 6
     [System.IO.File]::WriteAllText(
         (Join-Path $OutDir 'config\client.json'),

@@ -1,14 +1,8 @@
 // Minimal concrete plugin used to exercise the framework end to end:
 // scheduler side plans/dispatches tasks, client side executes them.
-#include "common/Logger.h"
-#include "common/TaskPlugin.h"
-#include "common/WorkerPlugin.h"
-
-#include "demo.pb.h"
-
-#include <json.hpp>
-
 #include <chrono>
+#include <deque>
+#include <json.hpp>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -16,6 +10,11 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#include "common/Logger.h"
+#include "common/TaskPlugin.h"
+#include "common/WorkerPlugin.h"
+#include "demo.pb.h"
 
 #ifdef _WIN32
 #define DEMO_EXPORT __declspec(dllexport)
@@ -26,10 +25,8 @@
 namespace {
 
 class DemoPlugin : public common::TaskPlugin {
-public:
-    std::string pluginType() const override {
-        return "demo";
-    }
+   public:
+    std::string pluginType() const override { return "demo"; }
 
     bool init(const std::string& config) override {
         (void)config;
@@ -55,6 +52,7 @@ public:
         pending_ids_.clear();
         tasks_by_id_.clear();
         task_client_.clear();
+        done_.clear();
         completed_ = 0;
         total_ = total;
 
@@ -83,7 +81,7 @@ public:
             return false;
         }
         task = pending_.front();
-        pending_.erase(pending_.begin());
+        pending_.pop_front();
         pending_ids_.erase(task.task_id());
         task_client_[task.task_id()] = client.identity;
         return true;
@@ -92,6 +90,7 @@ public:
     void requeue(const std::vector<std::string>& task_ids) override {
         std::lock_guard<std::mutex> lock(mutex_);
         for (const std::string& task_id : task_ids) {
+            if (done_.count(task_id)) continue;
             task_client_.erase(task_id);
             const auto spec_it = tasks_by_id_.find(task_id);
             if (spec_it != tasks_by_id_.end()) {
@@ -115,7 +114,7 @@ public:
         return false;  // demo runs cannot be resumed
     }
 
-    void processResult(const common::TaskResult& result) override {
+    bool processResult(const common::TaskResult& result) override {
         demo::DemoResult demo_result;
         std::string message = "unparsed";
         if (demo_result.ParseFromString(result.result())) {
@@ -123,14 +122,17 @@ public:
         }
 
         std::lock_guard<std::mutex> lock(mutex_);
+        if (!tasks_by_id_.count(result.task_id())) return false;
+        if (!done_.insert(result.task_id()).second) return true;
         task_client_.erase(result.task_id());
         ++completed_;
         LOG_INFO("demo plugin: result " << result.task_id() << " exit=" << result.exit_code()
-                                        << " msg=" << message << " (" << completed_ << "/"
-                                        << total_ << ")");
+                                        << " msg=" << message << " (" << completed_ << "/" << total_
+                                        << ")");
         if (total_ > 0 && completed_ >= total_) {
             LOG_INFO("demo plugin: run finished");
         }
+        return true;
     }
 
     bool runFinished() override {
@@ -144,14 +146,16 @@ public:
         pending_ids_.clear();
         tasks_by_id_.clear();
         task_client_.clear();
+        done_.clear();
         completed_ = 0;
         total_ = 0;
         LOG_INFO("demo plugin: run cancelled, task pool cleared");
     }
 
-private:
+   private:
     std::mutex mutex_;
-    std::vector<common::Task> pending_;
+    std::deque<common::Task> pending_;
+    std::unordered_set<std::string> done_;
     std::unordered_set<std::string> pending_ids_;
     std::unordered_map<std::string, common::Task> tasks_by_id_;
     std::unordered_map<std::string, std::string> task_client_;
@@ -160,10 +164,8 @@ private:
 };
 
 class DemoClientPlugin : public common::WorkerPlugin {
-public:
-    std::string pluginType() const override {
-        return "demo";
-    }
+   public:
+    std::string pluginType() const override { return "demo"; }
 
     bool init(const std::string& config) override {
         const nlohmann::json cfg = nlohmann::json::parse(config);
@@ -182,6 +184,11 @@ public:
     }
 
     bool execute(const common::Task& task, common::TaskResult& result) override {
+        return execute(task, result, {});
+    }
+
+    bool execute(const common::Task& task, common::TaskResult& result,
+                 const common::CancellationToken& cancellation) override {
         demo::DemoTask demo_task;
         if (!demo_task.ParseFromString(task.payload())) {
             result.set_exit_code(-1);
@@ -189,11 +196,13 @@ public:
         }
 
         const auto start = std::chrono::steady_clock::now();
-        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms_));
-        const auto elapsed_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
-                                                                  start)
-                .count();
+        if (cancellation.waitFor(std::chrono::milliseconds(sleep_ms_))) {
+            result.set_exit_code(-2);
+            return false;
+        }
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - start)
+                                    .count();
 
         result.set_exit_code(0);
         result.set_duration_ms(elapsed_ms);
@@ -206,7 +215,7 @@ public:
         return true;
     }
 
-private:
+   private:
     int sleep_ms_ = 200;
 };
 

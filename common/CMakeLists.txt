@@ -36,11 +36,16 @@ add_library(common SHARED
     src/version.cpp
     src/zmq_helper.cpp
     src/EventManager.cpp
+    src/ProcessRunner.cpp
     src/Logger.cpp
     src/Config.cpp
     src/DynamicLibrary.cpp
     src/Util.cpp
     src/PgUtil.cpp
+    src/AtomicFile.cpp
+    src/Manifest.cpp
+    src/RunStore.cpp
+    src/TaskLedger.cpp
     ${PROTO_SRCS}
 )
 

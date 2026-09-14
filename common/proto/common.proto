@@ -28,6 +28,8 @@ enum MessageType {
   // Client -> scheduler.
   TASK_ACK = 10;       // task receipt: client confirms it received the task
   TASK_REJECT = 11;    // task rejection: client cannot execute the task
+  HEARTBEAT_ACK = 12;  // network-thread liveness and session acknowledgement
+  TASK_REPORT_ACK = 13; // durable application acceptance, separate from receipt
 }
 
 // The task unit transported by the framework. plugin_type anchors both the
@@ -36,6 +38,8 @@ enum MessageType {
 message Task {
   string task_id = 1;
   bytes payload = 2;
+  string attempt_id = 3;
+  string run_id = 4;
 }
 
 // Resource usage (health info), filled by the client and used by the
