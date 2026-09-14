@@ -1,0 +1,25 @@
+:root { color-scheme: light; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; color: #17202a; background: #f4f6f8; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 960px; }
+.topbar { min-height: 76px; padding: 16px 28px; background: #17202a; color: #f8fafc; display: flex; align-items: center; justify-content: space-between; }
+.eyebrow { margin: 0 0 3px; font-size: 11px; letter-spacing: 1.5px; color: #9fb3c8; }
+h1, h2, p { margin: 0; } h1 { font-size: 22px; font-weight: 600; } h2 { font-size: 15px; font-weight: 600; }
+.health { font-size: 12px; color: #a7f3d0; }
+.layout { display: grid; grid-template-columns: minmax(0, 1fr) 330px; gap: 18px; padding: 22px 28px; max-width: 1500px; margin: 0 auto; }
+.toolbar, .panel-title, .field { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.toolbar { margin-bottom: 14px; } label { font-size: 12px; color: #52606d; } select, textarea { font: inherit; }
+select { margin-left: 7px; padding: 7px 28px 7px 8px; border: 1px solid #cbd5e1; background: #fff; border-radius: 4px; }
+button { border: 1px solid #9aa9b8; border-radius: 4px; background: #fff; color: #1f2933; padding: 7px 12px; cursor: pointer; } button:hover { background: #e8eef4; }
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 14px; }
+.stat { background: #fff; border: 1px solid #d9e2ec; padding: 12px 14px; } .stat strong { display: block; font-size: 22px; margin-top: 5px; }
+.panel { background: #fff; border: 1px solid #d9e2ec; padding: 16px; } .panel-title { margin-bottom: 14px; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; } th, td { text-align: left; border-top: 1px solid #edf1f5; padding: 10px 7px; } th { color: #52606d; font-weight: 600; }
+tbody tr { cursor: pointer; } tbody tr:hover { background: #f7fafc; } .muted { color: #7b8794; text-align: center; padding: 22px; }
+.assistant { align-self: start; position: sticky; top: 18px; } .context-note { color: #7b8794; font-size: 11px; line-height: 1.5; margin: 8px 0 12px; }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; background: #94a3b8; } .status-dot.ready { background: #16a34a; }
+.field { margin-bottom: 10px; } .field select { flex: 1; margin-left: 0; }
+.chat { min-height: 180px; max-height: 430px; overflow-y: auto; border-top: 1px solid #edf1f5; border-bottom: 1px solid #edf1f5; padding: 10px 0; }
+.bubble { padding: 8px 10px; margin: 7px 0; font-size: 12px; line-height: 1.55; white-space: pre-wrap; } .bubble.user { background: #eef5fb; } .bubble.assistant { background: #f7f8fa; }
+#chat-form { margin-top: 12px; } textarea { width: 100%; resize: vertical; border: 1px solid #cbd5e1; padding: 8px; border-radius: 4px; } #chat-form button { margin-top: 8px; width: 100%; background: #17202a; color: #fff; border-color: #17202a; }
+pre { white-space: pre-wrap; word-break: break-word; background: #f7f8fa; padding: 10px; font-size: 11px; max-height: 300px; overflow: auto; }
+

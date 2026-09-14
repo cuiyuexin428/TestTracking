@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Test Tracking Results</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">TEST TRACKING</p>
+      <h1>结果分析</h1>
+    </div>
+    <div class="health" id="health">检查服务状态中...</div>
+  </header>
+  <main class="layout">
+    <section class="content">
+      <div class="toolbar">
+        <label>插件 <select id="plugin"><option value="">全部</option></select></label>
+        <button id="refresh" type="button" title="刷新结果">刷新</button>
+      </div>
+      <div class="stats" id="stats"></div>
+      <div class="panel">
+        <div class="panel-title"><h2>运行记录</h2><span id="run-count"></span></div>
+        <table>
+          <thead><tr><th>运行 ID</th><th>插件</th><th>状态</th><th>文件结果</th><th>创建时间</th></tr></thead>
+          <tbody id="runs"><tr><td colspan="5" class="muted">加载中...</td></tr></tbody>
+        </table>
+      </div>
+      <div class="panel" id="detail-panel" hidden>
+        <div class="panel-title"><h2>运行详情</h2><button id="close-detail" type="button">关闭</button></div>
+        <pre id="detail"></pre>
+      </div>
+    </section>
+    <aside class="assistant panel">
+      <div class="panel-title"><h2>AI 助手</h2><span class="status-dot" id="ai-status"></span></div>
+      <label class="field">Provider<select id="provider"></select></label>
+      <p class="context-note">AI 只接收当前选中的运行结果上下文，不直接访问数据库。</p>
+      <div id="chat" class="chat"></div>
+      <form id="chat-form">
+        <textarea id="question" rows="3" placeholder="询问当前结果，例如：哪些文件需要优先复核？"></textarea>
+        <button type="submit">发送</button>
+      </form>
+    </aside>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
+

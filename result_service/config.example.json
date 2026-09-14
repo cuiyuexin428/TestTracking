@@ -1,0 +1,20 @@
+{
+  "host": "127.0.0.1",
+  "port": 56330,
+  "db_conn": "",
+  "workspace": "",
+  "stp_result_table": "",
+  "providers": {
+    "codex": {
+      "command": "codex",
+      "args": ["exec", "--json", "--ephemeral", "--skip-git-repo-check", "--sandbox", "read-only", "-"],
+      "timeout_seconds": 120
+    },
+    "dsh": {
+      "command": "dsh",
+      "args": ["--profile", "headless"],
+      "prompt_mode": "argument",
+      "timeout_seconds": 120
+    }
+  }
+}
