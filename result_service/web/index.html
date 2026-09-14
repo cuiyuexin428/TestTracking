@@ -3,48 +3,88 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Test Tracking Results</title>
+  <title>TestTracking Server Console</title>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <header class="topbar">
-    <div>
-      <p class="eyebrow">TEST TRACKING</p>
-      <h1>结果分析</h1>
+  <div class="console" id="console" data-ai-open="true">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brandmark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+        <div><strong>TestTracking</strong><span>SERVER CONSOLE</span></div>
+      </div>
+      <div class="service-state"><span class="dot" id="health-dot"></span><span id="health">正在连接结果服务</span></div>
+    </header>
+    <div class="shell">
+      <nav class="sidebar" aria-label="服务端导航">
+        <div class="nav-label">工作空间</div>
+        <button type="button" class="nav-item" data-page="overview"><span class="nav-icon">▦</span>运行总览</button>
+        <button type="button" class="nav-item" data-page="results" aria-current="page"><span class="nav-icon">⌁</span>结果分析</button>
+        <button type="button" class="nav-item" data-page="clients"><span class="nav-icon">▣</span>客户端<span class="nav-count">0</span></button>
+        <button type="button" class="nav-item" data-page="history"><span class="nav-icon">◷</span>历史运行</button>
+        <button type="button" class="nav-item" data-page="plugins"><span class="nav-icon">▤</span>插件与配置</button>
+        <button type="button" class="nav-item" data-page="logs"><span class="nav-icon">≡</span>运行日志</button>
+        <div class="side-foot"><strong>本地结果服务</strong><span><span class="dot"></span> API 已连接</span><small>Windows · PostgreSQL</small></div>
+      </nav>
+      <main class="main">
+        <div class="breadcrumb"><span>工作空间 / <b id="crumb">结果分析</b></span><time id="snapshot-time"></time></div>
+        <div class="headline">
+          <div><h1 id="page-title">结果分析</h1><p id="page-subtitle">查看已完成运行的业务结果与差异。</p></div>
+          <div class="head-actions"><button type="button" class="button" id="ai-toggle">✦ AI 助手</button><button type="button" class="button primary" id="refresh">↻ 刷新</button></div>
+        </div>
+        <section class="page" id="page-overview" hidden>
+          <div class="metrics">
+            <div class="metric"><span>运行记录</span><strong id="metric-runs">0<small>个运行</small></strong><em>长期运行清单</em></div>
+            <div class="metric"><span>已完成</span><strong id="metric-finished">0<small>个运行</small></strong><em>调度执行已结束</em></div>
+            <div class="metric"><span>成功文件</span><strong id="metric-success">0<small>个</small></strong><em>已持久化结果</em></div>
+            <div class="metric"><span>失败文件</span><strong id="metric-failed">0<small>个</small></strong><em>需要复核</em></div>
+          </div>
+          <div class="section-head"><h2>最近运行<span class="count" id="overview-count"></span></h2><div class="segmented" id="overview-filter"><button data-filter="" aria-pressed="true">全部</button><button data-filter="coverage" aria-pressed="false">coverage</button><button data-filter="stpcompare" aria-pressed="false">stpcompare</button></div></div>
+          <div id="run-cards" class="run-list"></div>
+          <div class="recovery"><span class="shield">✓</span><div><strong>持久化恢复已启用</strong><span>服务端重启后沿用原运行，已完成任务保持完成，未完成任务重新派发。</span></div></div>
+        </section>
+        <section class="page" id="page-results">
+          <div class="result-tools">
+            <div class="result-fields">
+              <label>结果类型<select id="result-type"><option value="coverage">coverage · 覆盖率</option><option value="stpcompare">stpcompare · 文本比较</option></select></label>
+              <label>运行<select id="result-run"><option value="">暂无运行记录</option></select></label>
+            </div>
+            <div class="analysis-state"><span class="dot"></span><span id="analysis-state">等待选择运行</span></div>
+          </div>
+          <div class="result-kpis">
+            <div class="result-kpi"><span>执行状态</span><strong id="execution-status">--</strong></div>
+            <div class="result-kpi"><span>结果完整性</span><strong id="completeness">--<small> / --</small></strong></div>
+            <div class="result-kpi"><span id="analysis-label">分析状态</span><strong id="analysis-value">--</strong></div>
+          </div>
+          <div id="coverage-view">
+            <div class="result-grid">
+              <article class="result-panel"><div class="panel-head"><h2>覆盖率概览</h2><span class="chip blue">coverage</span></div><div class="bars" id="coverage-bars"></div></article>
+              <article class="result-panel"><div class="panel-head"><h2>文件结果</h2><span class="chip" id="file-total-chip">0 个文件</span></div><div class="donut-wrap"><div class="donut" id="result-donut"><div><strong id="donut-total">0</strong>个文件</div></div><div class="legend"><div><span><i></i>成功</span><strong id="legend-success">0</strong></div><div><span><i class="pending"></i>待定</span><strong id="legend-pending">0</strong></div><div><span><i class="failed"></i>失败</span><strong id="legend-failed">0</strong></div></div></div></article>
+            </div>
+            <div class="section-head"><h2>运行结果<span class="count">派生结果由独立后处理工具发布</span></h2></div>
+            <div class="table-wrap"><table><thead><tr><th>指标</th><th>数值</th><th>状态</th></tr></thead><tbody id="coverage-table"></tbody></table></div>
+          </div>
+          <div id="compare-view" hidden>
+            <div class="section-head"><h2>文本比较结果<span class="count">按长期文件清单统计</span></h2></div>
+            <div class="table-wrap"><table><thead><tr><th>分类</th><th>文件数</th><th>状态</th></tr></thead><tbody id="compare-table"></tbody></table></div>
+          </div>
+        </section>
+        <section class="page" id="page-clients" hidden><div class="empty-panel"><span>▣</span><h2>客户端实时状态尚未接入</h2><p>结果服务当前只读取长期结果；在线心跳需要 scheduler 管理接口。</p></div></section>
+        <section class="page" id="page-history" hidden><div class="section-head"><h2>最近完成的运行<span class="count" id="history-count"></span></h2></div><div class="table-wrap"><table><thead><tr><th>运行 ID</th><th>插件</th><th>执行状态</th><th>文件结果</th><th>完成时间</th></tr></thead><tbody id="history-table"></tbody></table></div></section>
+        <section class="page" id="page-plugins" hidden><div class="config-grid" id="plugin-grid"></div></section>
+        <section class="page" id="page-logs" hidden><div class="empty-panel"><span>≡</span><h2>运行日志尚未接入</h2><p>发布包会将 scheduler 与结果服务日志写入 data/logs。</p></div></section>
+      </main>
+      <aside class="assistant" id="assistant">
+        <div class="assistant-head"><strong>✦ 结果助手</strong><button type="button" class="icon-button" id="ai-close" title="关闭 AI 助手">×</button></div>
+        <div class="provider-field"><label>AI 服务<select id="provider"></select></label></div>
+        <div class="ai-context" id="ai-context">上下文：尚未选择运行</div>
+        <div class="chat" id="chat" aria-live="polite"><div class="message assistant-message">选择一个运行后，可以让 Codex 或 DSH 分析当前结构化结果。</div></div>
+        <div class="quick-actions"><button type="button" data-prompt="分析当前运行的结果完整性">检查完整性</button><button type="button" data-prompt="总结当前运行中需要优先处理的问题">归纳问题</button></div>
+        <form class="compose" id="chat-form"><textarea id="question" rows="3" placeholder="询问当前结果..." required></textarea><div class="compose-actions"><span>当前运行的结构化结果</span><button class="send-button" type="submit" title="发送">➤</button></div></form>
+      </aside>
     </div>
-    <div class="health" id="health">检查服务状态中...</div>
-  </header>
-  <main class="layout">
-    <section class="content">
-      <div class="toolbar">
-        <label>插件 <select id="plugin"><option value="">全部</option></select></label>
-        <button id="refresh" type="button" title="刷新结果">刷新</button>
-      </div>
-      <div class="stats" id="stats"></div>
-      <div class="panel">
-        <div class="panel-title"><h2>运行记录</h2><span id="run-count"></span></div>
-        <table>
-          <thead><tr><th>运行 ID</th><th>插件</th><th>状态</th><th>文件结果</th><th>创建时间</th></tr></thead>
-          <tbody id="runs"><tr><td colspan="5" class="muted">加载中...</td></tr></tbody>
-        </table>
-      </div>
-      <div class="panel" id="detail-panel" hidden>
-        <div class="panel-title"><h2>运行详情</h2><button id="close-detail" type="button">关闭</button></div>
-        <pre id="detail"></pre>
-      </div>
-    </section>
-    <aside class="assistant panel">
-      <div class="panel-title"><h2>AI 助手</h2><span class="status-dot" id="ai-status"></span></div>
-      <label class="field">Provider<select id="provider"></select></label>
-      <p class="context-note">AI 只接收当前选中的运行结果上下文，不直接访问数据库。</p>
-      <div id="chat" class="chat"></div>
-      <form id="chat-form">
-        <textarea id="question" rows="3" placeholder="询问当前结果，例如：哪些文件需要优先复核？"></textarea>
-        <button type="submit">发送</button>
-      </form>
-    </aside>
-  </main>
+    <footer><span><span class="dot"></span><span id="footer-status">结果服务连接中</span></span><span>执行状态 · 结果完整性 · 分析状态独立展示</span></footer>
+  </div>
   <script src="/app.js"></script>
 </body>
 </html>
-
