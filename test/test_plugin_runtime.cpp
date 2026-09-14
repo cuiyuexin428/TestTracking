@@ -66,7 +66,13 @@ void ledgerTests(const fs::path& root) {
     CHECK(common::ReadManifest(path.string(), &manifest), "JSONL manifest");
     const nlohmann::json cfg = {{"store_dir", (root / "ledger").string()}, {"store_type", "file"}};
     common::TaskLedger ledger;
-    CHECK(ledger.init(cfg.dump(), "coverage"), "ledger init");
+    CHECK(ledger.init(cfg.dump(), "coverage", "coverage_checkpoints"), "ledger init");
+    common::TaskLedger custom;
+    CHECK(custom.init(cfg.dump(), "third_party_plugin", "third_party_checkpoints"),
+          "plugin-owned checkpoint table accepted");
+    common::TaskLedger invalid;
+    CHECK(!invalid.init(cfg.dump(), "third_party_plugin", "third_party;drop"),
+          "invalid checkpoint table rejected");
     CHECK(ledger.plan("one", {task("one", 0)}, {"f.stp"}, "fp"), "ledger plan");
     common::Task issued;
     CHECK(ledger.request(&issued), "request task");
@@ -91,7 +97,7 @@ void ledgerTests(const fs::path& root) {
     CHECK(read(root / "ledger" / "one" / "checkpoint.bin") == before,
           "completion does not rewrite plan");
     common::TaskLedger recovered;
-    CHECK(recovered.init(cfg.dump(), "coverage"), "restore init");
+    CHECK(recovered.init(cfg.dump(), "coverage", "coverage_checkpoints"), "restore init");
     CHECK(recovered.restore("one") && recovered.finished(), "journal restores committed result");
     auto wrong = report(issued);
     wrong.set_run_id("another");
@@ -237,6 +243,29 @@ void postgresTests(const std::string& connection) {
     common::PgConnection database;
     CHECK(database.connect(connection), "postgres inspection connection");
     auto conn = database.get();
+    const nlohmann::json ledger_cfg = {{"store_type", "postgres"}, {"db_conn", connection}};
+    common::TaskLedger custom_ledger;
+    CHECK(custom_ledger.init(ledger_cfg.dump(), "third_party_plugin", "Third_Party_Checkpoints"),
+          "postgres plugin-owned checkpoint table initialized");
+    auto registered_checkpoint = common::PgQuery(
+        conn, "SELECT count(*)::text FROM plugin_checkpoint_tables "
+              "WHERE plugin_type='third_party_plugin' AND checkpoint_table='third_party_checkpoints'");
+    CHECK(registered_checkpoint && common::PgCell(registered_checkpoint.get(), 0, 0) == "1",
+          "plugin checkpoint table registered for maintenance");
+    CHECK(custom_ledger.plan("custom-ledger", {task("custom-ledger", 0)}, {"f.stp"}, "fp"),
+          "postgres plugin-owned checkpoint plan saved");
+    auto custom_checkpoint = common::PgQuery(
+        conn, "SELECT count(*)::text FROM third_party_checkpoints WHERE run_id='custom-ledger'");
+    CHECK(custom_checkpoint && common::PgCell(custom_checkpoint.get(), 0, 0) == "1",
+          "custom checkpoint table contains plan");
+    common::TaskLedger recovered_ledger;
+    CHECK(recovered_ledger.init(ledger_cfg.dump(), "third_party_plugin", "third_party_checkpoints") &&
+              recovered_ledger.restore("custom-ledger"),
+          "custom checkpoint table restores plan");
+    registered_checkpoint = common::PgQuery(
+        conn, "SELECT count(*)::text FROM plugin_checkpoint_tables WHERE plugin_type='third_party_plugin'");
+    CHECK(registered_checkpoint && common::PgCell(registered_checkpoint.get(), 0, 0) == "1",
+          "reinitialization keeps one canonical checkpoint registration");
     coverage_plugin::FileCoverageResult a, b;
     a.run_id = "atomic-db";
     a.file = "file.stp";

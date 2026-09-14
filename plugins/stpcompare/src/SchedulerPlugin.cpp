@@ -6,6 +6,9 @@
 #include <unordered_set>
 #include <json.hpp>
 namespace stpcompare {
+namespace {
+constexpr const char* kCheckpointTable = "stp_compare_checkpoints";
+}
 std::string SchedulerPlugin::pluginType() const { return "stpcompare"; }
 bool SchedulerPlugin::init(const std::string& config) {
     const auto cfg=nlohmann::json::parse(config);
@@ -13,7 +16,8 @@ bool SchedulerPlugin::init(const std::string& config) {
     expected_program_version_=cfg.value("expected_program_version",std::string());
     expected_dataset_version_=cfg.value("expected_dataset_version",std::string());
     task_size_=cfg.value("task_size",25);
-    return !manifest_path_.empty() && task_size_>0 && ledger_.init(config,pluginType());
+    return !manifest_path_.empty() && task_size_>0 &&
+           ledger_.init(config,pluginType(),kCheckpointTable);
 }
 bool SchedulerPlugin::validateClient(const common::ClientInfo&,const std::string& bytes,common::ValidationResult& result) {
     stpcompare::StpCompareClientInfo info;

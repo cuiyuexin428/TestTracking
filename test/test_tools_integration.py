@@ -98,28 +98,73 @@ class ToolIntegrationTests(unittest.TestCase):
         self.assertEqual(hba.read_text().count('203.0.113.0/24'), 1)
 
     def test_prune_preserves_active_runs_raw_and_durable_metadata(self):
-        self.sql("CREATE TABLE runs(run_id text PRIMARY KEY,status text,created_at timestamptz);"
+        self.sql("CREATE TABLE runs(run_id text PRIMARY KEY,plugin_type text,status text,created_at timestamptz);"
                  "CREATE TABLE tasks(run_id text); CREATE TABLE coverage_checkpoints(run_id text);"
+                 "CREATE TABLE third_party_checkpoints(run_id text);"
+                 "CREATE TABLE plugin_checkpoint_tables(plugin_type text,checkpoint_table text);"
                  "CREATE TABLE plugin_task_completions(run_id text); CREATE TABLE plugin_runs(run_id text);"
                  "CREATE TABLE coverage_file_points(run_id text);"
-                 "INSERT INTO runs VALUES('running','running',now()-interval '10 days'),"
-                 "('stopped','stopped',now()-interval '9 days'),('finished-quote''','finished',now());"
-                 "INSERT INTO tasks SELECT run_id FROM runs; INSERT INTO coverage_checkpoints SELECT run_id FROM runs;"
+                 "INSERT INTO runs VALUES('running','coverage','running',now()-interval '10 days'),"
+                 "('stopped','third-party','stopped',now()-interval '9 days'),"
+                 "('finished-coverage','coverage','finished',now()-interval '1 day'),"
+                 "('finished-quote''','third-party','finished',now());"
+                 "INSERT INTO tasks SELECT run_id FROM runs;"
+                 "INSERT INTO coverage_checkpoints SELECT run_id FROM runs WHERE plugin_type='coverage';"
+                 "INSERT INTO third_party_checkpoints SELECT run_id FROM runs WHERE plugin_type='third-party';"
+                 "INSERT INTO plugin_checkpoint_tables VALUES"
+                 "('coverage','coverage_checkpoints'),('third-party','third_party_checkpoints');"
                  "INSERT INTO plugin_task_completions SELECT run_id FROM runs;"
                  "INSERT INTO plugin_runs SELECT run_id FROM runs; INSERT INTO coverage_file_points SELECT run_id FROM runs;")
+        preview = self.script('prune_old_runs.ps1', '-Keep', '0', '-DryRun', *self.database_args())
+        self.assertIn('would prune:', preview.stdout)
+        self.assertEqual(self.sql('SELECT count(*) FROM runs'), '4')
         self.script('prune_old_runs.ps1', '-Keep', '0', *self.database_args())
         self.assertEqual(self.sql("SELECT string_agg(run_id,',' ORDER BY run_id) FROM runs"), 'running,stopped')
-        for table in ('tasks', 'coverage_checkpoints', 'plugin_task_completions'):
+        for table in ('tasks', 'plugin_task_completions'):
             self.assertEqual(self.sql(f'SELECT count(*) FROM {table}'), '2')
+        for table in ('coverage_checkpoints', 'third_party_checkpoints'):
+            self.assertEqual(self.sql(f'SELECT count(*) FROM {table}'), '1')
+        self.assertEqual(self.sql('SELECT count(*) FROM plugin_checkpoint_tables'), '2')
         for table in ('plugin_runs', 'coverage_file_points'):
-            self.assertEqual(self.sql(f'SELECT count(*) FROM {table}'), '3')
+            self.assertEqual(self.sql(f'SELECT count(*) FROM {table}'), '4')
+
+    def test_prune_requires_registration_before_deleting_old_runs(self):
+        self.sql("CREATE TABLE runs(run_id text PRIMARY KEY,plugin_type text,status text,created_at timestamptz);"
+                 "CREATE TABLE tasks(run_id text); CREATE TABLE vendor_checkpoints(run_id text);"
+                 "INSERT INTO runs VALUES('old-run','vendor','finished',now());"
+                 "INSERT INTO tasks VALUES('old-run'); INSERT INTO vendor_checkpoints VALUES('old-run');")
+        for registry_exists in (False, True):
+            with self.subTest(registry_exists=registry_exists):
+                if registry_exists:
+                    self.sql("CREATE TABLE plugin_checkpoint_tables(plugin_type text,checkpoint_table text);"
+                             "INSERT INTO plugin_checkpoint_tables VALUES('another-plugin','another_checkpoints');")
+                result = self.script('prune_old_runs.ps1', '-Keep', '0', *self.database_args(), succeeds=False)
+                self.assertNotIn('pruned operational history:', result.stdout)
+                self.assertIn('initialize', result.stderr)
+                for table in ('runs', 'tasks', 'vendor_checkpoints'):
+                    self.assertEqual(self.sql(f'SELECT count(*) FROM {table}'), '1')
+        # Initializing the old plugin registers its existing table, so a later prune succeeds.
+        self.sql("INSERT INTO plugin_checkpoint_tables VALUES('vendor','vendor_checkpoints');")
+        self.script('prune_old_runs.ps1', '-Keep', '0', *self.database_args())
+        for table in ('runs', 'tasks', 'vendor_checkpoints'):
+            self.assertEqual(self.sql(f'SELECT count(*) FROM {table}'), '0')
 
     def test_prune_sql_error_rolls_back_and_never_reports_success(self):
-        self.sql("CREATE TABLE runs(run_id text PRIMARY KEY,status text,created_at timestamptz);"
-                 "INSERT INTO runs VALUES('finished','finished',now());")
+        self.sql("CREATE TABLE runs(run_id text PRIMARY KEY,plugin_type text,status text,created_at timestamptz);"
+                 "CREATE TABLE tasks(run_id text); CREATE TABLE vendor_checkpoints(run_id text);"
+                 "CREATE TABLE plugin_checkpoint_tables(plugin_type text,checkpoint_table text);"
+                 "INSERT INTO plugin_checkpoint_tables VALUES('vendor','vendor_checkpoints');"
+                 "INSERT INTO runs VALUES('finished','vendor','finished',now());"
+                 "INSERT INTO tasks VALUES('finished'); INSERT INTO vendor_checkpoints VALUES('finished');"
+                 "CREATE FUNCTION reject_prune() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+                 "RAISE EXCEPTION 'injected checkpoint delete failure'; END; $$;"
+                 "CREATE TRIGGER reject_prune BEFORE DELETE ON vendor_checkpoints FOR EACH ROW "
+                 "EXECUTE FUNCTION reject_prune();")
         result = self.script('prune_old_runs.ps1', '-Keep', '0', *self.database_args(), succeeds=False)
         self.assertNotIn('pruned operational history:', result.stdout)
-        self.assertEqual(self.sql('SELECT count(*) FROM runs'), '1')
+        self.assertIn('injected checkpoint delete failure', result.stderr)
+        for table in ('runs', 'tasks', 'vendor_checkpoints'):
+            self.assertEqual(self.sql(f'SELECT count(*) FROM {table}'), '1')
 
     def test_export_quotes_run_id_and_preserves_output_on_sql_failure(self):
         run = "run-'quoted"

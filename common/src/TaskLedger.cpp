@@ -21,7 +21,10 @@ bool Unhex(const std::string& text, std::string* bytes) {
     return true;
 }
 }
-bool TaskLedger::init(const std::string& config,const std::string& plugin) { return store_.init(config,plugin); }
+bool TaskLedger::init(const std::string& config, const std::string& plugin,
+                      const std::string& checkpoint_table) {
+    return store_.init(config, plugin, checkpoint_table);
+}
 void TaskLedger::clear() {
     run_.clear(); tasks_.clear(); pending_.clear(); priority_.clear(); queued_.clear();
     in_flight_.clear(); done_.clear(); finished_=false;

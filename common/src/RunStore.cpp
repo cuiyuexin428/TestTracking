@@ -5,21 +5,35 @@
 #include <json.hpp>
 
 namespace common {
-bool RunStore::init(const std::string& config, const std::string& plugin) {
+bool RunStore::init(const std::string& config, const std::string& plugin,
+                    const std::string& checkpoint_table) {
     const auto cfg = nlohmann::json::parse(config);
     plugin_ = plugin;
     directory_ = cfg.value("store_dir", std::string());
     program_version_ = cfg.value("expected_program_version", std::string());
     dataset_version_ = cfg.value("expected_dataset_version", std::string());
-    checkpoint_table_ = plugin == "coverage" ? "coverage_checkpoints" : "stp_compare_checkpoints";
+    if (!IsValidIdentifier(checkpoint_table)) return false;
+    checkpoint_table_ = checkpoint_table;
     postgres_ = cfg.value("store_type", std::string("file")) == "postgres";
 #ifdef _WIN32
     if (postgres_) {
         if (!connection_.connect(cfg.value("db_conn", std::string()))) return false;
         auto conn = connection_.get();
-        return EnsurePluginResultSchema(conn) && PgExec(conn,
+        PgTransaction transaction(conn);
+        if (!transaction.active() || !EnsurePluginResultSchema(conn) || !PgExec(conn,
             ("CREATE TABLE IF NOT EXISTS " + checkpoint_table_ +
-             "(run_id text PRIMARY KEY,blob bytea NOT NULL,updated_at timestamptz DEFAULT now())").c_str(), {});
+             "(run_id text PRIMARY KEY,blob bytea NOT NULL,updated_at timestamptz DEFAULT now())").c_str(), {}) ||
+            !PgExec(conn,
+                "CREATE TABLE IF NOT EXISTS plugin_checkpoint_tables("
+                "plugin_type text NOT NULL,checkpoint_table text NOT NULL,"
+                "registered_at timestamptz DEFAULT now(),"
+                "PRIMARY KEY(plugin_type,checkpoint_table))", {}) ||
+            !PgExec(conn,
+                // Record the actual relation name: unquoted SQL folds case.
+                "INSERT INTO plugin_checkpoint_tables(plugin_type,checkpoint_table) "
+                "SELECT $1,relname FROM pg_class WHERE oid=to_regclass($2) ON CONFLICT DO NOTHING",
+                {{plugin_,false},{checkpoint_table_,false}})) return false;
+        return transaction.commit();
     }
 #endif
     if (postgres_ || directory_.empty()) return false;

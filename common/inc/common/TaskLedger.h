@@ -10,7 +10,8 @@ namespace common {
 // task adds one small durable journal entry. Dispatch/requeue never rewrite N tasks.
 class TaskLedger {
 public:
-    bool init(const std::string& config, const std::string& plugin);
+    bool init(const std::string& config, const std::string& plugin,
+              const std::string& checkpoint_table);
     bool plan(const std::string& run, const std::vector<Task>& tasks,
               const std::vector<std::string>& files, const std::string& fingerprint);
     bool restore(const std::string& run);

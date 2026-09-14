@@ -7,7 +7,10 @@ namespace common {
 // Durable execution manifest is separate from the disposable recovery journal.
 class RunStore {
 public:
-    bool init(const std::string& config, const std::string& plugin);
+    // The plugin owns the checkpoint table name. RunStore persists the common
+    // plan there and keeps completion records in the shared journal tables.
+    bool init(const std::string& config, const std::string& plugin,
+              const std::string& checkpoint_table);
     bool savePlan(const std::string& run, const std::string& blob,
                   const std::vector<std::string>& files, const std::string& fingerprint);
     bool loadPlan(const std::string& run, std::string* blob);
