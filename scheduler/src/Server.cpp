@@ -1,100 +1,103 @@
 #include "scheduler/Server.h"
 
+#include <algorithm>
+#include <deque>
+#include <unordered_map>
+
 #include "common/Logger.h"
 
-#include <exception>
-#include <utility>
-
 namespace scheduler {
-
 Server::Server(const std::string& endpoint, const std::chrono::milliseconds& poll_timeout)
-    : router_(endpoint), poll_timeout_(poll_timeout) {
+    : endpoint_(endpoint), poll_timeout_(poll_timeout) {
 }
-
 Server::~Server() {
     stop();
 }
-
 void Server::start() {
-    // A replacement DEALER using the same worker identity must take over the
-    // route immediately; otherwise the ROUTER can keep sending to a crashed
-    // client's stale connection until its transport state expires.
-    const int handover = 1;
-    router_.setOption(ZMQ_ROUTER_HANDOVER, &handover, sizeof(handover));
-    router_.bind();
+    std::promise<void> ready;
+    auto result = ready.get_future();
     running_.store(true);
-    thread_ = std::thread(&Server::RunLoop, this);
+    thread_ = std::thread(&Server::RunLoop, this, std::move(ready));
+    result.get();
 }
-
 void Server::stop() {
-    if (!running_.exchange(false)) {
-        return;
-    }
-    if (thread_.joinable()) {
-        thread_.join();
-    }
+    running_.store(false);
+    if (thread_.joinable()) thread_.join();
 }
-
 void Server::sendTo(const std::string& identity, const common::Envelope& envelope) {
-    outgoing_.push({identity, envelope});
+    if (outgoing_.size() < 8192)
+        outgoing_.push({identity, envelope});
+    else
+        LOG_WARN("server: outgoing queue full; protocol retry required");
 }
-
 bool Server::tryRecv(IncomingMessage& out, const std::chrono::milliseconds& timeout) {
     return incoming_.pop(out, timeout);
 }
-
-void Server::RunLoop() {
-    OutgoingMessage out;
-    while (running_.load(std::memory_order_relaxed)) {
-        try {
-            if (router_.waitReadable(poll_timeout_)) {
-                std::vector<std::string> parts = router_.recvMsgParts();
-                if (parts.size() >= 2) {
-                    common::Envelope env;
-                    if (env.ParseFromString(parts[1])) {
-                        IncomingMessage msg;
+void Server::RunLoop(std::promise<void> ready) {
+    bool initialized = false;
+    try {
+        // Creation, binding, I/O and destruction all have the same owner.
+        common::ZmqRouter router(endpoint_);
+        const int one = 1;
+        router.setOption(ZMQ_ROUTER_HANDOVER, &one, sizeof(one));
+        router.setOption(ZMQ_ROUTER_MANDATORY, &one, sizeof(one));
+        router.bind();
+        ready.set_value();
+        initialized = true;
+        struct Pending {
+            std::string bytes;
+            std::chrono::steady_clock::time_point queued;
+        };
+        std::unordered_map<std::string, std::deque<Pending>> pending;
+        while (running_.load()) {
+            if (router.waitReadable(std::min(poll_timeout_, std::chrono::milliseconds(10)))) {
+                for (int i = 0; i < 128; ++i) {
+                    const auto parts = router.recvMsgParts();
+                    IncomingMessage msg;
+                    if (parts.size() == 2 && msg.envelope.ParseFromString(parts[1])) {
                         msg.identity = parts[0];
-                        msg.envelope = std::move(env);
-                        msg.peer_address = router_.lastPeerAddress();
-                        incoming_.push(std::move(msg));
-                    } else {
-                        LOG_WARN("server: dropped unparseable message from " << parts[0]);
+                        msg.peer_address = router.lastPeerAddress();
+                        msg.received_at = std::chrono::steady_clock::now();
+                        if (msg.envelope.type() == common::HEARTBEAT &&
+                            msg.envelope.has_heartbeat()) {
+                            if (heartbeat_handler_) heartbeat_handler_(msg);
+                        } else if (incoming_.size() < 8192)
+                            incoming_.push(std::move(msg));
                     }
-                } else {
-                    LOG_WARN("server: dropped malformed message (" << parts.size()
-                                                                   << " parts) from "
-                                                                   << (parts.empty()
-                                                                           ? std::string("unknown")
-                                                                           : parts[0]));
+                    if (!router.waitReadable(std::chrono::milliseconds(0))) break;
                 }
             }
-            if (outgoing_.pop(out, std::chrono::milliseconds(0))) {
-                std::string bytes;
-                if (!out.envelope.SerializeToString(&bytes)) {
-                    LOG_ERROR("server: failed to serialize envelope");
-                    continue;
-                }
-                if (router_.waitWritable(std::chrono::milliseconds(0))) {
-                    router_.sendMsgParts({out.identity, bytes});
-                } else {
-                    // Send queue full (HWM): keep this message at the head so
-                    // ordering is preserved and it is retried next round.
-                    // If this keeps happening in production it is a P0 sign
-                    // that the server thread is not draining the queue.
-                    outgoing_.pushFront(std::move(out));
-                    continue;
-                }
+            OutgoingMessage out;
+            for (int i = 0; i < 256 && outgoing_.pop(out, std::chrono::milliseconds(0)); ++i) {
+                // Bound both peer count and per-peer backlog.
+                if (!pending.count(out.identity) && pending.size() >= 4096) continue;
+                auto& queue = pending[out.identity];
+                if (queue.size() < 256)
+                    queue.push_back(
+                        {out.envelope.SerializeAsString(), std::chrono::steady_clock::now()});
             }
-        } catch (const std::exception& e) {
-            // A zmq failure means the network layer is broken; there is no
-            // point keeping the scheduler alive.
-            LOG_ERROR("server: fatal zmq error: " << e.what());
-            std::terminate();
-        } catch (...) {
-            LOG_ERROR("server: fatal zmq unknown error");
-            std::terminate();
+            // Preserve per-client order without head-of-line blocking others.
+            for (auto it = pending.begin(); it != pending.end();) {
+                auto& queue = it->second;
+                for (int n = 0; n < 32 && !queue.empty(); ++n) {
+                    const bool expired = std::chrono::steady_clock::now() - queue.front().queued >
+                                         std::chrono::seconds(10);
+                    if (!expired && !router.trySendMsgParts({it->first, queue.front().bytes}))
+                        break;
+                    queue.pop_front();
+                }
+                if (queue.empty())
+                    it = pending.erase(it);
+                else
+                    ++it;
+            }
         }
+    } catch (...) {
+        running_.store(false);
+        if (!initialized)
+            ready.set_exception(std::current_exception());
+        else
+            LOG_ERROR("server: network loop failed");
     }
 }
-
 }  // namespace scheduler

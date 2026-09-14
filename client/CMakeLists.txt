@@ -17,5 +17,8 @@ add_custom_target(client_config ALL
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         ${CMAKE_CURRENT_SOURCE_DIR}/client.json
         ${CMAKE_BINARY_DIR}/bin/$<CONFIG>/config/client.json
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${CMAKE_CURRENT_SOURCE_DIR}/client.stpcompare.json
+        ${CMAKE_BINARY_DIR}/bin/$<CONFIG>/config/client.stpcompare.json
 )
 add_dependencies(client client_config)

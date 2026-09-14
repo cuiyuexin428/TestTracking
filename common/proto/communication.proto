@@ -28,5 +28,7 @@ message Envelope {
     StopCommand stop = 11;
     TaskAck task_ack = 12;
     TaskRejectCommand task_reject = 13;
+    HeartbeatAck heartbeat_ack = 15;
+    TaskReportAck task_report_ack = 16;
   }
 }

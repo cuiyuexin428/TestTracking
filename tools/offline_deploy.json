@@ -24,7 +24,6 @@
   "package_out_dir": "dist/client_package",
   "worker_id": "worker-1",
   "task_threads": 2,
-  "batch_size": 1000,
   "task_size": 25,
   "store_cov": true
 }

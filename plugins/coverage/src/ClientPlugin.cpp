@@ -1,6 +1,9 @@
 #include "coverage/ClientPlugin.h"
 
 #include "common/Logger.h"
+#include "common/Util.h"
+#include "common/ProcessRunner.h"
+#include "common/AtomicFile.h"
 
 #include "coverage.pb.h"
 #include "coverage/CoverageUtil.h"
@@ -9,6 +12,7 @@
 #include <json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <chrono>
@@ -22,23 +26,8 @@ namespace coverage_plugin {
 
 namespace {
 
-#ifdef _WIN32
-std::string NormalizePath(std::string path) {
-    for (char& c : path) {
-        if (c == '/') {
-            c = '\\';
-        }
-    }
-    return path;
-}
-#else
-std::string NormalizePath(const std::string& path) {
-    return path;
-}
-#endif
-
 std::vector<std::uint64_t> SyntheticPoints(const std::string& file) {
-    const std::uint64_t seed = Fnv1a64(file);
+    const std::uint64_t seed = common::Fnv1a64(file);
     const std::uint64_t count = 10 + (seed % 40);
     std::vector<std::uint64_t> points;
     points.reserve(count);
@@ -136,6 +125,9 @@ bool ClientPlugin::init(const std::string& config) {
     keep_reports_ = cfg.value("keep_reports", false);
     store_cov_ = cfg.value("store_cov", false);
     dry_run_delay_ms_ = cfg.value("dry_run_delay_ms", 0);
+    process_timeout_ms_ = cfg.value("process_timeout_ms", 300000);
+    if (process_timeout_ms_ <= 0) return false;
+    engine_dlls_.clear();
     for (const nlohmann::json& dll : cfg.value("engine_dlls", nlohmann::json::array())) {
         engine_dlls_.push_back(dll.get<std::string>());
     }
@@ -161,12 +153,20 @@ bool ClientPlugin::init(const std::string& config) {
         dry_run_delay_ms_ = 0;
     }
 
+    if (!dry_run_ && export_dir_.empty()) {
+        export_dir_ = "reports";
+    }
     if (!export_dir_.empty()) {
         std::error_code ec;
         std::filesystem::create_directories(export_dir_, ec);
+        if (ec) {
+            LOG_ERROR("coverage plugin: cannot create export_dir " << export_dir_
+                                                                  << ": " << ec.message());
+            return false;
+        }
     }
 
-    store_ = CreateCoverageStore(config);
+    store_ = CreateCoverageResultStore(config);
     if (!store_->init(config)) {
         LOG_ERROR("coverage plugin: coverage store init failed");
         return false;
@@ -191,115 +191,109 @@ std::string ClientPlugin::heartbeatInfo() const {
     return "program=" + program_version_ + ",dataset=" + dataset_version_;
 }
 
-bool ClientPlugin::RunOneFile(const std::string& run_id, int wave, const std::string& file,
-                              std::vector<std::uint64_t>& points) {
-    const std::string stp_path = stp_root_ + "/" + file;
-    const std::string xml_path =
-        NormalizePath(export_dir_ + "/" + std::to_string(Fnv1a64(file)) + ".xml");
-    const std::string cov_path =
-        NormalizePath(export_dir_ + "/" + std::to_string(Fnv1a64(file)) + ".cov");
-
-    std::string command = "\"" + opencppcoverage_ + "\" --quiet";
-    for (const std::string& module : engine_dlls_) {
-        command += " --modules=" + NormalizePath(module);
+bool ClientPlugin::RunOneFile(const std::string& run_id, const std::string& file,
+                              FileCoverageResult* output,
+                              const common::CancellationToken& cancellation) {
+    static std::atomic<std::uint64_t> sequence{0};
+    const auto stamp=std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto report_dir=std::filesystem::absolute(export_dir_)/
+        (std::to_string(stamp)+"-"+std::to_string(sequence.fetch_add(1)));
+    std::error_code ec;
+    if (!std::filesystem::create_directory(report_dir,ec) || ec) {
+        output->detail="cannot create execution directory"; return false;
     }
-    command += " --export_type=cobertura:" + xml_path;
-    if (store_cov_) {
-        command += " --export_type=binary:" + cov_path;
-    }
-    command += " -- \"" + NormalizePath(target_exe_) + "\" \"" + NormalizePath(stp_path) + "\"";
-
-    const int exit_code = RunCommand(command);
-    if (exit_code != 0) {
-        LOG_WARN("coverage plugin: opencppcoverage exit=" << exit_code << " for " << file);
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() { std::error_code ignored; std::filesystem::remove_all(path,ignored); }
+    } cleanup{report_dir};
+    const auto xml_path=report_dir/"coverage.xml";
+    const auto cov_path=report_dir/"coverage.cov";
+    common::ProcessOptions options;
+    options.executable=std::filesystem::absolute(opencppcoverage_).string();
+    options.arguments={"--quiet"};
+    options.working_directory=report_dir.string();
+    options.timeout=std::chrono::milliseconds(process_timeout_ms_);
+    for(const auto& module:engine_dlls_)
+        options.arguments.push_back("--modules="+common::NormalizePath(std::filesystem::absolute(module).string()));
+    options.arguments.push_back("--export_type=cobertura:"+common::NormalizePath(xml_path.string()));
+    if(store_cov_) options.arguments.push_back("--export_type=binary:"+common::NormalizePath(cov_path.string()));
+    options.arguments.push_back("--");
+    options.arguments.push_back(common::NormalizePath(std::filesystem::absolute(target_exe_).string()));
+    options.arguments.push_back(common::NormalizePath(std::filesystem::absolute(std::filesystem::path(stp_root_)/file).string()));
+    const auto process=common::ProcessRunner::run(options,cancellation);
+    if(!process.started || process.exit_code!=0 || process.cancelled || process.timed_out) {
+        output->detail=process.cancelled?"cancelled":process.timed_out?"process timed out":
+            "coverage process failed: "+std::to_string(process.exit_code)+" "+process.error;
         return false;
     }
-    if (!ParseCobertura(xml_path, points)) {
-        LOG_WARN("coverage plugin: failed to parse " << xml_path);
-        return false;
+    if(!ParseCobertura(xml_path.string(),output->points)) {
+        output->detail="missing or invalid Cobertura report"; return false;
     }
-    if (store_cov_) {
-        std::ifstream cov_in(cov_path, std::ios::binary | std::ios::ate);
-        if (cov_in.is_open()) {
-            const std::streamsize size = cov_in.tellg();
-            std::string data(static_cast<size_t>(size), '\0');
-            cov_in.seekg(0);
-            cov_in.read(&data[0], size);
-            if (!store_->saveFileCov(run_id, wave, file, data,
-                                     static_cast<std::int64_t>(size))) {
-                LOG_WARN("coverage plugin: failed to store cov for " << file);
-                return false;
-            }
-            std::error_code ec;
-            std::filesystem::remove(cov_path, ec);
-        } else {
-            LOG_WARN("coverage plugin: failed to read cov " << cov_path);
-            return false;
+    if(store_cov_ && (!common::ReadCompleteFile(cov_path,&output->cov) || output->cov.empty())) {
+        output->detail="missing or empty coverage binary"; return false;
+    }
+    if(keep_reports_) {
+        std::string xml;
+        const auto published=std::filesystem::path(export_dir_)/
+            (std::to_string(common::Fnv1a64(file))+".xml");
+        if(!common::ReadCompleteFile(xml_path,&xml) || !common::WriteAtomicFile(published,xml)) {
+            output->detail="cannot publish validation report"; return false;
         }
-    }
-    if (!keep_reports_) {
-        std::error_code ec;
-        std::filesystem::remove(xml_path, ec);
     }
     return true;
 }
 
 bool ClientPlugin::execute(const common::Task& task, common::TaskResult& result) {
-    coverage::CoverageTask cov_task;
-    if (!cov_task.ParseFromString(task.payload())) {
-        result.set_exit_code(-1);
-        return false;
-    }
-
-    coverage::CoverageResult coverage_result;
-    for (const std::string& file : cov_task.files()) {
-        coverage::FileCoverage entry;
-        entry.set_file(file);
-
-        std::vector<std::uint64_t> points;
-        bool ok = false;
-        std::set<std::uint64_t> existing;
-        const bool already_covered =
-            store_->loadFileCoverage(cov_task.run_id(), cov_task.wave_id(), file, &existing);
-        if (already_covered) {
-            points.assign(existing.begin(), existing.end());
-            ok = true;
-            LOG_INFO("coverage plugin: file " << file << " already covered, skip ("
-                                              << points.size() << " lines)");
-        } else if (dry_run_) {
-            points = SyntheticPoints(file);
-            ok = true;
-            if (dry_run_delay_ms_ > 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(dry_run_delay_ms_));
-            }
-        } else {
-            ok = RunOneFile(cov_task.run_id(), cov_task.wave_id(), file, points);
-        }
-        // The same (path, line) can appear once per module; dedupe so counts
-        // and the point sets are exact.
-        std::sort(points.begin(), points.end());
-        points.erase(std::unique(points.begin(), points.end()), points.end());
-        if (ok) {
-            ok = store_->saveFileCoverage(cov_task.run_id(), cov_task.wave_id(), file, points);
-            if (!ok) {
-                LOG_WARN("coverage plugin: failed to store points for " << file);
-            }
-        }
-
-        entry.set_ok(ok);
-        entry.set_covered_lines(static_cast<std::int32_t>(points.size()));
-        LOG_INFO("coverage plugin: file " << file << (ok ? " ok" : " failed")
-                                          << " covered_lines=" << points.size());
-        *coverage_result.add_files() = entry;
-    }
-
-    if (!coverage_result.SerializeToString(result.mutable_result())) {
-        LOG_ERROR("coverage plugin: failed to serialize task result " << task.task_id());
-        result.set_exit_code(-1);
-        return false;
-    }
-    result.set_exit_code(0);
-    return true;
+    return execute(task,result,common::CancellationToken{});
 }
 
+bool ClientPlugin::execute(const common::Task& task, common::TaskResult& result,
+                           const common::CancellationToken& cancellation) {
+    if (cancellation.isCancellationRequested()) {
+        result.set_exit_code(-2);
+        return false;
+    }
+    coverage::CoverageTask payload;
+    if(!payload.ParseFromString(task.payload()) ||
+       (!task.run_id().empty() && task.run_id()!=payload.run_id())) {
+        result.set_exit_code(-1); return false;
+    }
+    coverage::CoverageResult summary;
+    bool all_ok=true, all_persisted=true;
+    for(const auto& file:payload.files()) {
+        if(cancellation.isCancellationRequested()) { result.set_exit_code(-2); return false; }
+        FileCoverageResult output;
+        output.run_id=payload.run_id(); output.file=file; output.attempt_id=task.attempt_id();
+        std::set<std::uint64_t> existing;
+        const bool cached=store_->loadFileCoverage(payload.run_id(),file,&existing) &&
+            (!store_cov_ || dry_run_ || store_->hasFileCov(payload.run_id(),file));
+        if(cached) {
+            output.points.assign(existing.begin(),existing.end()); output.successful=true;
+        } else if(dry_run_) {
+            if(cancellation.waitFor(std::chrono::milliseconds(dry_run_delay_ms_))) {
+                result.set_exit_code(-2); return false;
+            }
+            output.points=SyntheticPoints(file); output.successful=true;
+        } else {
+            output.successful=RunOneFile(payload.run_id(),file,&output,cancellation);
+        }
+        if(cancellation.isCancellationRequested()) { result.set_exit_code(-2); return false; }
+        std::sort(output.points.begin(),output.points.end());
+        output.points.erase(std::unique(output.points.begin(),output.points.end()),output.points.end());
+        if(!cached && !store_->publish(output)) {
+            output.successful=false; all_persisted=false;
+            output.detail="failed to publish raw execution result";
+        }
+        auto* entry=summary.add_files(); entry->set_file(file);
+        entry->set_ok(output.successful);
+        entry->set_covered_lines(static_cast<std::int32_t>(output.points.size()));
+        all_ok=all_ok && output.successful;
+        LOG_INFO("coverage: file "<<file<<(output.successful?" ok":" failed")<<" "<<output.detail);
+    }
+    if(!summary.SerializeToString(result.mutable_result())) { result.set_exit_code(-1); return false; }
+    // A durable business failure is a completed execution; a failed database
+    // publication must be retried by the framework, never reported committed.
+    result.set_exit_code(all_persisted?(all_ok?0:1):-1);
+    return all_persisted;
+}
 }  // namespace coverage_plugin

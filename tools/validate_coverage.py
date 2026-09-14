@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """Cross-validation for the coverage plugin (offline acceptance tool).
 
-Supports multi-wave runs: wave staging dirs are processed in order and the
-cumulative coverage C is carried across waves, mirroring the plugin.
+The run is stored as a flat directory of per-file point files (one <fnv>.json
+per file under the run dir). Settlement is a single global greedy pass over all
+files (no waves), so this validator mirrors that.
 
 Verifies:
   1. Point-set parsing: plugin-stored points vs an independent cobertura parse
      of the kept XML reports (per file).
-  2. Greedy selection with cross-wave carry: reference greedy must satisfy
-     final cumulative == union of all files across all waves, and the
-     plugin's selected.txt must reach the same union.
-  3. Exact minimum set cover per wave by brute force (small N only).
+  2. Global greedy selection: the reference greedy must reach the union of all
+     files' point sets.
+  3. Exact minimum set cover by brute force (small N only).
+  4. (optional) The exported selected list (from coverage_selected) reaches the
+     same union.
 
 Usage:
-  python validate_coverage.py --store-dir <run_dir> --reports-dir <export_dir>
-      --selected-file <run_dir/selected.txt> [--brute-force]
+  python validate_coverage.py --run-dir <store_dir/run_id> --reports-dir <export_dir>
+      [--selected-file <file>] [--brute-force]
 """
 
 import argparse
@@ -112,15 +114,15 @@ def brute_force_min_cover(file_points, target):
     return best_size
 
 
-def load_wave(wave_dir, reports_dir):
-    """Returns (plugin_sets, ref_sets, file_results) for one wave."""
+def load_run(run_dir, reports_dir):
+    """Returns (plugin_sets, ref_sets, results) for a flat run dir."""
     plugin_sets = {}
     ref_sets = {}
     results = []
-    for name in sorted(os.listdir(wave_dir)):
+    for name in sorted(os.listdir(run_dir)):
         if not name.endswith(".json"):
             continue
-        with open(os.path.join(wave_dir, name), encoding="utf-8") as f:
+        with open(os.path.join(run_dir, name), encoding="utf-8") as f:
             data = json.load(f)
         file_name = data["file"]
         plugin_points = set(data["points"])
@@ -140,109 +142,65 @@ def load_wave(wave_dir, reports_dir):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--store-dir", required=True,
-                        help="run dir containing wave-* staging dirs")
+    parser.add_argument("--run-dir", required=True,
+                        help="run dir containing per-file <fnv>.json point files")
     parser.add_argument("--reports-dir", required=True,
                         help="dir with kept cobertura XMLs")
-    parser.add_argument("--selected-file", required=True,
-                        help="plugin selected.txt path")
+    parser.add_argument("--selected-file", default="",
+                        help="optional exported selected file list")
     parser.add_argument("--brute-force", action="store_true",
-                        help="run exact minimum set cover per wave")
+                        help="run exact minimum set cover")
     args = parser.parse_args()
 
-    waves = sorted(
-        d for d in os.listdir(args.store_dir)
-        if d.startswith("wave-") and os.path.isdir(os.path.join(args.store_dir, d)))
-    if not waves:
-        print(f"[FAIL] no wave-* dirs under {args.store_dir}")
+    if not os.path.isdir(args.run_dir):
+        print(f"[FAIL] run dir not found: {args.run_dir}")
+        return 1
+
+    plugin_sets, ref_sets, results = load_run(args.run_dir, args.reports_dir)
+    if not plugin_sets:
+        print(f"[FAIL] no *.json point files under {args.run_dir}")
         return 1
 
     failed = 0
-    cumulative = set()
-    reference_selected = []
-    union_all = set()
-
-    print(f"== multi-wave validation: {len(waves)} waves ==")
-    for wave in waves:
-        wave_dir = os.path.join(args.store_dir, wave)
-        plugin_sets, ref_sets, results = load_wave(wave_dir, args.reports_dir)
-
-        print(f"--- {wave} ---")
-        for file_name, plugin_points, ref_points, ok, extra in results:
-            if ref_points is None:
-                print(f"[FAIL] {file_name}: {extra}")
-                failed += 1
-                continue
-            print(f"[{'PASS' if ok else 'FAIL'}] {file_name}: "
-                  f"plugin={len(plugin_points)} ref={len(ref_points)} xor={extra}")
-            if not ok:
-                failed += 1
-
-        wave_all = set()
-        for pts in plugin_sets.values():
-            wave_all |= pts
-        union_all |= wave_all
-
-        cumulative_before = set(cumulative)
-        selected_wave = greedy_select(plugin_sets, cumulative)
-        wave_ok = cumulative == (cumulative_before | wave_all)
-        print(f"[{'PASS' if wave_ok else 'FAIL'}] {wave}: "
-              f"cumulative after wave = {len(cumulative)} "
-              f"(prev {len(cumulative_before)} | wave-all {len(wave_all)})")
-        if not wave_ok:
+    print(f"== coverage validation: {len(plugin_sets)} files ==")
+    for file_name, plugin_points, ref_points, ok, extra in results:
+        if ref_points is None:
+            print(f"[FAIL] {file_name}: {extra}")
             failed += 1
-        reference_selected.extend(selected_wave)
+            continue
+        print(f"[{'PASS' if ok else 'FAIL'}] {file_name}: "
+              f"plugin={len(plugin_points)} ref={len(ref_points)} xor={extra}")
+        if not ok:
+            failed += 1
 
-        if args.brute_force and len(plugin_sets) <= 16:
-            # Only this wave's NEW points are reachable by this wave's files.
-            needed = {p for p in wave_all if p not in cumulative_before}
-            optimal = brute_force_min_cover(plugin_sets, needed)
-            print(f"[INFO] {wave}: greedy={len(selected_wave)} "
-                  f"exact-optimal={optimal}")
+    union_all = set()
+    for pts in plugin_sets.values():
+        union_all |= pts
 
-        summary_path = os.path.join(args.store_dir, f"wave-summary-{wave.split('-')[1]}.json")
-        if os.path.exists(summary_path):
-            with open(summary_path, encoding="utf-8") as f:
-                summary = json.load(f)
-            summary_ok = summary.get("covered_lines") == len(cumulative)
-            print(f"[{'PASS' if summary_ok else 'FAIL'}] {wave} wave summary "
-                  f"covered={summary.get('covered_lines')} "
-                  f"== cumulative points={len(cumulative)}")
-            if not summary_ok:
-                failed += 1
-
+    cumulative = set()
+    selected_wave = greedy_select(plugin_sets, cumulative)
     final_ok = cumulative == union_all
     print(f"[{'PASS' if final_ok else 'FAIL'}] final cumulative == union(all): "
           f"{len(cumulative)} vs {len(union_all)}")
     if not final_ok:
         failed += 1
 
-    selected_txt = []
-    if os.path.exists(args.selected_file):
-        with open(args.selected_file, encoding="utf-8") as f:
-            selected_txt = [line.strip() for line in f if line.strip()]
-    plugin_union = set()
-    plugin_selected_names = set(selected_txt)
-    for wave in waves:
-        wave_dir = os.path.join(args.store_dir, wave)
-        for name in os.listdir(wave_dir):
-            if not name.endswith(".json"):
-                continue
-            with open(os.path.join(wave_dir, name), encoding="utf-8") as f:
-                data = json.load(f)
-            if data["file"] in plugin_selected_names:
-                plugin_union |= set(data["points"])
-    sel_ok = plugin_union == union_all
-    print(f"[{'PASS' if sel_ok else 'FAIL'}] plugin selected.txt union == "
-          f"union(all): {len(plugin_union)} vs {len(union_all)}")
-    if not sel_ok:
-        failed += 1
+    if args.brute_force and len(plugin_sets) <= 16:
+        optimal = brute_force_min_cover(plugin_sets, union_all)
+        print(f"[INFO] greedy={len(selected_wave)} exact-optimal={optimal}")
 
-    if set(selected_txt) == set(reference_selected):
-        print(f"[PASS] selection identical: {len(selected_txt)} files")
-    else:
-        print(f"[INFO] selection differs by tie-break: plugin={len(selected_txt)} "
-              f"reference={len(reference_selected)} (union already verified)")
+    if args.selected_file and os.path.exists(args.selected_file):
+        selected_txt = [line.strip() for line in open(args.selected_file, encoding="utf-8")
+                        if line.strip()]
+        sel_union = set()
+        for file_name in selected_txt:
+            if file_name in plugin_sets:
+                sel_union |= plugin_sets[file_name]
+        sel_ok = sel_union == union_all
+        print(f"[{'PASS' if sel_ok else 'FAIL'}] selected union == union(all): "
+              f"{len(sel_union)} vs {len(union_all)}")
+        if not sel_ok:
+            failed += 1
 
     print()
     if failed == 0:

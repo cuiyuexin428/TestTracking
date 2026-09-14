@@ -53,8 +53,8 @@ public:
                                 const std::string& client_message,
                                 ValidationResult& result) = 0;
 
-    // Plan a run (freely, e.g. waves); the plugin keeps the task pool
-    // internally.
+    // Persist the run plan before returning true. Business payloads remain
+    // plugin-owned; the shared ledger manages pending and committed tasks.
     virtual bool plan(const RunRequest& request,
                       const std::vector<ClientInfo>& clients) = 0;
 
@@ -65,8 +65,11 @@ public:
                              const std::string& request_payload,
                              Task& task) = 0;
 
-    // Process a task execution report.
-    virtual void processResult(const TaskResult& result) = 0;
+    // All runtime calls are serialized on the scheduler worker, including
+    // STOP/checkpoint/cancel. No callback survives its run's lifecycle barrier.
+    // Return true only after durable progress acceptance. Retrying the same
+    // run/task must be idempotent; false keeps the framework attempt in flight.
+    virtual bool processResult(const TaskResult& result) = 0;
 
     // Whether the current run has fully completed (no pending work). Called
     // by the framework to clear the active run context so a new run can

@@ -1,0 +1,57 @@
+{
+  "scheduler": {
+    "endpoint": "tcp://127.0.0.1:5555",
+    "poll_timeout_ms": 50
+  },
+  "client": {
+    "worker_id": "compare-worker-1",
+    "heartbeat_interval_ms": 1000,
+    "task_threads": 1,
+    "request_backoff_initial_ms": 200,
+    "request_backoff_max_ms": 30000,
+    "register_timeout_ms": 5000,
+    "register_max_attempts": 5
+  },
+  "plugins": {
+    "demo": {
+      "dll": "demo.dll",
+      "enabled": false
+    },
+    "coverage": {
+      "dll": "coverage.dll",
+      "enabled": false,
+      "dry_run": true,
+      "store_type": "postgres",
+      "db_conn": "host=127.0.0.1 port=5432 dbname=testtracking user=postgres",
+      "store_dir": "coverage_store",
+      "store_cov": false,
+      "program_dir": "testenv/program",
+      "stp_root": "testenv/dataset",
+      "export_dir": "reports",
+      "opencppcoverage": "testenv/opencppcoverage/OpenCppCoverage.exe",
+      "target_exe": "testenv/program/StepTest.exe",
+      "engine_dlls": [
+        "testenv/program/TKernel.dll",
+        "testenv/program/TKBRep.dll",
+        "testenv/program/TKDESTEP.dll",
+        "testenv/program/TKTopAlgo.dll"
+      ]
+    },
+    "stpcompare": {
+      "dll": "stpcompare.dll",
+      "enabled": true,
+      "dry_run": true,
+      "store_type": "postgres",
+      "db_conn": "host=127.0.0.1 port=5432 dbname=testtracking user=postgres",
+      "store_dir": "stp_compare_store",
+      "table": "stp_compare_old",
+      "program_dir": "testenv/program",
+      "program_exe": "testenv/program/Converter.exe",
+      "program_cmd": "",
+      "info_file": "info.txt",
+      "info_new_file": "info_new.txt",
+      "stp_root": "testenv/dataset",
+      "work_dir": "stp_compare_work"
+    }
+  }
+}

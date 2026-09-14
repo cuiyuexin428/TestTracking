@@ -1,6 +1,7 @@
 #pragma once
 
 #include "communication.pb.h"
+#include "common/CancellationToken.h"
 
 #include <string>
 
@@ -37,6 +38,15 @@ public:
 
     // Execute one task and fill the execution report.
     virtual bool execute(const Task& task, TaskResult& result) = 0;
+
+    // Runs concurrently up to client.task_threads. Implementations should
+    // observe cancellation during waits and before publishing file outcomes.
+    // Rebuild all plugin DLLs together when updating this interface.
+    virtual bool execute(const Task& task, TaskResult& result,
+                         const CancellationToken& cancellation) {
+        if (cancellation.isCancellationRequested()) return false;
+        return execute(task, result);
+    }
 
     // Optional short business info shown in the scheduler's client list
     // (e.g. component versions). Empty string means no extra info.

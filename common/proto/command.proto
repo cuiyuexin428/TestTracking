@@ -13,6 +13,10 @@ message RegisterCommand {
   // Client-generated nonce used to match a response to this registration
   // attempt when an earlier response is delayed in the transport.
   string registration_id = 2;
+  // Framework wire protocol negotiated before plugin validation. A missing
+  // value (zero) identifies a pre-handshake-version client and is rejected.
+  uint32 protocol_version = 3;
+  repeated string capabilities = 4;
 }
 
 // Registration validation result. payload is the opaque business reply
@@ -27,6 +31,8 @@ message RegisterResult {
   string reason = 3;
   bool accepted = 4;
   string registration_id = 5;
+  uint32 protocol_version = 6;
+  repeated string capabilities = 7;
 }
 
 // Client task request. count is the desired number of tasks: the scheduler
@@ -54,6 +60,7 @@ message NoTaskCommand {}
 // client disconnects or a task gets stuck.
 message TaskAck {
   string task_id = 1;
+  string attempt_id = 2;
 }
 
 // Task rejection (client -> scheduler): the client received a task it cannot
@@ -62,6 +69,7 @@ message TaskAck {
 message TaskRejectCommand {
   string task_id = 1;
   string reason = 2;
+  string attempt_id = 3;
 }
 
 // Wake a sleeping client (sent by the scheduler's wakeup command).
@@ -87,4 +95,16 @@ message TaskResult {
   int64 duration_ms = 3;
   string artifact_path = 4;
   bytes result = 5;
+  string attempt_id = 6;
+  string run_id = 7;
+}
+
+// Retried reports are idempotent. accepted means the framework and plugin
+// progress are durable. A non-retryable rejection denotes an obsolete attempt.
+message TaskReportAck {
+  string task_id = 1;
+  string attempt_id = 2;
+  bool accepted = 3;
+  bool retryable = 4;
+  string reason = 5;
 }

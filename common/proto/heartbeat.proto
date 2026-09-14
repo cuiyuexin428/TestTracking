@@ -19,3 +19,8 @@ message Heartbeat {
   ResourceUsage resource = 3;  // health data (memory etc.)
   string plugin_info = 4;  // opaque business info (e.g. versions) for display
 }
+
+message HeartbeatAck {
+  string session_id = 1;
+  bool registered = 2;
+}

@@ -2,7 +2,6 @@
   "server": {
     "router_endpoint": "tcp://*:5555",
     "poll_timeout_ms": 50,
-    "process_threads": 4,
     "client_timeout_ms": 5000,
     "task_lease_timeout_ms": 0,
     "db_conn": "host=127.0.0.1 port=5432 dbname=testtracking user=postgres"
@@ -18,12 +17,17 @@
       "stp_manifest": "C:/Shared/dataset/manifest.txt",
       "store_type": "postgres",
       "db_conn": "host=127.0.0.1 port=5432 dbname=testtracking user=postgres",
-      "batch_size": 1000,
       "task_size": 25,
-      "store_cov": true,
-      "opencppcoverage": "C:/Program Files/OpenCppCoverage/OpenCppCoverage.exe",
       "expected_program_version": "1.0",
       "expected_dataset_version": "d1"
+    },
+    "stpcompare": {
+      "dll": "stpcompare.dll",
+      "enabled": true,
+      "stp_manifest": "C:/Shared/dataset/manifest.txt",
+      "store_type": "postgres",
+      "db_conn": "host=127.0.0.1 port=5432 dbname=testtracking user=postgres",
+      "task_size": 25
     }
   }
 }

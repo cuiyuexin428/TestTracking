@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package stpcompare;
+
+// One task = a list of stp file names (relative paths under stp_root).
+message StpCompareTask {
+  string run_id = 1;
+  repeated string files = 2;
+  // Reserved for client-side retries; the server does not perform file-level
+  // retries.
+  int32 retry_count = 3;
+}
+
+// Per-file outcome. The two txt outputs themselves are written directly into
+// the configured table by the client's StpResultStore; only status travels on
+// the wire so the scheduler can track completion and surface failures.
+message FileOutcome {
+  string file = 1;
+  bool ok = 2;
+  string detail = 3;
+}
+
+message StpCompareResult {
+  repeated FileOutcome files = 1;
+}
+
+// Registration validation payload: component versions of the client package.
+// The framework does not parse it; the stpcompare server plugin interprets it.
+message StpCompareClientInfo {
+  string program_version = 1;
+  string dataset_version = 2;
+}
+
+// Run checkpoint for resume after STOP/crash. The run is a flat task pool; at
+// snapshot time remaining_tasks hold every task that is not finished yet
+// (pending + in-flight), so restore re-dispatches them instead of dropping
+// them.
+message StpCompareCheckpoint {
+  // Checkpoint format version: 1 = flat dispatch.
+  int32 checkpoint_version = 1;
+  int32 total_files = 2;
+  // Fingerprint of the stp manifest the run was planned from, so restore
+  // refuses to resume when the input dataset changed underneath it.
+  string manifest_fingerprint = 3;
+  // Serialized common::Task payloads still pending or in flight at snapshot.
+  repeated bytes remaining_tasks = 4;
+  // Legacy fields removed; preserved so old code cannot reuse the tags.
+  reserved 5, 6, 7;
+}

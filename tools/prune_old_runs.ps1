@@ -1,42 +1,22 @@
-# Deletes old runs (framework runs/tasks + coverage business rows), keeping
-# the most recent -Keep runs. Use -DryRun to preview what would be removed.
-param(
-    [int]$Keep = 10,
-    [switch]$DryRun,
-    [string]$DbConn = 'host=127.0.0.1 port=5432 dbname=testtracking user=postgres',
-    [string]$Psql = 'C:\WorkSpace\ThirdParty\pgsql\bin\psql.exe'
-)
-$ErrorActionPreference = 'Stop'
-
-$runs = & $Psql $DbConn -t -A -c "SELECT run_id FROM runs ORDER BY created_at DESC OFFSET $Keep;" 2>$null
-if (-not $runs) {
-    Write-Host "no runs to prune (keep=$Keep)"
-    exit 0
-}
-$ids = @($runs | Where-Object { $_.Trim() } | ForEach-Object { $_.Trim() })
-Write-Host "runs to prune: $($ids.Count)"
-
-if ($DryRun) {
-    $ids | ForEach-Object { Write-Host "  $_" }
-    exit 0
-}
-
-foreach ($runId in $ids) {
-    $sql = @"
+# Remove operational history for old terminal runs (finished / cancelled / interrupted / failed).
+# Raw and long-term metadata remain. 'stopped' stays for the next start's recovery.
+param([ValidateRange(0,2147483647)][int]$Keep=10,[switch]$DryRun,[string]$DbConn='host=127.0.0.1 port=5432 dbname=testtracking user=postgres',[string]$Psql='')
+$ErrorActionPreference='Stop'; . (Join-Path $PSScriptRoot 'ToolSupport.ps1'); $Psql=Resolve-ProjectPsql $Psql
+$ids=@(Invoke-ProjectSql $Psql $DbConn "SELECT run_id FROM runs WHERE status IN ('finished','cancelled','interrupted','failed') ORDER BY created_at DESC, run_id DESC OFFSET :keep;" @{keep=$Keep} | ? {$_.Trim()})
+if($DryRun){$ids|%{Write-Host "would prune: $_"};exit 0}
+foreach($runId in $ids){
+  $sql=@'
 BEGIN;
-DELETE FROM coverage_wave_points WHERE run_id='$runId';
-DELETE FROM coverage_cov_files WHERE run_id='$runId';
-DELETE FROM coverage_cumulative WHERE run_id='$runId';
-DELETE FROM coverage_selected WHERE run_id='$runId';
-DELETE FROM coverage_run_summary WHERE run_id='$runId';
-DELETE FROM coverage_wave_summary WHERE run_id='$runId';
-DELETE FROM coverage_cumulative_cov WHERE run_id='$runId';
-DELETE FROM coverage_checkpoints WHERE run_id='$runId';
-DELETE FROM tasks WHERE run_id='$runId';
-DELETE FROM runs WHERE run_id='$runId';
+CREATE TEMP TABLE prune_target ON COMMIT DROP AS SELECT run_id FROM runs WHERE run_id=:'run_id' AND status IN ('finished','cancelled','interrupted','failed') FOR UPDATE;
+DELETE FROM tasks WHERE run_id IN (SELECT run_id FROM prune_target);
+DO $$ BEGIN
+  IF to_regclass('coverage_checkpoints') IS NOT NULL THEN DELETE FROM coverage_checkpoints WHERE run_id IN (SELECT run_id FROM prune_target); END IF;
+  IF to_regclass('stp_compare_checkpoints') IS NOT NULL THEN DELETE FROM stp_compare_checkpoints WHERE run_id IN (SELECT run_id FROM prune_target); END IF;
+  IF to_regclass('plugin_task_completions') IS NOT NULL THEN DELETE FROM plugin_task_completions WHERE run_id IN (SELECT run_id FROM prune_target); END IF;
+END $$;
+DELETE FROM runs WHERE run_id IN (SELECT run_id FROM prune_target);
 COMMIT;
-"@
-    & $Psql $DbConn -c $sql 2>&1 | Out-Null
-    Write-Host "pruned $runId"
+'@
+  try { Invoke-ProjectSql $Psql $DbConn $sql @{run_id=$runId}|Out-Null; Write-Host "pruned operational history: $runId" } catch { throw "prune failed for $runId; no success reported: $_" }
 }
-Write-Host 'done'
+Write-Host "done: $($ids.Count) terminal runs"

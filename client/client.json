@@ -36,6 +36,22 @@
         "testenv/program/TKDESTEP.dll",
         "testenv/program/TKTopAlgo.dll"
       ]
+    },
+    "stpcompare": {
+      "dll": "stpcompare.dll",
+      "enabled": false,
+      "dry_run": true,
+      "store_type": "postgres",
+      "db_conn": "host=127.0.0.1 port=5432 dbname=testtracking user=postgres",
+      "store_dir": "stp_compare_store",
+      "table": "stp_compare_old",
+      "program_dir": "testenv/program",
+      "program_exe": "testenv/program/Converter.exe",
+      "program_cmd": "",
+      "info_file": "info.txt",
+      "info_new_file": "info_new.txt",
+      "stp_root": "testenv/dataset",
+      "work_dir": "stp_compare_work"
     }
   }
 }

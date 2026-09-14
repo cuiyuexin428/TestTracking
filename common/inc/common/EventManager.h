@@ -3,7 +3,6 @@
 #include <atomic>
 #include <memory>
 #include <thread>
-#include <mutex>
 #include <vector>
 
 #include "common/BlockingQueue.h"
@@ -21,13 +20,20 @@ public:
     explicit EventManager(int thread_num);
     ~EventManager();
 
-    void push(Event* event);
+    // Ownership always transfers, including when a closed queue rejects work.
+    bool push(Event* event);
+    bool push(std::unique_ptr<Event> event);
+    // Discard queued work and wake waiters. Does not wait for running actions.
+    void requestStop();
+    bool isStopped() const;
+    // Call after requestStop; only from the owner, never from a worker action.
+    void join();
 
 private:
     EventQueue queue_;
     std::vector<std::thread> thread_group;
     std::atomic<bool> stop_{false};
-    std::mutex push_mutex_;
+    std::atomic<int> running_workers_{0};
 };
 
 }  // namespace common

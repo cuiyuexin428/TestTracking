@@ -43,7 +43,7 @@ void TaskExecutor::start(common::WorkerPlugin* plugin, CompletionCallback on_com
     }
     plugin_ = plugin;
     on_completed_ = std::move(on_completed);
-    cancelled_.store(false);
+    cancellation_source_.reset();
     pool_ = std::make_unique<common::EventManager>(thread_count);
 }
 
@@ -55,15 +55,16 @@ void TaskExecutor::push(const common::Task& task) {
     }
     common::WorkerPlugin* plugin = plugin_;
     CompletionCallback on_completed = on_completed_;
-    std::atomic<bool>& cancelled = cancelled_;
+    const auto cancellation = cancellation_source_.token();
 
-    auto action = [plugin, on_completed, &cancelled, task] {
+    auto action = [plugin, on_completed, cancellation, task] {
+        if (cancellation.isCancellationRequested()) return;
         common::TaskResult result;
         result.set_task_id(task.task_id());
         const auto start = std::chrono::steady_clock::now();
         bool ok = false;
         try {
-            ok = plugin->execute(task, result);
+            ok = plugin->execute(task, result, cancellation);
         } catch (const std::exception& e) {
             LOG_ERROR("client plugin " << plugin->pluginType()
                                        << ": execute threw: " << e.what());
@@ -74,11 +75,15 @@ void TaskExecutor::push(const common::Task& task) {
         if (!ok) {
             result.set_exit_code(-1);
         }
+        // Plugins cannot rewrite the transport identity of their execution.
+        result.set_task_id(task.task_id());
+        result.set_attempt_id(task.attempt_id());
+        result.set_run_id(task.run_id());
         result.set_duration_ms(static_cast<std::int64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - start)
                 .count()));
-        if (!cancelled.load(std::memory_order_relaxed) && on_completed) {
+        if (!cancellation.isCancellationRequested() && on_completed) {
             on_completed(result);
         }
     };
@@ -86,14 +91,24 @@ void TaskExecutor::push(const common::Task& task) {
 }
 
 void TaskExecutor::stop() {
-    cancelled_.store(true, std::memory_order_relaxed);
+    requestStop();
     std::unique_ptr<common::EventManager> pool;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         pool = std::move(pool_);
     }
-    // The EventManager destructor joins its worker; queued events are dropped.
     pool.reset();
+}
+
+bool TaskExecutor::isStopped() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return pool_ == nullptr || pool_->isStopped();
+}
+
+void TaskExecutor::requestStop() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    cancellation_source_.requestCancellation();
+    if (pool_ != nullptr) pool_->requestStop();
 }
 
 }  // namespace client
