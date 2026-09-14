@@ -39,8 +39,13 @@ class ResultService:
             return 200, {"status": "ok", "service": "result_service"}
         if path == "/readyz":
             ready = self.repository.ready()
-            return (200 if ready else 503), {"status": "ready" if ready else "not_ready",
-                                               "database_configured": self.repository.configured}
+            payload = {"status": "ready" if ready else "not_ready",
+                       "database_configured": self.repository.configured}
+            if not self.repository.configured:
+                payload["reason"] = "database_not_configured"
+            elif not ready:
+                payload["reason"] = "database_unavailable"
+            return (200 if ready else 503), payload
         if path == "/api/plugins":
             return 200, [{"name": name} for name in sorted(self.plugins)]
         if path == "/api/runs":
@@ -50,6 +55,10 @@ class ResultService:
         if path.startswith("/api/runs/"):
             run_id = path.rsplit("/", 1)[-1]
             plugin = query.get("plugin", [None])[0]
+            if not plugin:
+                return 400, {"error": "plugin query parameter is required"}
+            if plugin not in self.plugins:
+                return 400, {"error": f"unknown plugin: {plugin}"}
             result = self.repository.get_run(run_id, plugin)
             return (200, result) if result else (404, {"error": "run not found"})
         if path == "/api/ai/providers":
@@ -63,6 +72,9 @@ class ResultService:
         context = body.get("context", {})
         if not message or not isinstance(context, dict):
             return 400, {"error": "provider, message and object context are required"}
+        run = context.get("run")
+        if not isinstance(run, dict) or not run.get("run_id") or not run.get("plugin_type"):
+            return 400, {"error": "selected run context is required"}
         if len(message) > 8000:
             return 400, {"error": "message is too long"}
         provider = self.providers.get(provider_name)

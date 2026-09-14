@@ -49,14 +49,90 @@ def sanitize_context(value: Any, *, max_bytes: int = 32_000) -> dict[str, Any]:
     return result
 
 
-def _command_argv(config: ProviderConfig) -> list[str]:
-    executable = shutil.which(config.command) or config.command
+def _latest_file(paths: list[Path]) -> Path | None:
+    files = [path for path in paths if path.is_file()]
+    return max(files, key=lambda path: path.stat().st_mtime) if files else None
+
+
+def _windows_command_candidates(name: str) -> list[Path]:
+    def env_path(key: str) -> Path | None:
+        value = os.environ.get(key, "").strip()
+        return Path(value) if value else None
+
+    local_app_data = env_path("LOCALAPPDATA")
+    app_data = env_path("APPDATA")
+    user_profile = env_path("USERPROFILE")
+    pnpm_home = env_path("PNPM_HOME")
+    candidates: list[Path] = []
+    if name == "codex":
+        if local_app_data:
+            codex_root = local_app_data / "OpenAI" / "Codex" / "bin"
+            if codex_root.is_dir():
+                candidates.extend(codex_root.glob("*/codex.exe"))
+            candidates.extend([
+                local_app_data / "pnpm" / "codex.cmd",
+                local_app_data / "Microsoft" / "WindowsApps" / "codex.exe",
+            ])
+        if app_data:
+            candidates.append(app_data / "npm" / "codex.cmd")
+        if pnpm_home:
+            candidates.append(pnpm_home / "codex.cmd")
+        if user_profile:
+            candidates.append(user_profile / ".local" / "bin" / "codex.exe")
+    elif name == "dsh":
+        if app_data:
+            candidates.append(app_data / "npm" / "dsh.cmd")
+        if pnpm_home:
+            candidates.append(pnpm_home / "dsh.cmd")
+        if local_app_data:
+            candidates.append(local_app_data / "pnpm" / "dsh.cmd")
+    return candidates
+
+
+def _powershell_executable() -> str | None:
+    return shutil.which("pwsh") or shutil.which("powershell.exe")
+
+
+def _is_explicit_path(value: str) -> bool:
+    return Path(value).is_absolute() or "/" in value or "\\" in value
+
+
+def _runnable_file(path: Path) -> bool:
+    return path.is_file() and (
+        os.name != "nt" or path.suffix.lower() != ".ps1" or _powershell_executable() is not None
+    )
+
+
+def resolve_provider_command(config: ProviderConfig) -> str | None:
+    env_key = f"RESULT_SERVICE_{config.name.upper().replace('-', '_')}_COMMAND"
+    configured = os.environ.get(env_key, config.command).strip()
+    expanded = Path(os.path.expandvars(os.path.expanduser(configured)))
+    if _is_explicit_path(configured):
+        return str(expanded.resolve()) if _runnable_file(expanded) else None
+    discovered = shutil.which(configured)
+    if discovered and _runnable_file(Path(discovered)):
+        return discovered
+    if os.name == "nt" and configured.lower() in {config.name.lower(), f"{config.name.lower()}.exe"}:
+        candidate = _latest_file(_windows_command_candidates(config.name.lower()))
+        return str(candidate.resolve()) if candidate else None
+    return None
+
+
+def _command_argv(config: ProviderConfig, executable: str | None = None) -> list[str]:
+    executable = executable or resolve_provider_command(config) or config.command
     suffix = Path(executable).suffix.lower()
     if os.name == "nt" and suffix == ".ps1":
-        return ["pwsh", "-NoProfile", "-File", executable, *config.args]
+        shell = _powershell_executable()
+        if not shell:
+            raise ProviderError("PowerShell is required to execute provider scripts")
+        return [shell, "-NoProfile", "-File", executable, *config.args]
     if os.name == "nt" and suffix in {".cmd", ".bat"}:
         return ["cmd.exe", "/d", "/c", executable, *config.args]
     return [executable, *config.args]
+
+
+def _argument_prompt(prompt: str) -> str:
+    return " ".join(line.strip() for line in prompt.splitlines() if line.strip())
 
 
 def _event_text(event: Any) -> str:
@@ -81,16 +157,18 @@ def _event_text(event: Any) -> str:
 
 def parse_provider_output(provider: str, output: str) -> str:
     """Extract the final assistant text from plain text or JSONL CLI output."""
-    texts: list[str] = []
+    events: list[Any] = []
     for line in output.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
         try:
-            event = json.loads(stripped)
+            events.append(json.loads(stripped))
         except json.JSONDecodeError:
-            texts.append(stripped)
-            continue
+            return output.strip()
+
+    texts: list[str] = []
+    for event in events:
         event_type = event.get("type") if isinstance(event, dict) else None
         if event_type in {"item.completed", "response.output_text.done", "message"}:
             text = _event_text(event)
@@ -112,15 +190,17 @@ class CommandProvider:
         self.config = config
 
     def available(self) -> bool:
-        command = shutil.which(self.config.command)
-        return command is not None or Path(self.config.command).exists()
+        return resolve_provider_command(self.config) is not None
 
     def complete(self, message: str, context: dict[str, Any]) -> ProviderResult:
         prompt = _build_prompt(message, context)
-        argv = _command_argv(self.config)
+        executable = resolve_provider_command(self.config)
+        if not executable:
+            raise ProviderError(f"{self.config.name} executable is not available")
+        argv = _command_argv(self.config, executable)
         stdin = prompt
         if self.config.prompt_mode == "argument":
-            argv.append(prompt)
+            argv.append(_argument_prompt(prompt))
             stdin = None
         try:
             completed = subprocess.run(

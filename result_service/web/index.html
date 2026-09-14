@@ -20,11 +20,16 @@
         <div class="nav-label">工作空间</div>
         <button type="button" class="nav-item" data-page="overview"><span class="nav-icon">▦</span>运行总览</button>
         <button type="button" class="nav-item" data-page="results" aria-current="page"><span class="nav-icon">⌁</span>结果分析</button>
-        <button type="button" class="nav-item" data-page="clients"><span class="nav-icon">▣</span>客户端<span class="nav-count">0</span></button>
+        <button type="button" class="nav-item" data-page="clients"><span class="nav-icon">▣</span>客户端<span class="nav-count">待接入</span></button>
         <button type="button" class="nav-item" data-page="history"><span class="nav-icon">◷</span>历史运行</button>
         <button type="button" class="nav-item" data-page="plugins"><span class="nav-icon">▤</span>插件与配置</button>
         <button type="button" class="nav-item" data-page="logs"><span class="nav-icon">≡</span>运行日志</button>
-        <div class="side-foot"><strong>本地结果服务</strong><span><span class="dot"></span> API 已连接</span><small>Windows · PostgreSQL</small></div>
+        <div class="side-foot">
+          <strong>本地结果服务</strong>
+          <div class="status-row"><span class="dot" id="api-dot"></span><span id="api-status">API 连接中</span></div>
+          <div class="status-row"><span class="dot warning" id="db-dot"></span><span id="db-status">数据库检查中</span></div>
+          <small id="provider-status">AI 接入检查中</small>
+        </div>
       </nav>
       <main class="main">
         <div class="breadcrumb"><span>工作空间 / <b id="crumb">结果分析</b></span><time id="snapshot-time"></time></div>
@@ -32,16 +37,17 @@
           <div><h1 id="page-title">结果分析</h1><p id="page-subtitle">查看已完成运行的业务结果与差异。</p></div>
           <div class="head-actions"><button type="button" class="button" id="ai-toggle">✦ AI 助手</button><button type="button" class="button primary" id="refresh">↻ 刷新</button></div>
         </div>
+        <div class="system-notice" id="system-notice" hidden><span class="notice-icon">!</span><div><strong id="notice-title"></strong><span id="notice-detail"></span></div></div>
         <section class="page" id="page-overview" hidden>
           <div class="metrics">
-            <div class="metric"><span>运行记录</span><strong id="metric-runs">0<small>个运行</small></strong><em>长期运行清单</em></div>
-            <div class="metric"><span>已完成</span><strong id="metric-finished">0<small>个运行</small></strong><em>调度执行已结束</em></div>
-            <div class="metric"><span>成功文件</span><strong id="metric-success">0<small>个</small></strong><em>已持久化结果</em></div>
-            <div class="metric"><span>失败文件</span><strong id="metric-failed">0<small>个</small></strong><em>需要复核</em></div>
+            <div class="metric"><span>最近运行</span><strong id="metric-runs">0<small>个运行</small></strong><em>最多加载 100 条</em></div>
+            <div class="metric"><span>其中已完成</span><strong id="metric-finished">0<small>个运行</small></strong><em>调度执行已结束</em></div>
+            <div class="metric"><span>成功文件</span><strong id="metric-success">0<small>个</small></strong><em>当前加载记录</em></div>
+            <div class="metric"><span>失败文件</span><strong id="metric-failed">0<small>个</small></strong><em>当前加载记录</em></div>
           </div>
           <div class="section-head"><h2>最近运行<span class="count" id="overview-count"></span></h2><div class="segmented" id="overview-filter"><button data-filter="" aria-pressed="true">全部</button><button data-filter="coverage" aria-pressed="false">coverage</button><button data-filter="stpcompare" aria-pressed="false">stpcompare</button></div></div>
           <div id="run-cards" class="run-list"></div>
-          <div class="recovery"><span class="shield">✓</span><div><strong>持久化恢复已启用</strong><span>服务端重启后沿用原运行，已完成任务保持完成，未完成任务重新派发。</span></div></div>
+          <div class="recovery"><span class="shield">i</span><div><strong>持久化恢复机制</strong><span>服务端重启后沿用原运行，已完成任务保持完成，未完成任务重新派发。</span></div></div>
         </section>
         <section class="page" id="page-results">
           <div class="result-tools">
@@ -49,7 +55,7 @@
               <label>结果类型<select id="result-type"><option value="coverage">coverage · 覆盖率</option><option value="stpcompare">stpcompare · 文本比较</option></select></label>
               <label>运行<select id="result-run"><option value="">暂无运行记录</option></select></label>
             </div>
-            <div class="analysis-state"><span class="dot"></span><span id="analysis-state">等待选择运行</span></div>
+            <div class="analysis-state waiting" id="analysis-status"><span class="dot warning"></span><span id="analysis-state">等待选择运行</span></div>
           </div>
           <div class="result-kpis">
             <div class="result-kpi"><span>执行状态</span><strong id="execution-status">--</strong></div>
@@ -79,11 +85,11 @@
         <div class="provider-field"><label>AI 服务<select id="provider"></select></label></div>
         <div class="ai-context" id="ai-context">上下文：尚未选择运行</div>
         <div class="chat" id="chat" aria-live="polite"><div class="message assistant-message">选择一个运行后，可以让 Codex 或 DSH 分析当前结构化结果。</div></div>
-        <div class="quick-actions"><button type="button" data-prompt="分析当前运行的结果完整性">检查完整性</button><button type="button" data-prompt="总结当前运行中需要优先处理的问题">归纳问题</button></div>
-        <form class="compose" id="chat-form"><textarea id="question" rows="3" placeholder="询问当前结果..." required></textarea><div class="compose-actions"><span>当前运行的结构化结果</span><button class="send-button" type="submit" title="发送">➤</button></div></form>
+        <div class="quick-actions" id="quick-actions"><button type="button" data-prompt="分析当前运行的结果完整性">检查完整性</button><button type="button" data-prompt="总结当前运行中需要优先处理的问题">归纳问题</button></div>
+        <form class="compose" id="chat-form"><textarea id="question" rows="3" placeholder="请先选择一个运行" required disabled></textarea><div class="compose-actions"><span id="compose-hint">需要选择运行</span><button class="send-button" id="send-button" type="submit" title="发送" disabled>➤</button></div></form>
       </aside>
     </div>
-    <footer><span><span class="dot"></span><span id="footer-status">结果服务连接中</span></span><span>执行状态 · 结果完整性 · 分析状态独立展示</span></footer>
+    <footer><span><span class="dot" id="footer-dot"></span><span id="footer-status">结果服务连接中</span></span><span>执行状态 · 结果完整性 · 分析状态独立展示</span></footer>
   </div>
   <script src="/app.js"></script>
 </body>

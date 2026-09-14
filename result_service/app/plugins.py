@@ -8,24 +8,35 @@ class QueryConnection(Protocol):
     def execute(self, query: str, params: tuple[Any, ...] = ()) -> Any: ...
 
 
+class ResultPluginError(RuntimeError):
+    """A plugin-owned result query could not be completed."""
+
+
 class ResultPlugin(Protocol):
     name: str
+    configured: bool
 
     def summary(self, connection: QueryConnection, run_id: str) -> dict[str, Any]: ...
 
 
 class CoverageResultPlugin:
     name = "coverage"
+    configured = True
 
     def summary(self, connection: QueryConnection, run_id: str) -> dict[str, Any]:
         try:
+            relation = connection.execute(
+                "SELECT to_regclass('coverage_run_summary') AS relation"
+            ).fetchone()
+            if not relation or not relation["relation"]:
+                return {}
             row = connection.execute(
                 "SELECT total_files, selected_files, cumulative_points, covered_lines, "
                 "total_lines, percent, finished_at FROM coverage_run_summary WHERE run_id=%s",
                 (run_id,),
             ).fetchone()
-        except Exception:
-            return {}
+        except Exception as exc:
+            raise ResultPluginError("coverage result query failed") from exc
         return dict(row) if row else {}
 
 
@@ -34,6 +45,7 @@ class StpCompareResultPlugin:
 
     def __init__(self, table: str | None):
         self.table = table if table and _valid_identifier(table) else None
+        self.configured = self.table is not None
 
     def summary(self, connection: QueryConnection, run_id: str) -> dict[str, Any]:
         if not self.table:
@@ -53,8 +65,8 @@ class StpCompareResultPlugin:
                 f"WHERE m.run_id=%s AND m.plugin_type='stpcompare'",
                 (run_id,),
             ).fetchone()
-        except Exception:
-            return {}
+        except Exception as exc:
+            raise ResultPluginError("stpcompare result query failed") from exc
         return dict(row) if row else {}
 
 

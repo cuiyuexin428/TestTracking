@@ -12,6 +12,11 @@ target_link_libraries(test_coverage_client PRIVATE coverage_core)
 add_test(NAME test_coverage_client COMMAND test_coverage_client)
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME test_result_service COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_result_service.py -v)
+    set_tests_properties(test_result_service PROPERTIES TIMEOUT 30)
+endif()
 add_executable(test_client_runtime test_client_runtime.cpp ../client/src/TaskExecutor.cpp)
 target_include_directories(test_client_runtime PRIVATE ../client/inc)
 target_link_libraries(test_client_runtime PRIVATE common)

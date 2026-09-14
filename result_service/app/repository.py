@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 from contextlib import contextmanager
 
-from .plugins import ResultPlugin
+from .plugins import ResultPlugin, ResultPluginError
+
+LOG = logging.getLogger("result_service.repository")
 
 
 class RepositoryError(RuntimeError):
@@ -16,7 +19,7 @@ class NullRepository:
     configured = False
 
     def ready(self) -> bool:
-        return True
+        return False
 
     def list_runs(self, plugin: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         return []
@@ -52,7 +55,8 @@ class PostgresRepository:
     def ready(self) -> bool:
         try:
             with self._connect() as connection:
-                connection.execute("SELECT 1").fetchone()
+                connection.execute("SELECT 1 FROM plugin_runs LIMIT 0")
+                connection.execute("SELECT 1 FROM plugin_file_outcomes LIMIT 0")
             return True
         except Exception:
             return False
@@ -105,7 +109,19 @@ class PostgresRepository:
             }
             adapter = self.plugins.get(result["plugin_type"])
             if adapter:
-                result["analysis"] = adapter.summary(connection, run_id)
+                if not adapter.configured:
+                    result["analysis"] = {}
+                    result["analysis_status"] = "not_configured"
+                else:
+                    try:
+                        with connection.transaction():
+                            result["analysis"] = adapter.summary(connection, run_id)
+                        result["analysis_status"] = "ready" if result["analysis"] else "pending"
+                    except ResultPluginError:
+                        LOG.warning("result analysis query failed for %s/%s",
+                                    result["plugin_type"], run_id, exc_info=True)
+                        result["analysis"] = {}
+                        result["analysis_status"] = "error"
             return result
 
 

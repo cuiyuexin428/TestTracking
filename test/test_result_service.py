@@ -1,0 +1,295 @@
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+import unittest
+from contextlib import contextmanager
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from result_service.app.config import ProviderConfig, ServiceConfig
+from result_service.app.plugins import CoverageResultPlugin, ResultPluginError
+from result_service.app.providers import (
+    _argument_prompt,
+    _command_argv,
+    parse_provider_output,
+    resolve_provider_command,
+)
+from result_service.app.repository import PostgresRepository
+from result_service.app.server import ResultService
+
+
+class _Rows:
+    def __init__(self, one=None, all_rows=None):
+        self.one = one
+        self.all_rows = all_rows or []
+
+    def fetchone(self):
+        return self.one
+
+    def fetchall(self):
+        return self.all_rows
+
+
+class _RepositoryConnection:
+    def execute(self, query, params=()):
+        if query.startswith("SELECT run_id"):
+            return _Rows(one={"run_id": "run-1", "plugin_type": "coverage",
+                              "expected_files": 2, "status": "finished"})
+        if query.startswith("SELECT status"):
+            return _Rows(all_rows=[{"status": "success", "count": 1}])
+        raise AssertionError(f"unexpected query: {query}")
+
+    @contextmanager
+    def transaction(self):
+        yield
+
+
+class _AnalysisPlugin:
+    name = "coverage"
+
+    def __init__(self, configured=True, result=None, error=False):
+        self.configured = configured
+        self.result = result or {}
+        self.error = error
+
+    def summary(self, connection, run_id):
+        if self.error:
+            raise ResultPluginError("query failed")
+        return self.result
+
+
+class _CoverageConnection:
+    def __init__(self, relation, summary=None):
+        self.relation = relation
+        self.summary = summary
+        self.summary_queried = False
+
+    def execute(self, query, params=()):
+        if query.startswith("SELECT to_regclass"):
+            return _Rows(one={"relation": self.relation})
+        if "FROM coverage_run_summary" in query:
+            self.summary_queried = True
+            return _Rows(one=self.summary)
+        raise AssertionError(f"unexpected query: {query}")
+
+
+class _ReadyConnection:
+    def __init__(self, fail_on=""):
+        self.fail_on = fail_on
+        self.queries = []
+
+    def execute(self, query, params=()):
+        self.queries.append(query)
+        if self.fail_on and self.fail_on in query:
+            raise RuntimeError("relation unavailable")
+        return _Rows()
+
+
+class ResultServiceContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.service = ResultService(ServiceConfig.defaults())
+
+    def test_unconfigured_database_is_not_ready(self) -> None:
+        status, payload = self.service.payload("/readyz", {})
+
+        self.assertEqual(503, status)
+        self.assertEqual("not_ready", payload["status"])
+        self.assertFalse(payload["database_configured"])
+        self.assertEqual("database_not_configured", payload["reason"])
+
+    def test_run_detail_requires_plugin_identity(self) -> None:
+        status, payload = self.service.payload("/api/runs/run-1", {})
+
+        self.assertEqual(400, status)
+        self.assertEqual("plugin query parameter is required", payload["error"])
+
+    def test_run_detail_rejects_unknown_plugin(self) -> None:
+        status, payload = self.service.payload("/api/runs/run-1", {"plugin": ["missing"]})
+
+        self.assertEqual(400, status)
+        self.assertEqual("unknown plugin: missing", payload["error"])
+
+    def test_ai_requires_a_selected_run(self) -> None:
+        status, payload = self.service.ai_chat({
+            "provider": "codex",
+            "message": "summarize",
+            "context": {"run": None, "result_type": "coverage"},
+        })
+
+        self.assertEqual(400, status)
+        self.assertEqual("selected run context is required", payload["error"])
+
+
+class ProviderPromptTests(unittest.TestCase):
+    def test_argument_prompt_keeps_context_on_one_command_line(self) -> None:
+        prompt = "Instruction\n\nResult context (JSON):\n{\"run_id\":\"run-1\"}\n\nQuestion:\nSummarize"
+
+        result = _argument_prompt(prompt)
+
+        self.assertNotIn("\n", result)
+        self.assertIn('{"run_id":"run-1"}', result)
+        self.assertTrue(result.endswith("Question: Summarize"))
+
+    def test_plain_multiline_provider_output_is_preserved(self) -> None:
+        output = "Summary:\n- first\n- second\n"
+
+        self.assertEqual("Summary:\n- first\n- second", parse_provider_output("dsh", output))
+
+    def test_jsonl_provider_output_uses_final_message(self) -> None:
+        output = '\n'.join([
+            '{"type":"thread.started","thread_id":"one"}',
+            '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}',
+        ])
+
+        self.assertEqual("done", parse_provider_output("codex", output))
+
+
+class RepositoryReadinessTests(unittest.TestCase):
+    def repository_with(self, connection):
+        repository = PostgresRepository("unused", {})
+
+        @contextmanager
+        def connect():
+            yield connection
+
+        repository._connect = connect
+        return repository
+
+    def test_ready_requires_framework_result_tables(self) -> None:
+        connection = _ReadyConnection()
+
+        ready = self.repository_with(connection).ready()
+
+        self.assertTrue(ready)
+        self.assertEqual([
+            "SELECT 1 FROM plugin_runs LIMIT 0",
+            "SELECT 1 FROM plugin_file_outcomes LIMIT 0",
+        ], connection.queries)
+
+    def test_missing_framework_result_table_is_not_ready(self) -> None:
+        connection = _ReadyConnection("plugin_file_outcomes")
+
+        self.assertFalse(self.repository_with(connection).ready())
+
+
+class RepositoryAnalysisStatusTests(unittest.TestCase):
+    def get_run(self, plugin):
+        repository = PostgresRepository("unused", {"coverage": plugin})
+
+        @contextmanager
+        def connect():
+            yield _RepositoryConnection()
+
+        repository._connect = connect
+        return repository.get_run("run-1", "coverage")
+
+    def test_published_analysis_is_ready(self) -> None:
+        result = self.get_run(_AnalysisPlugin(result={"percent": 80}))
+
+        self.assertEqual("ready", result["analysis_status"])
+        self.assertEqual({"percent": 80}, result["analysis"])
+
+    def test_missing_analysis_row_is_pending(self) -> None:
+        result = self.get_run(_AnalysisPlugin())
+
+        self.assertEqual("pending", result["analysis_status"])
+
+    def test_unconfigured_adapter_is_reported(self) -> None:
+        result = self.get_run(_AnalysisPlugin(configured=False))
+
+        self.assertEqual("not_configured", result["analysis_status"])
+
+    def test_analysis_query_failure_does_not_hide_run(self) -> None:
+        with self.assertLogs("result_service.repository", level="WARNING"):
+            result = self.get_run(_AnalysisPlugin(error=True))
+
+        self.assertEqual("error", result["analysis_status"])
+        self.assertEqual({}, result["analysis"])
+        self.assertEqual("finished", result["status"])
+
+
+class CoverageAnalysisTests(unittest.TestCase):
+    def test_missing_summary_table_is_pending(self) -> None:
+        connection = _CoverageConnection(None)
+
+        result = CoverageResultPlugin().summary(connection, "run-1")
+
+        self.assertEqual({}, result)
+        self.assertFalse(connection.summary_queried)
+
+    def test_existing_summary_table_returns_run_result(self) -> None:
+        summary = {"run_id": "run-1", "percent": 80}
+        connection = _CoverageConnection("coverage_run_summary", summary)
+
+        result = CoverageResultPlugin().summary(connection, "run-1")
+
+        self.assertEqual(summary, result)
+        self.assertTrue(connection.summary_queried)
+
+
+@unittest.skipUnless(os.name == "nt", "Windows provider discovery")
+class WindowsProviderDiscoveryTests(unittest.TestCase):
+    def test_codex_desktop_install_is_found_without_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            executable = Path(temp_dir) / "OpenAI" / "Codex" / "bin" / "version" / "codex.exe"
+            executable.parent.mkdir(parents=True)
+            executable.touch()
+            config = ProviderConfig(name="codex", command="codex")
+            environment = {"LOCALAPPDATA": temp_dir, "APPDATA": "", "USERPROFILE": "", "PNPM_HOME": ""}
+            with patch.dict(os.environ, environment, clear=True), \
+                    patch("result_service.app.providers.shutil.which", return_value=None):
+                resolved = resolve_provider_command(config)
+
+            self.assertEqual(executable.resolve(), Path(resolved))
+
+    def test_dsh_npm_command_uses_cmd_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            executable = Path(temp_dir) / "npm" / "dsh.cmd"
+            executable.parent.mkdir(parents=True)
+            executable.touch()
+            config = ProviderConfig(name="dsh", command="dsh", args=("--profile", "headless"))
+            environment = {"APPDATA": temp_dir, "LOCALAPPDATA": "", "USERPROFILE": "", "PNPM_HOME": ""}
+            with patch.dict(os.environ, environment, clear=True), \
+                    patch("result_service.app.providers.shutil.which", return_value=None):
+                resolved = resolve_provider_command(config)
+                argv = _command_argv(config, resolved)
+
+            self.assertEqual(["cmd.exe", "/d", "/c", str(executable.resolve()),
+                              "--profile", "headless"], argv)
+
+    def test_directory_is_not_an_available_command(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = ProviderConfig(name="custom", command=temp_dir)
+            with patch("result_service.app.providers.shutil.which", return_value=None):
+                self.assertIsNone(resolve_provider_command(config))
+
+    def test_bare_command_does_not_use_same_named_working_directory_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            command_file = Path(temp_dir) / "codex"
+            command_file.write_text("not an executable", encoding="utf-8")
+            config = ProviderConfig(name="codex", command="codex")
+            environment = {"LOCALAPPDATA": "", "APPDATA": "", "USERPROFILE": "", "PNPM_HOME": ""}
+            previous_cwd = os.getcwd()
+            try:
+                os.chdir(temp_dir)
+                with patch.dict(os.environ, environment, clear=True), \
+                        patch("result_service.app.providers.shutil.which", return_value=None):
+                    self.assertIsNone(resolve_provider_command(config))
+            finally:
+                os.chdir(previous_cwd)
+
+    def test_powershell_script_requires_an_available_host(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script = Path(temp_dir) / "provider.ps1"
+            script.touch()
+            config = ProviderConfig(name="custom", command=str(script))
+            with patch("result_service.app.providers.shutil.which", return_value=None):
+                self.assertIsNone(resolve_provider_command(config))
+
+
+if __name__ == "__main__":
+    unittest.main()
