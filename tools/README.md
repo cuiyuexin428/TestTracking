@@ -44,6 +44,21 @@ powershell -ExecutionPolicy Bypass -File .\tools\build_third_party.ps1
 - 首次使用数据库前执行 `tools\init_database.ps1` 创建 `testtracking` 数据库，或使用 `tools\setup_offline_server.ps1` 准备随包实例。
 - 如需远程客户端直写本地数据库，先运行 `tools\setup_postgres_remote.ps1`，再执行 `tools\build_package.ps1`；后者会自动探测本机 IPv4 并写入 client 配置的 endpoint/db_conn。
 
+`build_package.ps1` 不包含开发机资源路径默认值。完整客户端包请显式传入
+`-StepTestExe`、`-DatasetDir`，coverage 还需 `-OpenCppCoverageDir`；相对路径按项目根目录
+解析，资源会复制到包内 `testenv`，复制到其他机器后配置不引用源码目录。
+
+`build_server_package.ps1` 默认携带独立 Python 和 psycopg，首次构建从 Python/PyPI
+准备 `runtime/python` 缓存。离线时可显式传 `-PythonRuntimeDir`；
+`-UseSystemPython` 才使用目标机 Python。`-IncludePostgresRuntime` 会携带完整的
+PostgreSQL bin/lib/share 和初始化工具；运行机器仍需配置实际数据库连接。
+包内 README 提供启动、数据库准备及结果界面的操作说明。
+
+客户端发布包使用 Release x64 构建，默认输出 `dist\client_package`。脚本会从 Visual Studio
+的 `VC\Redist\MSVC\<版本>\x64\Microsoft.VC*.CRT` 自动携带 VC++ DLL；也可显式传
+`-VCRuntimeDir` 指定该目录。无需在目标机安装 Visual Studio。`-OnlyClient`、`-OnlyProgram`、
+`-OnlyDataset` 每次只能选一个；程序单独更新时，已有客户端配置中的可执行文件名会同步更新。
+
 如需在新机器上重建第三方库（例如换版本），先删除 `third_party_src\build` 再运行脚本，或直接加 `-Force`。
 
 ## 无网络环境重建

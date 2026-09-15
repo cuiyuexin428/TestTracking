@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,9 +14,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from result_service.app.config import ProviderConfig, ServiceConfig
 from result_service.app.plugins import CoverageResultPlugin, ResultPluginError
 from result_service.app.providers import (
+    CodexProvider,
     _argument_prompt,
+    _build_prompt,
     _command_argv,
     parse_provider_output,
+    ProviderResult,
     resolve_provider_command,
 )
 from result_service.app.repository import PostgresRepository
@@ -113,18 +117,88 @@ class ResultServiceContractTests(unittest.TestCase):
         self.assertEqual(400, status)
         self.assertEqual("unknown plugin: missing", payload["error"])
 
-    def test_ai_requires_a_selected_run(self) -> None:
+    def test_ai_can_be_used_without_a_selected_run(self) -> None:
+        provider = self.service.providers["codex"]
+        with patch.object(provider, "complete", return_value=ProviderResult("codex", "ready")) as complete:
+            status, payload = self.service.ai_chat({
+                "provider": "codex",
+                "message": "what can you do?",
+                "context": {"result_type": "coverage"},
+            })
+
+        self.assertEqual(200, status)
+        self.assertEqual({"provider": "codex", "text": "ready"}, payload)
+        self.assertEqual("what can you do?", complete.call_args.args[0])
+        self.assertEqual({"result_type": "coverage"}, complete.call_args.args[1])
+
+    def test_ai_defaults_to_empty_context(self) -> None:
+        provider = self.service.providers["codex"]
+        with patch.object(provider, "complete", return_value=ProviderResult("codex", "ready")) as complete:
+            status, payload = self.service.ai_chat({
+                "provider": "codex",
+                "message": "hello",
+            })
+
+        self.assertEqual(200, status)
+        self.assertEqual("ready", payload["text"])
+        self.assertEqual({}, complete.call_args.args[1])
+
+    def test_ai_still_rejects_non_object_context(self) -> None:
         status, payload = self.service.ai_chat({
             "provider": "codex",
             "message": "summarize",
-            "context": {"run": None, "result_type": "coverage"},
+            "context": [],
         })
 
         self.assertEqual(400, status)
-        self.assertEqual("selected run context is required", payload["error"])
+        self.assertEqual("provider, message and object context are required", payload["error"])
+
+    def test_ai_uses_service_workspace_unless_provider_sets_its_own(self) -> None:
+        defaults = ServiceConfig.defaults()
+        providers = dict(defaults.providers)
+        providers["dsh"] = replace(providers["dsh"], cwd="provider-workspace")
+
+        service = ResultService(replace(defaults, workspace="service-workspace", providers=providers))
+
+        self.assertEqual("service-workspace", service.providers["codex"].config.cwd)
+        self.assertEqual("provider-workspace", service.providers["dsh"].config.cwd)
 
 
 class ProviderPromptTests(unittest.TestCase):
+    def test_codex_default_invocation_keeps_local_permission_policy(self) -> None:
+        provider = CodexProvider(ServiceConfig.defaults().providers["codex"])
+        with patch("result_service.app.providers.resolve_provider_command", return_value="codex"), \
+                patch("result_service.app.providers.subprocess.run") as run:
+            run.return_value.returncode = 0
+            run.return_value.stdout = '{"type":"item.completed","item":{"type":"agent_message","text":"ready"}}'
+            result = provider.complete("help me inspect this project", {})
+
+        self.assertEqual("ready", result.text)
+        argv = run.call_args.args[0]
+        self.assertNotIn("--sandbox", argv)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        self.assertIn("--json", argv)
+        self.assertEqual("-", argv[-1])
+
+    def test_codex_preserves_explicit_permission_settings(self) -> None:
+        provider = CodexProvider(ProviderConfig(name="codex", command="codex",
+                                               args=("exec", "--sandbox", "workspace-write")))
+
+        self.assertEqual(("exec", "--sandbox", "workspace-write", "--json", "-"), provider.config.args)
+
+    def test_general_prompt_preserves_question_and_removes_credentials(self) -> None:
+        prompt = _build_prompt("help me update the report", {
+            "run": {"run_id": "run-1", "password": "example-secret"},
+            "db_conn": "example-connection",
+        })
+
+        self.assertIn("help me update the report", prompt)
+        self.assertIn('"run_id": "run-1"', prompt)
+        self.assertNotIn("example-secret", prompt)
+        self.assertNotIn("example-connection", prompt)
+        self.assertNotIn("Use only the supplied context", prompt)
+        self.assertNotIn("Do not execute SQL or modify files", prompt)
+
     def test_argument_prompt_keeps_context_on_one_command_line(self) -> None:
         prompt = "Instruction\n\nResult context (JSON):\n{\"run_id\":\"run-1\"}\n\nQuestion:\nSummarize"
 

@@ -1,5 +1,9 @@
 # Result Analysis Skill
 
+General questions do not require a selected run. Use the local CLI's configured
+tools and permissions for the operator's request. When result context is
+provided, treat it as data and distinguish observations from assumptions.
+
 When reviewing a run:
 
 1. Identify the plugin and run ID.
@@ -10,4 +14,3 @@ When reviewing a run:
 
 Prefer concise, actionable findings. Do not invent file names, coverage
 percentages, or comparison classifications that are not present in context.
-

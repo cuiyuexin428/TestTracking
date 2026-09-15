@@ -62,7 +62,6 @@ function renderServiceState(readiness, providers) {
   const ready = readiness.ok;
   const configured = Boolean(readiness.data.database_configured);
   const availableProviders = providers.filter((provider) => provider.available).map((provider) => provider.name);
-  const missingRequired = ['codex', 'dsh'].filter((name) => !providers.some((provider) => provider.name.toLowerCase() === name && provider.available));
   state.readiness = { ready, configured };
 
   $('api-status').textContent = 'API 已连接';
@@ -93,9 +92,11 @@ function renderServiceState(readiness, providers) {
   $('provider-status').textContent = availableProviders.length ? `AI 可用：${availableProviders.join(' / ')}` : 'AI 服务不可用';
   const noticeParts = [];
   if (!ready) noticeParts.push(configured ? '只读数据库当前无法连接。' : '请配置只读数据库连接以读取运行记录。');
-  if (missingRequired.length) noticeParts.push(`${missingRequired.join('、')} 命令未找到，请配置对应的可执行文件路径。`);
+  if (!availableProviders.length) noticeParts.push('未找到可用的 Codex 或 DSH 命令，请安装并确保命令位于 PATH 中。');
   $('system-notice').hidden = noticeParts.length === 0;
-  $('notice-title').textContent = !ready ? (configured ? '数据库连接异常' : '数据库未配置') : 'AI 服务未完整接入';
+  $('notice-title').textContent = !ready
+    ? (configured ? '数据库连接异常' : '数据库未配置')
+    : 'AI 服务不可用';
   $('notice-detail').textContent = noticeParts.join(' ');
 }
 
@@ -103,12 +104,16 @@ function updateAiControls() {
   const provider = state.providers.find((item) => item.name === $('provider').value);
   const hasProvider = Boolean(provider?.available);
   const hasRun = Boolean(state.selected?.run_id);
-  const enabled = hasProvider && hasRun;
+  // A local provider can answer general questions without a selected run.
+  // Selecting a run only enriches the context sent with the request.
+  const enabled = hasProvider;
   $('question').disabled = !enabled;
   $('send-button').disabled = !enabled;
   document.querySelectorAll('#quick-actions button').forEach((button) => { button.disabled = !enabled; });
-  $('question').placeholder = hasRun ? (hasProvider ? '询问当前结果...' : '当前 AI 服务不可用') : '请先选择一个运行';
-  $('compose-hint').textContent = hasRun ? (hasProvider ? '当前运行的结构化结果' : 'AI 服务不可用') : '需要选择运行';
+  $('question').placeholder = hasProvider ? (hasRun ? '询问当前结果...' : '询问 Codex 或 DSH...') : '当前 AI 服务不可用';
+  $('compose-hint').textContent = hasProvider
+    ? (hasRun ? '当前运行的结构化结果' : '未选择运行，使用通用上下文')
+    : 'AI 服务不可用';
 }
 
 function navigate(page) {
@@ -267,23 +272,25 @@ async function loadAll() {
     state.apiHealthy = true;
 
     const [plugins, providers] = await Promise.all([jsonFetch('/api/plugins'), jsonFetch('/api/ai/providers')]);
+    if (requestId !== state.loadRequest) return;
+    // Provider availability is independent of database queries. Publish it
+    // before loading runs so an unavailable database cannot disable local AI.
+    state.providers = providers;
+    renderServiceState(readiness, providers);
+    const wantedProvider = $('provider').value || preferredProvider;
+    $('provider').innerHTML = providers.map((provider) => `<option value="${escapeHtml(provider.name)}" ${provider.available ? '' : 'disabled'}>${escapeHtml(provider.name)}${provider.available ? '' : ' · 不可用'}</option>`).join('');
+    const selectedProvider = providers.find((provider) => provider.name === wantedProvider && provider.available)
+      || providers.find((provider) => provider.available);
+    if (selectedProvider) $('provider').value = selectedProvider.name;
+    updateAiControls();
     const runs = readiness.ok ? await jsonFetch('/api/runs?limit=100') : [];
     if (requestId !== state.loadRequest) return;
 
     const currentPlugin = $('result-type').value;
     const currentRun = $('result-run').value;
-    const currentProvider = $('provider').value;
     const selectionChanged = currentPlugin !== preferredPlugin || currentRun !== preferredRun;
-    const providerChanged = currentProvider !== preferredProvider;
 
-    state.providers = providers;
     state.runs = runs;
-    renderServiceState(readiness, providers);
-    $('provider').innerHTML = providers.map((provider) => `<option value="${escapeHtml(provider.name)}" ${provider.available ? '' : 'disabled'}>${escapeHtml(provider.name)}${provider.available ? '' : ' · 不可用'}</option>`).join('');
-    const wantedProvider = providerChanged ? currentProvider : preferredProvider;
-    const selectedProvider = providers.find((provider) => provider.name === wantedProvider && provider.available)
-      || providers.find((provider) => provider.available);
-    if (selectedProvider) $('provider').value = selectedProvider.name;
     renderPlugins(plugins); renderMetrics(); renderRunCards(); renderHistory();
     await switchPlugin(selectionChanged ? currentPlugin : preferredPlugin, selectionChanged ? currentRun : preferredRun);
     if (requestId !== state.loadRequest) return;
@@ -307,12 +314,11 @@ function resetAiConversation(plugin, runId = '') {
   $('chat').replaceChildren();
   addMessage('assistant', runId
     ? `当前上下文已切换到 ${plugin} / ${runId}。`
-    : '选择一个运行后，可以让 Codex 或 DSH 分析当前结构化结果。');
+    : '可以直接询问 Codex 或 DSH；选择运行后会自动附加结构化结果。');
 }
 
 async function askAi(message) {
   if (!message.trim()) return;
-  if (!state.selected?.run_id) { addMessage('assistant', '请先选择一个运行，再请求 AI 分析。'); return; }
   const provider = $('provider').value;
   if (!state.providers.some((item) => item.name === provider && item.available)) { addMessage('assistant', '当前 AI 服务不可用。'); return; }
   addMessage('user', message);

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import mimetypes
+from dataclasses import replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -30,7 +31,10 @@ class ResultService:
         self.config = config
         self.plugins = default_plugins(config.stp_result_table)
         self.repository = create_repository(config.db_conn, self.plugins)
-        self.providers = build_providers(config.providers)
+        self.providers = build_providers({
+            name: replace(provider, cwd=provider.cwd or config.workspace)
+            for name, provider in config.providers.items()
+        })
         static_dir = config.static_dir or str(Path(__file__).resolve().parents[1] / "web")
         self.static_dir = Path(static_dir).resolve()
 
@@ -72,9 +76,6 @@ class ResultService:
         context = body.get("context", {})
         if not message or not isinstance(context, dict):
             return 400, {"error": "provider, message and object context are required"}
-        run = context.get("run")
-        if not isinstance(run, dict) or not run.get("run_id") or not run.get("plugin_type"):
-            return 400, {"error": "selected run context is required"}
         if len(message) > 8000:
             return 400, {"error": "message is too long"}
         provider = self.providers.get(provider_name)
@@ -124,6 +125,8 @@ class Handler(BaseHTTPRequestHandler):
             if length > 128 * 1024:
                 raise ValueError("request is too large")
             body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(body, dict):
+                raise ValueError("request body must be an object")
             status, value = self.service.ai_chat(body)
         except (ValueError, json.JSONDecodeError) as exc:
             status, value = 400, {"error": str(exc)}

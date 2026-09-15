@@ -14,7 +14,7 @@ function Resolve-ProjectTool {
 
 function Resolve-ProjectPsql([string]$Explicit = '') {
     $root = Split-Path -Parent $PSScriptRoot
-    $candidates = @((Join-Path $root 'third_party/pgsql/bin/psql.exe'), 'psql.exe', 'psql')
+    $candidates = @((Join-Path $root 'postgres/bin/psql.exe'), (Join-Path $root 'third_party/pgsql/bin/psql.exe'), 'psql.exe', 'psql')
     if ($env:PG_ROOT) { $candidates = @((Join-Path $env:PG_ROOT 'bin/psql.exe')) + $candidates }
     return Resolve-ProjectTool $Explicit $candidates 'psql (-Psql)'
 }

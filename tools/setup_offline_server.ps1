@@ -7,7 +7,7 @@ tools\offline_deploy.json (dataset/program sources and versions), then run:
   powershell -ExecutionPolicy Bypass -File .\tools\setup_offline_server.ps1
 
 The script, in order:
-  1. verifies the toolchain and builds the project (Debug by default)
+  1. verifies the toolchain and builds the project (Release by default)
   2. installs/initializes/starts the bundled PostgreSQL server and creates the database
   3. stages the stp dataset and regenerates the dataset manifest
   4. writes the scheduler config (db, manifest, expected versions)
@@ -53,8 +53,17 @@ param(
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'ToolSupport.ps1')
 
+$ProjectRoot = [System.IO.Path]::GetFullPath($ProjectRoot)
+function Resolve-ProjectPath([string]$Path) {
+    if (-not $Path) { return '' }
+    if ([System.IO.Path]::IsPathRooted($Path)) { return [System.IO.Path]::GetFullPath($Path) }
+    return [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot $Path))
+}
+
 if (-not $DeployConfig) {
     $DeployConfig = Join-Path $PSScriptRoot 'offline_deploy.json'
+} else {
+    $DeployConfig = Resolve-ProjectPath $DeployConfig
 }
 $deploy = @{}
 if (Test-Path $DeployConfig) {
@@ -94,7 +103,7 @@ function Build-DbConn([string]$HostName, [int]$Port, [string]$Db, [string]$User,
     return New-PostgresConnection $HostName $Port $Db $User $Password
 }
 
-$buildConfig = if ($Config) { $Config } else { [string](Get-DeployValue 'build_config' 'Debug') }
+$buildConfig = if ($Config) { $Config } else { [string](Get-DeployValue 'build_config' 'Release') }
 $serverPort = if ($ServerPort -gt 0) { $ServerPort } else { [int](Get-DeployValue 'server_port' 5555) }
 $dbPort = if ($DbPort -gt 0) { $DbPort } else { [int](Get-DeployValue 'db_port' 5432) }
 $dbName = if ($DbName) { $DbName } else { [string](Get-DeployValue 'db_name' 'testtracking') }
@@ -118,6 +127,15 @@ $workerId = if ($WorkerId) { $WorkerId } else { [string](Get-DeployValue 'worker
 $taskThreads = [int](Get-DeployValue 'task_threads' 2)
 $taskSize = [int](Get-DeployValue 'task_size' 25)
 $storeCov = [bool](Get-DeployValue 'store_cov' $true)
+
+# All deployment inputs are interpreted relative to the project root, so the
+# setup script behaves the same when invoked from another working directory.
+$BuildDir = if ($BuildDir) { Resolve-ProjectPath $BuildDir } else { '' }
+$PgData = if ($PgData) { Resolve-ProjectPath $PgData } else { '' }
+$datasetDir = if ($datasetDir) { Resolve-ProjectPath $datasetDir } else { '' }
+$stepTestExe = if ($stepTestExe) { Resolve-ProjectPath $stepTestExe } else { '' }
+$engineSrcDir = if ($engineSrcDir) { Resolve-ProjectPath $engineSrcDir } else { '' }
+$opencppcoverageDir = if ($opencppcoverageDir) { Resolve-ProjectPath $opencppcoverageDir } else { '' }
 
 if (-not $serverIp) { $serverIp = [string](Get-DeployValue 'server_ip' '') }
 if (-not $serverIp) {
@@ -243,6 +261,7 @@ if (-not $SkipPackage) {
     & (Join-Path $PSScriptRoot 'build_package.ps1') `
         -OutDir $outDir `
         -BinDir $binDir `
+        -Config $buildConfig `
         -Endpoint $endpoint `
         -ServerIp $serverIp `
         -ServerPort $serverPort `

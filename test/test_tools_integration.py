@@ -200,21 +200,31 @@ class ToolIntegrationTests(unittest.TestCase):
         self.assertIn('different=0', output.read_text())
         self.assertNotIn('different\tone.stp', output.read_text())
 
-    def test_deploy_nondefault_ports_paths_and_single_plugin_packages(self):
+    def test_deploy_relative_paths_from_non_project_working_directory(self):
         project = self.root / 'project with spaces'
         (project / 'scheduler').mkdir(parents=True)
         shutil.copyfile(ROOT / 'scheduler/scheduler.json', project / 'scheduler/scheduler.json')
         build = project / 'build outputs'
-        binaries = build / 'bin/Debug'
+        binaries = build / 'bin/Release'
         binaries.mkdir(parents=True)
         for filename in ('client.exe', 'scheduler.exe', 'coverage.dll', 'stpcompare.dll'):
             (binaries / filename).write_bytes(b'configuration fixture; never executed')
+        # A fixture CRT keeps this configuration test independent of whether
+        # Visual Studio redistributables are installed on the test host.
+        crt = project / 'VC runtime'
+        crt.mkdir()
+        for filename in ('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll'):
+            (crt / filename).write_bytes(b'configuration fixture; never executed')
         deploy = project / 'deployment.json'
-        deploy.write_text(json.dumps({'server_ip':'192.0.2.17','server_port':6123,'db_port':6543,
+        deploy.write_text(json.dumps({'build_config':'Release','server_ip':'192.0.2.17','server_port':6123,'db_port':6543,
                                       'db_name':'test_db','db_user':'test_user','program_version':'p17',
                                       'dataset_version':'d17'}))
-        self.script('setup_offline_server.ps1', '-ProjectRoot', project, '-BuildDir', build,
-                    '-DeployConfig', deploy, '-SkipBuild', '-SkipDatabase', '-SkipDataset',
+        # Invoke from the parent directory while every deployment path is
+        # relative to the project root. This catches accidental resolution
+        # against the caller's working directory.
+        self.script('setup_offline_server.ps1', '-ProjectRoot', 'project with spaces',
+                    '-BuildDir', 'build outputs', '-DeployConfig', 'deployment.json',
+                    '-SkipBuild', '-SkipDatabase', '-SkipDataset',
                     '-SkipPackage', '-SkipFirewall')
         config = json.loads((binaries / 'config/scheduler.json').read_text())
         self.assertEqual(config['server']['router_endpoint'], 'tcp://*:6123')
@@ -225,7 +235,8 @@ class ToolIntegrationTests(unittest.TestCase):
         for name in ('coverage', 'stpcompare'):
             output = self.root / ('package ' + name)
             self.script('build_package.ps1', '-OutDir', output, '-BinDir', binaries, '-OnlyClient',
-                        '-Plugin', name, '-ServerIp', '192.0.2.17', '-ServerPort', '6123', '-DbPort', '6543')
+                        '-Plugin', name, '-ServerIp', '192.0.2.17', '-ServerPort', '6123', '-DbPort', '6543',
+                        '-VCRuntimeDir', crt)
             client = json.loads((output / 'config/client.json').read_text())
             self.assertEqual(client['scheduler']['endpoint'], 'tcp://192.0.2.17:6123')
             enabled = [key for key,value in client['plugins'].items() if value['enabled']]

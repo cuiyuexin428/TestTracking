@@ -50,7 +50,10 @@ class ServiceConfig:
                 "codex": ProviderConfig(
                     name="codex",
                     command="codex",
-                    args=("exec", "--json", "--ephemeral", "--skip-git-repo-check", "--sandbox", "read-only", "-"),
+                    # Keep the invocation compatible with the local Codex CLI,
+                    # while leaving approval and sandbox policy to the user's
+                    # own Codex configuration.
+                    args=("exec", "--json", "--ephemeral", "--skip-git-repo-check", "-"),
                 ),
                 "dsh": ProviderConfig(
                     name="dsh",

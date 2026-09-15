@@ -1,5 +1,5 @@
 {
-  "build_config": "Debug",
+  "build_config": "Release",
   "server_ip": "",
   "server_port": 5555,
   "db_port": 5432,
@@ -9,12 +9,12 @@
   "db_auth_method": "trust",
   "client_cidr": "0.0.0.0/0",
   "register_db_service": true,
-  "dataset_dir": "C:/WorkSpace/occt_demo/step",
+  "dataset_dir": "",
   "dataset_version": "d1",
-  "step_test_exe": "C:/WorkSpace/occt_demo/build/Debug/StepTest.exe",
-  "engine_src_dir": "C:/WorkSpace/occt_demo/occtlib/src",
+  "step_test_exe": "",
+  "engine_src_dir": "",
   "program_version": "1.0",
-  "opencppcoverage_dir": "C:/Program Files/OpenCppCoverage",
+  "opencppcoverage_dir": "",
   "engine_dlls": [
     "TKernel.dll",
     "TKBRep.dll",

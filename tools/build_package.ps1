@@ -15,7 +15,7 @@
 #   -OnlyProgram  replace testenv\program and bump its version
 #   -OnlyDataset  replace testenv\dataset and bump its version
 param(
-    [string]$OutDir = 'C:\Shared\client_package',
+    [string]$OutDir = '',
     [string]$BinDir = $null,
     [string]$Endpoint = '',
     [string]$WorkerId = 'worker-1',
@@ -37,19 +37,43 @@ param(
     [string]$ProgramVersion = '1.0',
     [string]$DatasetVersion = 'd1',
     [string[]]$EngineDlls = @('TKernel.dll', 'TKBRep.dll', 'TKDESTEP.dll', 'TKTopAlgo.dll'),
-    [string]$StepTestExe = 'C:\WorkSpace\occt_demo\build\Debug\StepTest.exe',
+    # These inputs belong to the deployment being packaged. Keep them empty
+    # by default so a package build never silently captures a developer's
+    # workstation paths.
+    [string]$StepTestExe = '',
 
     [string]$EngineSrcDir = '',
-    [string]$DatasetDir = 'C:\WorkSpace\occt_demo\step',
-    [string]$OpenCppCoverageDir = 'C:\Program Files\OpenCppCoverage'
+    [string]$DatasetDir = '',
+    [string]$OpenCppCoverageDir = '',
+    [ValidateSet('Debug', 'Release')][string]$Config = 'Release',
+    [string]$VCRuntimeDir = ''
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'ToolSupport.ps1')
+. (Join-Path $PSScriptRoot 'PackageSupport.ps1')
+$programInputProvided = [bool]($StepTestExe -or $ConverterExe)
+$root = [System.IO.Path]::GetFullPath((Split-Path $PSScriptRoot -Parent))
+
+function Resolve-ProjectPath([string]$Path) {
+    if (-not $Path) { return '' }
+    if ([System.IO.Path]::IsPathRooted($Path)) {
+        return [System.IO.Path]::GetFullPath($Path)
+    }
+    return [System.IO.Path]::GetFullPath((Join-Path $root $Path))
+}
+
+if (@($OnlyClient, $OnlyProgram, $OnlyDataset).Where({ $_ }).Count -gt 1) {
+    throw 'Choose at most one of -OnlyClient, -OnlyProgram, -OnlyDataset'
+}
+if ($Config -ne 'Release') {
+    throw 'Deployment packages require -Config Release; Debug runtimes cannot be redistributed'
+}
+
 if ($Plugin -eq 'stpcompare') {
     if (-not $ConverterExe -and -not $OnlyClient -and -not $OnlyDataset) {
         throw 'Pass -ConverterExe for a stpcompare program package'
     }
-    $StepTestExe = if ($ConverterExe) { $ConverterExe } else { 'Converter.exe' }
+    $StepTestExe = if ($ConverterExe) { Resolve-ProjectPath $ConverterExe } else { 'Converter.exe' }
 }
 function Get-LocalIPv4 {
     $candidates = @()
@@ -67,7 +91,7 @@ function Get-LocalIPv4 {
     throw 'Cannot auto-detect server IPv4 address; pass -ServerIp or -Endpoint.'
 }
 
-if (-not $ServerIp) {
+if (-not $OnlyProgram -and -not $OnlyDataset -and -not $ServerIp -and (-not $Endpoint -or (-not $DbConn -and $StoreType -eq 'postgres'))) {
     $candidateIps = @(Get-LocalIPv4)
     $ServerIp = $candidateIps[0]
     Write-Host "detected IPv4 candidates: $($candidateIps -join ', '); using $ServerIp (override with -ServerIp)"
@@ -77,10 +101,20 @@ if (-not $DbConn -and $StoreType -eq 'postgres') {
     $DbConn = New-PostgresConnection $ServerIp $DbPort $DbName $DbUser $DbPassword
 }
 
-$root = Split-Path $PSScriptRoot -Parent
-if (-not $BinDir) {
+if (-not $OutDir) {
+    $OutDir = Join-Path $root 'dist\client_package'
+} else {
+    $OutDir = Resolve-ProjectPath $OutDir
+}
+$StepTestExe = Resolve-ProjectPath $StepTestExe
+$EngineSrcDir = Resolve-ProjectPath $EngineSrcDir
+$DatasetDir = Resolve-ProjectPath $DatasetDir
+$OpenCppCoverageDir = Resolve-ProjectPath $OpenCppCoverageDir
+$VCRuntimeDir = Resolve-ProjectPath $VCRuntimeDir
+if (-not $OnlyProgram -and -not $OnlyDataset -and -not $BinDir) {
     $candidates = @(
-        (Join-Path $root 'out\build\x64-Debug\bin\Debug'),
+        (Join-Path $root 'build\rt\bin\Release'),
+        (Join-Path $root 'out\build\x64-Release\bin\Release'),
         (Join-Path $root 'out\build\Release\bin\Release'),
         (Join-Path $root 'build\bin\Release')
     )
@@ -91,11 +125,31 @@ if (-not $BinDir) {
         }
     }
 }
-if (-not $BinDir -or -not (Test-Path (Join-Path $BinDir 'client.exe'))) {
+$BinDir = Resolve-ProjectPath $BinDir
+if (-not $OnlyProgram -and -not $OnlyDataset -and (-not $BinDir -or -not (Test-Path (Join-Path $BinDir 'client.exe')))) {
     throw "client.exe not found; pass -BinDir <bin dir>"
 }
 
+if (-not $OnlyClient -and -not $OnlyDataset -and -not $StepTestExe) {
+        throw 'StepTest executable is required; pass -StepTestExe <path> (the package stores it under testenv/program)'
+}
+if (-not $OnlyClient -and -not $OnlyProgram -and -not $DatasetDir) {
+        throw 'Dataset directory is required; pass -DatasetDir <path> (the package stores it under testenv/dataset)'
+}
+if (-not $OnlyClient -and -not $OnlyDataset -and $Plugin -eq 'coverage' -and -not $OpenCppCoverageDir) {
+        throw 'OpenCppCoverage directory is required for coverage; pass -OpenCppCoverageDir <path>'
+}
+
 $testenv = Join-Path $OutDir 'testenv'
+$clientConfigPath = Join-Path $OutDir 'config\client.json'
+$programFileName = if ($StepTestExe) { Split-Path -Leaf $StepTestExe }
+    elseif ($Plugin -eq 'stpcompare') { 'Converter.exe' } else { 'StepTest.exe' }
+if ($OnlyClient -and -not $programInputProvided -and (Test-Path -LiteralPath $clientConfigPath)) {
+    $previousConfig = Get-Content -LiteralPath $clientConfigPath -Raw | ConvertFrom-Json
+    $previousPlugin = $previousConfig.plugins.$Plugin
+    $previousProgram = if ($Plugin -eq 'coverage') { $previousPlugin.target_exe } else { $previousPlugin.program_exe }
+    if ($previousProgram) { $programFileName = [System.IO.Path]::GetFileName([string]$previousProgram) }
+}
 
 if (-not $OnlyClient -and -not $OnlyDataset) {
     # testenv\program: target exe + PDB + all engine DLLs + instrumented PDBs.
@@ -127,6 +181,7 @@ if (-not $OnlyClient -and -not $OnlyDataset) {
         }
     }
     Get-ChildItem $stepDir -Filter '*.dll' | Copy-Item -Destination $progDir
+    Copy-VCRuntime -Destination $progDir -RuntimeDir $VCRuntimeDir | Out-Null
     if ($EngineSrcDir) {
         Copy-Item -Path $EngineSrcDir -Destination (Join-Path $progDir 'engine_src') -Recurse
     }
@@ -134,6 +189,15 @@ if (-not $OnlyClient -and -not $OnlyDataset) {
         (Join-Path $progDir 'version.txt'),
         $ProgramVersion,
         (New-Object System.Text.UTF8Encoding($false)))
+    if ($OnlyProgram -and (Test-Path -LiteralPath $clientConfigPath)) {
+        $existingConfig = Get-Content -LiteralPath $clientConfigPath -Raw | ConvertFrom-Json
+        $existingPlugin = $existingConfig.plugins.$Plugin
+        if ($existingPlugin) {
+            $exeProperty = if ($Plugin -eq 'coverage') { 'target_exe' } else { 'program_exe' }
+            $existingPlugin | Add-Member -NotePropertyName $exeProperty -NotePropertyValue ('testenv/program/' + $programFileName) -Force
+            Write-AtomicText $clientConfigPath ($existingConfig | ConvertTo-Json -Depth 10)
+        }
+    }
 
     if ($Plugin -eq 'coverage') {
     # testenv\opencppcoverage (static tooling).
@@ -196,6 +260,7 @@ if (-not $OnlyProgram -and -not $OnlyDataset) {
     New-Item -ItemType Directory -Force (Join-Path $OutDir 'config') | Out-Null
     Copy-Item -LiteralPath (Join-Path $BinDir 'client.exe') -Destination $OutDir
     Get-ChildItem $BinDir -Filter '*.dll' | Copy-Item -Destination $OutDir
+    Copy-VCRuntime -Destination $OutDir -RuntimeDir $VCRuntimeDir | Out-Null
 
     $coverageCfg = @{
         dll = 'coverage.dll'
@@ -208,7 +273,7 @@ if (-not $OnlyProgram -and -not $OnlyDataset) {
         stp_root = 'testenv/dataset'
         export_dir = 'reports'
         opencppcoverage = 'testenv/opencppcoverage/OpenCppCoverage.exe'
-        target_exe = 'testenv/program/StepTest.exe'
+        target_exe = 'testenv/program/' + $programFileName
         engine_dlls = $EngineDlls | ForEach-Object { "testenv/program/$_" }
     }
     if ($DbConn) {
@@ -219,7 +284,7 @@ if (-not $OnlyProgram -and -not $OnlyDataset) {
         $selectedPlugin = @{
             dll = 'stpcompare.dll'; enabled = $true; dry_run = $false
             store_type = $StoreType; db_conn = $DbConn; store_dir = 'store'
-            program_dir = 'testenv/program'; program_exe = ('testenv/program/' + (Split-Path -Leaf $StepTestExe))
+            program_dir = 'testenv/program'; program_exe = ('testenv/program/' + $programFileName)
             stp_root = 'testenv/dataset'; work_dir = 'stp_compare_work'
             info_file = 'info.txt'; info_new_file = 'info_new.txt'; table = 'stp_compare_old'
         }
@@ -256,4 +321,6 @@ pause
 }
 
 Write-Host "done. copy '$OutDir' to the target machine and run start_client.bat"
-Write-Host "NOTE: endpoint/db_conn default to this machine's detected IPv4 ($ServerIp); pass -ServerIp/-Endpoint/-DbConn to override."
+if (-not $OnlyProgram -and -not $OnlyDataset) {
+    Write-Host 'Check config/client.json endpoint/db_conn for the deployment server before starting the client.'
+}

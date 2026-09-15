@@ -84,9 +84,9 @@
         <div class="assistant-head"><strong>✦ 结果助手</strong><button type="button" class="icon-button" id="ai-close" title="关闭 AI 助手">×</button></div>
         <div class="provider-field"><label>AI 服务<select id="provider"></select></label></div>
         <div class="ai-context" id="ai-context">上下文：尚未选择运行</div>
-        <div class="chat" id="chat" aria-live="polite"><div class="message assistant-message">选择一个运行后，可以让 Codex 或 DSH 分析当前结构化结果。</div></div>
+        <div class="chat" id="chat" aria-live="polite"><div class="message assistant-message">可以直接询问 Codex 或 DSH；选择运行后会自动附加结构化结果。</div></div>
         <div class="quick-actions" id="quick-actions"><button type="button" data-prompt="分析当前运行的结果完整性">检查完整性</button><button type="button" data-prompt="总结当前运行中需要优先处理的问题">归纳问题</button></div>
-        <form class="compose" id="chat-form"><textarea id="question" rows="3" placeholder="请先选择一个运行" required disabled></textarea><div class="compose-actions"><span id="compose-hint">需要选择运行</span><button class="send-button" id="send-button" type="submit" title="发送" disabled>➤</button></div></form>
+        <form class="compose" id="chat-form"><textarea id="question" rows="3" placeholder="询问 Codex 或 DSH..." required disabled></textarea><div class="compose-actions"><span id="compose-hint">正在检查本机 AI 命令</span><button class="send-button" id="send-button" type="submit" title="发送" disabled>➤</button></div></form>
       </aside>
     </div>
     <footer><span><span class="dot" id="footer-dot"></span><span id="footer-status">结果服务连接中</span></span><span>执行状态 · 结果完整性 · 分析状态独立展示</span></footer>

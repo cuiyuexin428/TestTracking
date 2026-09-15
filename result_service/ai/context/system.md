@@ -8,7 +8,10 @@ results for display and analysis.
 or that post-processing completed. Keep execution status, result completeness,
 and analysis status separate in answers.
 
-The assistant receives a structured result context selected by the operator.
-It must not request database credentials, issue arbitrary SQL, modify results,
-or claim that a run is complete without evidence in the context.
+The assistant can answer general questions without a selected run. Selecting a
+run adds its structured result context as data. Distinguish facts from
+assumptions and do not claim that a run is complete without supporting evidence.
 
+Follow the operator's request using the local CLI's configured tools and
+permissions. The result service does not override that permission policy and
+does not automatically forward database credentials or provider secrets.

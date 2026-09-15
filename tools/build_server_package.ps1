@@ -11,6 +11,7 @@ the current directory:
     data\dataset\ (optional STP manifest and inputs)
     data\artifacts, data\reports, data\logs
     scripts\start_server.ps1, stop_server.ps1, health_check.ps1
+    runtime\python\ (embedded Python and PostgreSQL driver)
     release-manifest.json
 
 No path in scheduler.json points back to the source or build tree. The
@@ -21,7 +22,7 @@ config/scheduler.json before starting the package).
 param(
     [string]$ProjectRoot = (Split-Path -Parent $PSScriptRoot),
     [string]$BinDir = '',
-    [ValidateSet('Debug', 'Release')][string]$Config = 'Debug',
+    [ValidateSet('Debug', 'Release')][string]$Config = 'Release',
     [string]$OutDir = '',
     [string]$DbConn = 'host=127.0.0.1 port=5432 dbname=testtracking user=postgres',
     [string]$ResultDbConn = '',
@@ -34,9 +35,17 @@ param(
     [switch]$SkipDataset,
     [switch]$IncludeSymbols,
     [switch]$IncludePostgresRuntime,
-    [string]$PgBinDir = ''
+    [string]$PgBinDir = '',
+    # Optional embeddable CPython directory. When supplied it is copied to
+    # runtime/python so the package does not depend on Python being on PATH.
+    [string]$PythonRuntimeDir = '',
+    [switch]$UseSystemPython,
+    [string]$VCRuntimeDir = ''
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'PackageSupport.ps1')
+if ($Config -ne 'Release') { throw 'Portable distributions require a Release build; Debug runtime DLLs are not redistributable.' }
+if ($UseSystemPython -and $PythonRuntimeDir) { throw 'UseSystemPython and PythonRuntimeDir cannot be combined.' }
 
 function Resolve-FullPath([string]$Path) {
     if ([System.IO.Path]::IsPathRooted($Path)) { return [System.IO.Path]::GetFullPath($Path) }
@@ -71,7 +80,11 @@ function Copy-DirectoryContents([string]$Source, [string]$Destination) {
 function Find-BinaryDir {
     param([string]$Root, [string]$Explicit, [string]$BuildConfig)
     if ($Explicit) {
-        $candidate = Resolve-FullPath $Explicit
+        $candidate = if ([System.IO.Path]::IsPathRooted($Explicit)) {
+            Resolve-FullPath $Explicit
+        } else {
+            Resolve-FullPath (Join-Path $Root $Explicit)
+        }
         if (Test-Path (Join-Path $candidate 'scheduler.exe')) { return $candidate }
         $nested = Join-Path $candidate ("bin\$BuildConfig")
         if (Test-Path (Join-Path $nested 'scheduler.exe')) { return $nested }
@@ -128,8 +141,36 @@ function Write-TextFile([string]$Path, [string]$Text) {
 }
 
 $ProjectRoot = Resolve-FullPath $ProjectRoot
-if (-not $OutDir) { $OutDir = Join-Path $ProjectRoot ("dist\server-$PackageVersion") }
+$VCRuntimeDir = if ($VCRuntimeDir) {
+    if ([System.IO.Path]::IsPathRooted($VCRuntimeDir)) { Resolve-FullPath $VCRuntimeDir }
+    else { Resolve-FullPath (Join-Path $ProjectRoot $VCRuntimeDir) }
+} else { '' }
+if (-not $OutDir) {
+    $OutDir = Join-Path $ProjectRoot ("dist\server-$PackageVersion")
+} elseif (-not [System.IO.Path]::IsPathRooted($OutDir)) {
+    $OutDir = Join-Path $ProjectRoot $OutDir
+}
 $OutDir = Resolve-FullPath $OutDir
+$PythonRuntimeDir = if ($PythonRuntimeDir) {
+    if ([System.IO.Path]::IsPathRooted($PythonRuntimeDir)) {
+        Resolve-FullPath $PythonRuntimeDir
+    } else {
+        Resolve-FullPath (Join-Path $ProjectRoot $PythonRuntimeDir)
+    }
+} else { '' }
+if (-not $UseSystemPython -and -not $PythonRuntimeDir) {
+    $PythonRuntimeDir = Join-Path $ProjectRoot 'runtime\python'
+    $buildPython = if ($env:PYTHON) { $env:PYTHON } else { 'python' }
+    & $buildPython (Join-Path $PSScriptRoot 'prepare_python_runtime.py') --out $PythonRuntimeDir
+    if ($LASTEXITCODE -ne 0) { throw 'Preparing portable Python failed; for offline builds pass -PythonRuntimeDir with a prepared runtime.' }
+}
+if ($PythonRuntimeDir) {
+    $pythonExe = Join-Path $PythonRuntimeDir 'python.exe'
+    if (-not (Test-Path -LiteralPath $pythonExe -PathType Leaf)) { throw "Python runtime not found: $pythonExe" }
+    if (Test-Path -LiteralPath (Join-Path $PythonRuntimeDir 'pyvenv.cfg')) { throw 'A virtual environment cannot be relocated. Supply an embedded Python runtime.' }
+    & $pythonExe -B -I -c 'import sys, psycopg, psycopg_binary; assert sys.version_info >= (3, 10); assert sys.maxsize > 2**32'
+    if ($LASTEXITCODE -ne 0) { throw 'Python runtime must contain Python 3.10+ x64 and psycopg[binary].' }
+}
 $bin = Find-BinaryDir -Root $ProjectRoot -Explicit $BinDir -BuildConfig $Config
 
 if (Test-Path -LiteralPath $OutDir) {
@@ -166,13 +207,17 @@ $dlls = @(Get-ChildItem -LiteralPath $bin -Filter '*.dll' -File -ErrorAction Sil
     Where-Object { $_.BaseName -notmatch '(?i)(^test_|_probe$|probe_)' })
 if ($dlls.Count -eq 0) { throw "No DLLs found next to scheduler.exe: $bin" }
 foreach ($dll in $dlls) { Copy-Item -LiteralPath $dll.FullName -Destination (Join-Path $binOut $dll.Name) -Force }
+Copy-VCRuntime -Destination $binOut -RuntimeDir $VCRuntimeDir | Out-Null
 if ($IncludeSymbols) {
     Get-ChildItem -LiteralPath $bin -Filter '*.pdb' -File -ErrorAction SilentlyContinue | ForEach-Object {
         Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $binOut $_.Name) -Force
     }
 }
 
-$datasetSource = if ($DatasetDir) { Resolve-FullPath $DatasetDir } else { Join-Path $ProjectRoot 'runtime\dataset' }
+$datasetSource = if ($DatasetDir) {
+    if ([System.IO.Path]::IsPathRooted($DatasetDir)) { Resolve-FullPath $DatasetDir }
+    else { Resolve-FullPath (Join-Path $ProjectRoot $DatasetDir) }
+} else { Join-Path $ProjectRoot 'runtime\dataset' }
 $manifestRelative = 'data/dataset/manifest.txt'
 if (-not $SkipDataset) {
     if (-not (Test-Path -LiteralPath $datasetSource -PathType Container)) { throw "Dataset directory not found: $datasetSource (pass -SkipDataset to omit it)" }
@@ -205,13 +250,36 @@ if (Test-Path (Join-Path $binOut 'coverage_settle.exe')) {
 }
 
 if ($IncludePostgresRuntime) {
-    if (-not $PgBinDir) { $PgBinDir = Join-Path $ProjectRoot 'runtime\pgsql\bin' }
-    Copy-DirectoryContents (Resolve-FullPath $PgBinDir) (Join-Path $OutDir 'postgres\bin')
+    if (-not $PgBinDir) {
+        $PgBinDir = Join-Path $ProjectRoot 'third_party\pgsql\bin'
+        if (-not (Test-Path $PgBinDir)) { $PgBinDir = Join-Path $ProjectRoot 'runtime\pgsql\bin' }
+    }
+    $pgSource = if ([System.IO.Path]::IsPathRooted($PgBinDir)) { Resolve-FullPath $PgBinDir }
+        else { Resolve-FullPath (Join-Path $ProjectRoot $PgBinDir) }
+    $postgresBinOut = Join-Path $OutDir 'postgres\bin'
+    Copy-DirectoryContents $pgSource $postgresBinOut
+    # PostgreSQL executables are launched from their own bin directory. Copy
+    # the same VC++ runtime used by the scheduler there as well, so an
+    # otherwise clean Windows x64 host does not need a global VC++ install.
+    foreach ($runtimeName in @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll')) {
+        $runtimeSource = Join-Path $binOut $runtimeName
+        if (Test-Path -LiteralPath $runtimeSource -PathType Leaf) {
+            Copy-Item -LiteralPath $runtimeSource -Destination (Join-Path $postgresBinOut $runtimeName) -Force
+        }
+    }
+    # initdb/postgres need their share and lib trees, not only executables.
+    foreach ($name in @('share', 'lib')) {
+        Copy-DirectoryContents (Join-Path (Split-Path -Parent $pgSource) $name) (Join-Path $OutDir "postgres\$name")
+    }
+    Copy-FileChecked (Join-Path $PSScriptRoot 'init_postgres_offline.ps1') (Join-Path $toolsOut 'init_postgres_offline.ps1')
 }
 
-# Bundle the read-only result/API sidecar and its static UI. Python itself is
-# an explicit prerequisite; the package does not silently copy a developer's
-# virtual environment or credentials.
+if ($PythonRuntimeDir) {
+    Copy-DirectoryContents $PythonRuntimeDir (Join-Path $OutDir 'runtime\python')
+}
+
+# Bundle the read-only result/API sidecar and its static UI. Python and psycopg
+# are included by default. Only an explicit -UseSystemPython relies on the host.
 $resultSource = Join-Path $ProjectRoot 'result_service'
 if (Test-Path -LiteralPath (Join-Path $resultSource 'launcher.py')) {
     Copy-DirectoryContents $resultSource $resultOut
@@ -221,7 +289,12 @@ if (Test-Path -LiteralPath (Join-Path $resultSource 'launcher.py')) {
         Where-Object { $_.Name -in @('__pycache__', '.pytest_cache') } |
         Sort-Object FullName -Descending |
         Remove-Item -Recurse -Force
-    Get-ChildItem -LiteralPath $resultOut -File -Recurse -Include '*.pyc', '*.pyo' -Force -ErrorAction SilentlyContinue |
+    # Windows PowerShell 5 treats -Include unexpectedly when combined with
+    # -LiteralPath and -Recurse, which can select every file. Filter by the
+    # actual extension so release inputs such as launcher.py and index.html
+    # are never removed.
+    Get-ChildItem -LiteralPath $resultOut -File -Recurse -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -in @('.pyc', '.pyo') } |
         Remove-Item -Force
     $resultConfig = [ordered]@{
         host = '127.0.0.1'
@@ -229,8 +302,9 @@ if (Test-Path -LiteralPath (Join-Path $resultSource 'launcher.py')) {
         db_conn = $ResultDbConn
         stp_result_table = $StpResultTable
         static_dir = '../result_service/web'
+        workspace = '..'
         providers = [ordered]@{
-            codex = [ordered]@{ command = 'codex'; args = @('exec', '--json', '--ephemeral', '--skip-git-repo-check', '--sandbox', 'read-only', '-'); timeout_seconds = 120 }
+            codex = [ordered]@{ command = 'codex'; args = @('exec', '--json', '--ephemeral', '--skip-git-repo-check', '-'); timeout_seconds = 120 }
             dsh = [ordered]@{ command = 'dsh'; args = @('--profile', 'headless'); prompt_mode = 'argument'; timeout_seconds = 120 }
         }
     }
@@ -260,15 +334,17 @@ $resultCfg = Join-Path $root 'config\result_service.json'
 $resultPidFile = Join-Path $root 'data\result_service.pid'
 $resultProc = $null
 if ((Test-Path $resultLauncher) -and (Test-Path $resultCfg)) {
-    $python = if ($env:PYTHON) { $env:PYTHON } else { 'python' }
+    $bundledPython = Join-Path $root 'runtime\python\python.exe'
+    $python = if (Test-Path -LiteralPath $bundledPython -PathType Leaf) { $bundledPython }
+        elseif ($env:PYTHON) { $env:PYTHON } else { 'python' }
     $resultLog = Join-Path $root 'data\logs\result_service.log'
-    $resultProc = Start-Process -FilePath $python -ArgumentList @('-B', $resultLauncher, '--config', $resultCfg) -WorkingDirectory $root -WindowStyle Hidden -RedirectStandardOutput $resultLog -RedirectStandardError (Join-Path $root 'data\logs\result_service.err.log') -PassThru
+    $resultProc = Start-Process -FilePath $python -ArgumentList @('-B', ('"' + $resultLauncher + '"'), '--config', ('"' + $resultCfg + '"')) -WorkingDirectory $root -WindowStyle Hidden -RedirectStandardOutput $resultLog -RedirectStandardError (Join-Path $root 'data\logs\result_service.err.log') -PassThru
     [System.IO.File]::WriteAllText($resultPidFile, [string]$resultProc.Id)
     Write-Host "result service started (pid $($resultProc.Id))"
 }
 # Keep scheduler attached to this console so its stdin command protocol remains
 # usable. The process is still tracked for health/stop scripts.
-$proc = Start-Process -FilePath $exe -ArgumentList $cfg -WorkingDirectory $root -NoNewWindow -PassThru
+$proc = Start-Process -FilePath $exe -ArgumentList ('"' + $cfg + '"') -WorkingDirectory $root -NoNewWindow -PassThru
 [System.IO.File]::WriteAllText($pidFile, [string]$proc.Id)
 Write-Host "scheduler started (pid $($proc.Id)); type help for commands"
 try { Wait-Process -Id $proc.Id } finally {
@@ -291,13 +367,15 @@ $resultStartScript = @'
 param([switch]$NoWait)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$python = if ($env:PYTHON) { $env:PYTHON } else { 'python' }
+$bundledPython = Join-Path $root 'runtime\python\python.exe'
+$python = if (Test-Path -LiteralPath $bundledPython -PathType Leaf) { $bundledPython }
+    elseif ($env:PYTHON) { $env:PYTHON } else { 'python' }
 $launcher = Join-Path $root 'result_service\launcher.py'
 $cfg = Join-Path $root 'config\result_service.json'
 $log = Join-Path $root 'data\logs\result_service.log'
 if (-not (Test-Path $launcher)) { throw "result service launcher not found: $launcher" }
 if (-not (Test-Path $cfg)) { throw "result service config not found: $cfg" }
-$proc = Start-Process -FilePath $python -ArgumentList @('-B', $launcher, '--config', $cfg) -WorkingDirectory $root -WindowStyle Hidden -RedirectStandardOutput $log -RedirectStandardError (Join-Path $root 'data\logs\result_service.err.log') -PassThru
+$proc = Start-Process -FilePath $python -ArgumentList @('-B', ('"' + $launcher + '"'), '--config', ('"' + $cfg + '"')) -WorkingDirectory $root -WindowStyle Hidden -RedirectStandardOutput $log -RedirectStandardError (Join-Path $root 'data\logs\result_service.err.log') -PassThru
 [System.IO.File]::WriteAllText((Join-Path $root 'data\result_service.pid'), [string]$proc.Id)
 Write-Host "result service started (pid $($proc.Id)); logs: $log"
 if (-not $NoWait) { Wait-Process -Id $proc.Id }
@@ -363,6 +441,44 @@ Write-Output (ConvertTo-Json @{ status = 'ok'; pid = $pidValue; port = $ServerPo
 '@
 Write-TextFile (Join-Path $scriptsOut 'health_check.ps1') $healthScript
 
+$packageReadme = @'
+# TestTracking server (Windows x64)
+
+Run start_server.bat from any directory. The scripts use this package as the
+working directory. Release C++ runtime DLLs and (by default) Python + psycopg are
+included. Do not copy only bin: config, result_service, runtime, tools and data
+belong to the same package.
+
+Before starting:
+- Set database connections in config/scheduler.json and config/result_service.json.
+  Use a reader database role for the result service. Its DB connection is not sent to AI.
+- Provide data/dataset/manifest.txt, matching the dataset and versions on clients.
+- Set stp_result_table in config/result_service.json to the table used by that plugin.
+
+UI: http://127.0.0.1:56330/ (host/port are configurable).
+To run only the UI/AI: scripts/start_result_service.ps1; stop with
+scripts/stop_result_service.ps1. AI works without a database or a selected run.
+Install/login to Codex or DSH as the account running this service. Local CLI
+settings and permissions apply; provider commands/cwd are configurable. With
+-UseSystemPython, the target machine must provide Python 3.10+ x64 and
+psycopg[binary] on its import path.
+
+If built with -IncludePostgresRuntime, initialize a local database explicitly
+from the package root:
+  Set-Location <server-package>
+  powershell -File .\tools\init_postgres_offline.ps1 -PgRoot .\postgres -PgData .\data\pgdata -NoService -NoFirewall -ClientCidr 127.0.0.1/32
+Adjust database name/user/port and network access for your deployment. To stop it:
+  postgres/bin/pg_ctl.exe -D data/pgdata -m fast stop
+No developer database is shipped. Back up data/pgdata before upgrades; do not
+overwrite an active deployment directory with a newly built package.
+
+Post-processing and maintenance scripts are in tools; PostgreSQL tools in a
+bundled postgres/bin are discovered automatically. release-manifest.json lists
+the packaged files and hashes. Generated logs, PID files and database data are
+runtime state, not release inputs.
+'@
+Write-TextFile (Join-Path $OutDir 'README.md') $packageReadme
+
 # Build a machine-readable inventory. The manifest excludes itself so its
 # hashes are stable after writing and can be checked by a deployment tool.
 $files = @()
@@ -381,6 +497,9 @@ $manifestObject = [ordered]@{
     protocol = 'zmq'
     server_port = $ServerPort
     dataset_included = (-not $SkipDataset)
+    target_platform = 'windows-x64'
+    python_bundled = [bool]$PythonRuntimeDir
+    postgres_bundled = [bool]$IncludePostgresRuntime
     files = @($files | Sort-Object path)
 }
 Write-TextFile (Join-Path $OutDir 'release-manifest.json') ($manifestObject | ConvertTo-Json -Depth 8)

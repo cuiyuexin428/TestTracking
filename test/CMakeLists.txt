@@ -16,6 +16,18 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME test_result_service COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/test_result_service.py -v)
     set_tests_properties(test_result_service PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        add_test(NAME test_package_portability COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_package_portability.py -v)
+        set_tests_properties(test_package_portability PROPERTIES TIMEOUT 90)
+    endif()
+endif()
+
+find_program(NodeJS_EXECUTABLE NAMES node nodejs)
+if(NodeJS_EXECUTABLE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_result_web.js")
+    add_test(NAME test_result_web COMMAND ${NodeJS_EXECUTABLE}
+        --test ${CMAKE_CURRENT_SOURCE_DIR}/test_result_web.js)
+    set_tests_properties(test_result_web PROPERTIES TIMEOUT 30)
 endif()
 add_executable(test_client_runtime test_client_runtime.cpp ../client/src/TaskExecutor.cpp)
 target_include_directories(test_client_runtime PRIVATE ../client/inc)
