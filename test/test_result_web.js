@@ -23,7 +23,7 @@ function element() {
   };
 }
 
-async function createConsole({ available = 'codex', databaseReady = false, runsError = false, chatConversationId = null } = {}) {
+async function createConsole({ available = 'codex', databaseReady = false, runsError = false, chatConversationId = null, chatGate = null } = {}) {
   const elements = new Map();
   const get = (id) => {
     if (!elements.has(id)) elements.set(id, element());
@@ -72,6 +72,7 @@ async function createConsole({ available = 'codex', databaseReady = false, runsE
         case '/api/ai/chat':
           assert.equal(options.method, 'POST');
           posts.push(JSON.parse(options.body));
+          if (chatGate) await chatGate;
           data = { text: 'Local AI response', conversation_id: chatConversationId };
           break;
         case '/api/ai/dsh-web':
@@ -128,6 +129,48 @@ test('chat form sends a general question without a run and displays the response
   }]);
   assert.equal(ui.get('question').value, '');
   assert.equal(ui.get('chat').children.at(-1).textContent, 'Local AI response');
+});
+
+test('Enter sends a chat message and Shift+Enter keeps editing', async () => {
+  const ui = await createConsole({ available: 'codex' });
+  let prevented = false;
+  ui.get('question').value = 'Send with Enter';
+  await ui.get('question').listeners.keydown({
+    key: 'Enter', shiftKey: false, isComposing: false,
+    preventDefault() { prevented = true; },
+  });
+
+  assert.equal(prevented, true);
+  assert.equal(ui.posts.at(-1).message, 'Send with Enter');
+  assert.equal(ui.get('question').value, '');
+
+  ui.get('question').value = 'Keep this line';
+  await ui.get('question').listeners.keydown({
+    key: 'Enter', shiftKey: true, isComposing: false,
+    preventDefault() { throw new Error('Shift+Enter must not submit'); },
+  });
+  assert.equal(ui.posts.length, 1);
+  assert.equal(ui.get('question').value, 'Keep this line');
+});
+
+test('editor remains usable while the current AI reply is pending', async () => {
+  let releaseChat;
+  const chatGate = new Promise((resolve) => { releaseChat = resolve; });
+  const ui = await createConsole({ available: 'codex', chatGate });
+  ui.get('question').value = 'First message';
+
+  const pending = ui.get('chat-form').listeners.submit({ preventDefault() {} });
+  await new Promise(setImmediate);
+  assert.equal(ui.get('question').disabled, false);
+  assert.equal(ui.get('send-button').disabled, true);
+  assert.equal(ui.get('send-button').textContent, '…');
+
+  ui.get('question').value = 'Draft next message';
+  releaseChat();
+  await pending;
+  assert.equal(ui.get('question').value, 'Draft next message');
+  assert.equal(ui.get('send-button').disabled, false);
+  assert.equal(ui.get('send-button').textContent, '➤');
 });
 
 test('conversation id is saved per provider and reused on the next message', async () => {

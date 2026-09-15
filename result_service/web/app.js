@@ -130,13 +130,18 @@ function updateAiControls() {
   // A local provider can answer general questions without a selected run.
   // Selecting a run only enriches the context sent with the request.
   const enabled = hasProvider && !state.aiBusy;
-  $('question').disabled = !enabled;
+  // Keep the editor usable while a reply is running so the next question is
+  // not lost; only submission must wait for the active provider call.
+  $('question').disabled = !hasProvider;
   $('send-button').disabled = !enabled;
+  $('send-button').textContent = state.aiBusy ? '…' : '➤';
+  $('send-button').title = state.aiBusy ? 'AI 正在回复' : '发送';
+  $('send-button').setAttribute('aria-label', $('send-button').title);
   $('new-conversation').disabled = state.aiBusy || !hasProvider;
   document.querySelectorAll('#quick-actions button').forEach((button) => { button.disabled = !enabled; });
   $('question').placeholder = hasProvider ? (hasRun ? '询问当前结果...' : '询问 Codex 或 DSH...') : '当前 AI 服务不可用';
   $('compose-hint').textContent = hasProvider
-    ? (hasRun ? '当前运行的结构化结果' : '未选择运行，使用通用上下文')
+    ? (state.aiBusy ? `${provider.name} 正在回复，可继续编辑下一条` : (hasRun ? '当前运行的结构化结果' : '未选择运行，使用通用上下文'))
     : 'AI 服务不可用';
   const providerStatus = $('provider-availability');
   providerStatus.className = hasProvider ? 'available' : 'unavailable';
@@ -386,6 +391,14 @@ async function askAi(message) {
   $('chat').scrollTop = $('chat').scrollHeight;
 }
 
+async function submitChat() {
+  const question = $('question');
+  const message = question.value;
+  if (!message.trim() || state.aiBusy) return;
+  question.value = '';
+  await askAi(message);
+}
+
 function selectAiTab(tab) {
   document.querySelectorAll('[data-ai-tab]').forEach((button) => {
     button.setAttribute('aria-selected', String(button.dataset.aiTab === tab));
@@ -462,7 +475,12 @@ $('dsh-native-open').addEventListener('click', openDshWeb);
 $('dsh-native-frame').addEventListener('load', () => { $('dsh-native-status').textContent = 'DSH 原生界面已连接'; });
 $('dsh-native-frame').addEventListener('error', () => { $('dsh-native-status').textContent = 'DSH 界面加载失败，请重新连接。'; });
 document.querySelectorAll('[data-ai-tab]').forEach((button) => button.addEventListener('click', () => selectAiTab(button.dataset.aiTab)));
-$('chat-form').addEventListener('submit', async (event) => { event.preventDefault(); const message = $('question').value; $('question').value = ''; await askAi(message); });
+$('chat-form').addEventListener('submit', async (event) => { event.preventDefault(); await submitChat(); });
+$('question').addEventListener('keydown', async (event) => {
+  if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
+  event.preventDefault();
+  await submitChat();
+});
 
 let resizeStart = null;
 $('ai-resize').addEventListener('pointerdown', (event) => {
