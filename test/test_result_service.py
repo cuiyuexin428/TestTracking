@@ -23,7 +23,7 @@ from result_service.app.providers import (
     resolve_provider_command,
 )
 from result_service.app.repository import PostgresRepository
-from result_service.app.server import ResultService
+from result_service.app.server import Handler, ResultHTTPServer, ResultService
 
 
 class _Rows:
@@ -162,6 +162,19 @@ class ResultServiceContractTests(unittest.TestCase):
 
         self.assertEqual("service-workspace", service.providers["codex"].config.cwd)
         self.assertEqual("provider-workspace", service.providers["dsh"].config.cwd)
+
+
+@unittest.skipUnless(os.name == "nt", "Windows exclusive socket behavior")
+class ResultHTTPServerTests(unittest.TestCase):
+    def test_second_service_cannot_share_the_same_port(self) -> None:
+        first = ResultHTTPServer(("127.0.0.1", 0), Handler)
+        try:
+            port = first.server_address[1]
+            with self.assertRaises(OSError):
+                second = ResultHTTPServer(("127.0.0.1", port), Handler)
+                second.server_close()
+        finally:
+            first.server_close()
 
 
 class ProviderPromptTests(unittest.TestCase):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import mimetypes
+import socket
 from dataclasses import replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -88,6 +89,18 @@ class ResultService:
         return 200, {"provider": result.provider, "text": result.text}
 
 
+class ResultHTTPServer(ThreadingHTTPServer):
+    """Own the listen address so stale and current services cannot coexist."""
+
+    allow_reuse_address = False
+    allow_reuse_port = False
+
+    def server_bind(self) -> None:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 class Handler(BaseHTTPRequestHandler):
     service: ResultService
 
@@ -151,7 +164,7 @@ def serve(config: ServiceConfig) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     service = ResultService(config)
     handler = type("ConfiguredHandler", (Handler,), {"service": service})
-    server = ThreadingHTTPServer((config.host, config.port), handler)
+    server = ResultHTTPServer((config.host, config.port), handler)
     LOG.info("result service listening on http://%s:%d", config.host, config.port)
     try:
         server.serve_forever()
