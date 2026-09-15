@@ -81,12 +81,37 @@
         <section class="page" id="page-logs" hidden><div class="empty-panel"><span>≡</span><h2>运行日志尚未接入</h2><p>发布包会将 scheduler 与结果服务日志写入 data/logs。</p></div></section>
       </main>
       <aside class="assistant" id="assistant">
-        <div class="assistant-head"><strong>✦ 结果助手</strong><button type="button" class="icon-button" id="ai-close" title="关闭 AI 助手">×</button></div>
-        <div class="provider-field"><label>AI 服务<select id="provider"></select></label></div>
-        <div class="ai-context" id="ai-context">上下文：尚未选择运行</div>
-        <div class="chat" id="chat" aria-live="polite"><div class="message assistant-message">可以直接询问 Codex 或 DSH；选择运行后会自动附加结构化结果。</div></div>
-        <div class="quick-actions" id="quick-actions"><button type="button" data-prompt="分析当前运行的结果完整性">检查完整性</button><button type="button" data-prompt="总结当前运行中需要优先处理的问题">归纳问题</button></div>
-        <form class="compose" id="chat-form"><textarea id="question" rows="3" placeholder="询问 Codex 或 DSH..." required disabled></textarea><div class="compose-actions"><span id="compose-hint">正在检查本机 AI 命令</span><button class="send-button" id="send-button" type="submit" title="发送" disabled>➤</button></div></form>
+        <div class="assistant-resize" id="ai-resize" role="separator" aria-label="调整 AI 助手宽度" aria-orientation="vertical" tabindex="0"></div>
+        <div class="assistant-head">
+          <div class="assistant-title"><strong>✦ AI 助手</strong><span id="provider-availability"><i class="dot warning"></i>正在检查</span></div>
+          <div class="assistant-actions">
+            <button type="button" class="icon-button" id="new-conversation" title="新建会话" aria-label="新建会话">＋</button>
+            <button type="button" class="icon-button" id="ai-expand" title="展开 AI 助手" aria-label="展开 AI 助手">↗</button>
+            <button type="button" class="icon-button" id="ai-close" title="收起 AI 助手" aria-label="收起 AI 助手">×</button>
+          </div>
+        </div>
+        <div class="assistant-tabs" role="tablist" aria-label="AI 助手视图">
+          <button type="button" id="ai-tab-chat" data-ai-tab="chat" role="tab" aria-selected="true" aria-controls="ai-chat-panel">会话</button>
+          <button type="button" id="ai-tab-dsh" data-ai-tab="dsh" role="tab" aria-selected="false" aria-controls="dsh-native-panel">DSH 原生界面</button>
+        </div>
+        <section class="assistant-view chat-view" id="ai-chat-panel" role="tabpanel" aria-labelledby="ai-tab-chat">
+          <div class="provider-field">
+            <label>AI 服务<select id="provider"></select></label>
+            <span class="conversation-status" id="conversation-status">新会话</span>
+          </div>
+          <div class="ai-context" id="ai-context">上下文：尚未选择运行</div>
+          <div class="chat" id="chat" aria-live="polite"><div class="message assistant-message">可以直接询问 Codex 或 DSH；选择运行后会自动附加结构化结果。</div></div>
+          <div class="quick-actions" id="quick-actions"><button type="button" data-prompt="分析当前运行的结果完整性">检查完整性</button><button type="button" data-prompt="总结当前运行中需要优先处理的问题">归纳问题</button></div>
+          <form class="compose" id="chat-form"><textarea id="question" rows="3" placeholder="询问 Codex 或 DSH..." required disabled></textarea><div class="compose-actions"><span id="compose-hint">正在检查本机 AI 命令</span><button class="send-button" id="send-button" type="submit" title="发送" aria-label="发送" disabled>➤</button></div></form>
+        </section>
+        <section class="assistant-view dsh-native" id="dsh-native-panel" role="tabpanel" aria-labelledby="ai-tab-dsh" hidden>
+          <div class="dsh-native-state" id="dsh-native-state">
+            <strong>DSH 原生界面</strong>
+            <span id="dsh-native-status">切换到此视图后会启动本机 DSH Web。</span>
+            <button type="button" class="button primary" id="dsh-native-open">启动 DSH</button>
+          </div>
+          <iframe id="dsh-native-frame" title="DSH 原生界面" hidden></iframe>
+        </section>
       </aside>
     </div>
     <footer><span><span class="dot" id="footer-dot"></span><span id="footer-status">结果服务连接中</span></span><span>执行状态 · 结果完整性 · 分析状态独立展示</span></footer>

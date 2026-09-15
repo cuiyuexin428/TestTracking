@@ -23,7 +23,16 @@ launches whose `PATH` does not contain the CLIs, set
 service also discovers the standard Codex desktop and npm/pnpm CLI locations.
 The AI panel is enabled as soon as at least one configured local provider is
 available. Selecting a run adds its structured result to the prompt, but a run
-is not required for general questions.
+is not required for general questions. Codex conversations keep the CLI thread
+ID in browser storage and resume through `codex exec resume`, so they survive a
+page refresh or result-service restart for the same service account. Use the new
+conversation button after moving the package workspace or when a thread is no
+longer available.
+
+The DSH native tab starts `dsh --profile web` on a loopback port and embeds that
+UI in the assistant panel. The result service reuses one DSH Web process and
+stops it with the service. The packaged stop script terminates the result-service
+process tree so DSH and active provider subprocesses are not left behind.
 
 When building the server package, pass `-StpResultTable` with the same
 plugin-owned result table configured for the stpcompare client and settlement

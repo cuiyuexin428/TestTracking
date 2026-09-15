@@ -53,7 +53,7 @@ class ServiceConfig:
                     # Keep the invocation compatible with the local Codex CLI,
                     # while leaving approval and sandbox policy to the user's
                     # own Codex configuration.
-                    args=("exec", "--json", "--ephemeral", "--skip-git-repo-check", "-"),
+                    args=("exec", "--json", "--skip-git-repo-check", "-"),
                 ),
                 "dsh": ProviderConfig(
                     name="dsh",

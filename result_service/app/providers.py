@@ -2,11 +2,19 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
+import socket
 import subprocess
+import threading
+import time
+import uuid
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.error import URLError
+from urllib.request import urlopen
 
 from .config import ProviderConfig
 
@@ -20,6 +28,7 @@ class ProviderResult:
     provider: str
     text: str
     raw_output: str = ""
+    conversation_id: str | None = None
 
 
 _BLOCKED_CONTEXT_KEYS = {
@@ -185,6 +194,33 @@ def parse_provider_output(provider: str, output: str) -> str:
     return texts[-1].strip()
 
 
+_CANONICAL_UUID = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+
+
+def _codex_conversation_id(value: Any) -> str:
+    if not isinstance(value, str) or _CANONICAL_UUID.fullmatch(value) is None:
+        raise ProviderError("invalid Codex conversation id")
+    try:
+        return str(uuid.UUID(value))
+    except ValueError as exc:
+        raise ProviderError("invalid Codex conversation id") from exc
+
+
+def _parse_codex_conversation_id(output: str) -> str | None:
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "thread.started":
+            continue
+        return _codex_conversation_id(event.get("thread_id"))
+    return None
+
+
 class CommandProvider:
     def __init__(self, config: ProviderConfig):
         self.config = config
@@ -192,14 +228,28 @@ class CommandProvider:
     def available(self) -> bool:
         return resolve_provider_command(self.config) is not None
 
-    def complete(self, message: str, context: dict[str, Any]) -> ProviderResult:
+    def complete(
+        self,
+        message: str,
+        context: dict[str, Any],
+        conversation_id: str | None = None,
+    ) -> ProviderResult:
         prompt = _build_prompt(message, context)
-        executable = resolve_provider_command(self.config)
+        text, raw_output = self._run_prompt(prompt)
+        return ProviderResult(self.config.name, text, raw_output)
+
+    def _run_prompt(
+        self,
+        prompt: str,
+        invocation_config: ProviderConfig | None = None,
+    ) -> tuple[str, str]:
+        config = invocation_config or self.config
+        executable = resolve_provider_command(config)
         if not executable:
             raise ProviderError(f"{self.config.name} executable is not available")
-        argv = _command_argv(self.config, executable)
+        argv = _command_argv(config, executable)
         stdin = prompt
-        if self.config.prompt_mode == "argument":
+        if config.prompt_mode == "argument":
             argv.append(_argument_prompt(prompt))
             stdin = None
         try:
@@ -210,8 +260,8 @@ class CommandProvider:
                 capture_output=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=self.config.timeout_seconds,
-                cwd=self.config.cwd,
+                timeout=config.timeout_seconds,
+                cwd=config.cwd,
                 check=False,
             )
         except FileNotFoundError as exc:
@@ -226,7 +276,7 @@ class CommandProvider:
         text = parse_provider_output(self.config.name, completed.stdout or "")
         if not text:
             raise ProviderError(f"{self.config.name} returned an empty response")
-        return ProviderResult(self.config.name, text, completed.stdout)
+        return text, completed.stdout or ""
 
 
 def _build_prompt(message: str, context: dict[str, Any]) -> str:
@@ -255,9 +305,70 @@ class CodexProvider(CommandProvider):
         super().__init__(ProviderConfig(name=config.name, command=config.command,
                                         args=tuple(args), timeout_seconds=config.timeout_seconds,
                                         cwd=config.cwd, prompt_mode="stdin"))
+        self._conversation_locks_guard = threading.Lock()
+        self._conversation_locks: weakref.WeakValueDictionary[str, threading.Lock] = (
+            weakref.WeakValueDictionary()
+        )
 
-    def complete(self, message: str, context: dict[str, Any]) -> ProviderResult:
-        return super().complete(message, context)
+    def complete(
+        self,
+        message: str,
+        context: dict[str, Any],
+        conversation_id: str | None = None,
+    ) -> ProviderResult:
+        normalized_id = (
+            _codex_conversation_id(conversation_id)
+            if conversation_id is not None
+            else None
+        )
+        prompt = _build_prompt(message, context)
+        invocation_config = self.config
+        conversation_lock = None
+        if normalized_id is not None:
+            invocation_config = ProviderConfig(
+                name=self.config.name,
+                command=self.config.command,
+                args=self._resume_args(normalized_id),
+                timeout_seconds=self.config.timeout_seconds,
+                cwd=self.config.cwd,
+                prompt_mode="stdin",
+            )
+            conversation_lock = self._lock_for(normalized_id)
+
+        if conversation_lock is None:
+            text, raw_output = self._run_prompt(prompt, invocation_config)
+        else:
+            with conversation_lock:
+                text, raw_output = self._run_prompt(prompt, invocation_config)
+
+        output_id = _parse_codex_conversation_id(raw_output)
+        if normalized_id is None:
+            if output_id is None:
+                raise ProviderError("Codex did not return a conversation id")
+            normalized_id = output_id
+        elif output_id is not None and output_id != normalized_id:
+            raise ProviderError("Codex returned a different conversation id")
+        return ProviderResult(
+            self.config.name,
+            text,
+            raw_output,
+            conversation_id=normalized_id,
+        )
+
+    def _resume_args(self, conversation_id: str) -> tuple[str, ...]:
+        args = list(self.config.args)
+        args.insert(1, "resume")
+        prompt_index = len(args) - 1 - args[::-1].index("-")
+        args.insert(prompt_index, conversation_id)
+        return tuple(args)
+
+    def _lock_for(self, conversation_id: str) -> threading.Lock:
+        with self._conversation_locks_guard:
+            lock = self._conversation_locks.get(conversation_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._conversation_locks[conversation_id] = lock
+            return lock
 
 
 class DshProvider(CommandProvider):
@@ -271,8 +382,109 @@ class DshProvider(CommandProvider):
                                         args=tuple(args), timeout_seconds=config.timeout_seconds,
                                         cwd=config.cwd, prompt_mode="argument"))
 
-    def complete(self, message: str, context: dict[str, Any]) -> ProviderResult:
-        return super().complete(message, context)
+    def complete(
+        self,
+        message: str,
+        context: dict[str, Any],
+        conversation_id: str | None = None,
+    ) -> ProviderResult:
+        return super().complete(message, context, conversation_id)
+
+
+class DshWebManager:
+    """Start one local DSH Web process and keep it available for the UI."""
+
+    def __init__(self, config: ProviderConfig, *, startup_timeout: float = 20.0):
+        self.config = config
+        self.startup_timeout = startup_timeout
+        self._lock = threading.Lock()
+        self._process: subprocess.Popen[str] | None = None
+        self._url: str | None = None
+
+    def start(self) -> str:
+        with self._lock:
+            if self._process is not None and self._process.poll() is None and self._url:
+                return self._url
+
+            self._process = None
+            self._url = None
+            executable = resolve_provider_command(self.config)
+            if not executable:
+                raise ProviderError("dsh executable is not available")
+
+            port = self._free_loopback_port()
+            web_config = ProviderConfig(
+                name=self.config.name,
+                command=self.config.command,
+                args=("--profile", "web", "--host", "127.0.0.1", "--port", str(port), "--no-open"),
+                timeout_seconds=self.config.timeout_seconds,
+                cwd=self.config.cwd,
+            )
+            argv = _command_argv(web_config, executable)
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            try:
+                process = subprocess.Popen(
+                    argv,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    cwd=self.config.cwd,
+                    creationflags=creationflags,
+                )
+            except FileNotFoundError as exc:
+                raise ProviderError("dsh executable is not available") from exc
+            except OSError as exc:
+                raise ProviderError(f"could not start dsh web: {exc}") from exc
+
+            url = f"http://127.0.0.1:{port}/"
+            deadline = time.monotonic() + self.startup_timeout
+            while time.monotonic() < deadline:
+                return_code = process.poll()
+                if return_code is not None:
+                    raise ProviderError(f"dsh web exited during startup with code {return_code}")
+                try:
+                    with urlopen(url, timeout=0.5) as response:
+                        if response.status < 500:
+                            self._process = process
+                            self._url = url
+                            return url
+                except (OSError, URLError):
+                    time.sleep(0.1)
+
+            self._stop_process(process)
+            raise ProviderError("dsh web did not become ready in time")
+
+    def close(self) -> None:
+        with self._lock:
+            process = self._process
+            self._process = None
+            self._url = None
+            if process is not None and process.poll() is None:
+                self._stop_process(process)
+
+    @staticmethod
+    def _free_loopback_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            return int(listener.getsockname()[1])
+
+    @staticmethod
+    def _stop_process(process: subprocess.Popen[str]) -> None:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                check=False,
+            )
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
 
 
 def build_providers(configs: dict[str, ProviderConfig]) -> dict[str, CommandProvider]:

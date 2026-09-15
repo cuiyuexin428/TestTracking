@@ -1,4 +1,27 @@
-const state = { runs: [], selected: null, page: 'results', filter: '', readiness: null, providers: [], selectionRequest: 0, loadRequest: 0, apiHealthy: false };
+const AI_CONVERSATIONS_KEY = 'testtracking.ai.conversations.v1';
+const AI_PANEL_WIDTH_KEY = 'testtracking.ai.panel-width.v1';
+
+function readStoredJson(key, fallback) {
+  try {
+    if (typeof localStorage === 'undefined') return fallback;
+    return JSON.parse(localStorage.getItem(key) || '') || fallback;
+  } catch (_) { return fallback; }
+}
+
+function readStoredNumber(key, fallback) {
+  try {
+    if (typeof localStorage === 'undefined') return fallback;
+    const value = Number(localStorage.getItem(key));
+    return Number.isFinite(value) && value > 0 ? value : fallback;
+  } catch (_) { return fallback; }
+}
+
+const state = {
+  runs: [], selected: null, page: 'results', filter: '', readiness: null,
+  providers: [], selectionRequest: 0, loadRequest: 0, apiHealthy: false,
+  conversationIds: readStoredJson(AI_CONVERSATIONS_KEY, {}), aiBusy: false,
+  panelWidth: readStoredNumber(AI_PANEL_WIDTH_KEY, 400), dshWebUrl: '', dshWebLoading: false,
+};
 const $ = (id) => document.getElementById(id);
 
 const pages = {
@@ -106,14 +129,24 @@ function updateAiControls() {
   const hasRun = Boolean(state.selected?.run_id);
   // A local provider can answer general questions without a selected run.
   // Selecting a run only enriches the context sent with the request.
-  const enabled = hasProvider;
+  const enabled = hasProvider && !state.aiBusy;
   $('question').disabled = !enabled;
   $('send-button').disabled = !enabled;
+  $('new-conversation').disabled = state.aiBusy || !hasProvider;
   document.querySelectorAll('#quick-actions button').forEach((button) => { button.disabled = !enabled; });
   $('question').placeholder = hasProvider ? (hasRun ? '询问当前结果...' : '询问 Codex 或 DSH...') : '当前 AI 服务不可用';
   $('compose-hint').textContent = hasProvider
     ? (hasRun ? '当前运行的结构化结果' : '未选择运行，使用通用上下文')
     : 'AI 服务不可用';
+  const providerStatus = $('provider-availability');
+  providerStatus.className = hasProvider ? 'available' : 'unavailable';
+  providerStatus.textContent = provider ? `${provider.name} ${hasProvider ? '可用' : '不可用'}` : '没有可用的 AI 服务';
+  const conversationId = state.conversationIds[$('provider').value];
+  $('conversation-status').textContent = conversationId ? `会话 ${conversationId.slice(0, 8)}` : '新会话';
+
+  const dshAvailable = state.providers.some((item) => item.name === 'dsh' && item.available);
+  $('dsh-native-open').disabled = !dshAvailable || state.dshWebLoading;
+  if (!dshAvailable && !state.dshWebUrl) $('dsh-native-status').textContent = '本机 DSH 命令不可用。';
 }
 
 function navigate(page) {
@@ -219,18 +252,15 @@ function renderAnalysis(plugin, run) {
 
 async function selectRun(runId, plugin) {
   const requestId = ++state.selectionRequest;
-  const previousKey = state.selected ? `${state.selected.plugin_type}/${state.selected.run_id}` : '';
   if (!runId) {
     state.selected = null;
     resetResult(plugin);
-    if (previousKey) resetAiConversation(plugin);
     return;
   }
   state.selected = null;
   renderAnalysis(plugin, {});
   setAnalysisState('pending', '正在加载运行');
   $('ai-context').textContent = `上下文：${plugin} / ${runId} / 加载中`;
-  if (previousKey && previousKey !== `${plugin}/${runId}`) resetAiConversation(plugin);
   let selected;
   try {
     selected = await jsonFetch(`/api/runs/${encodeURIComponent(runId)}?plugin=${encodeURIComponent(plugin)}`);
@@ -244,7 +274,6 @@ async function selectRun(runId, plugin) {
   if (requestId !== state.selectionRequest) return;
   state.selected = selected;
   renderAnalysis(plugin, state.selected);
-  if (previousKey !== `${plugin}/${runId}`) resetAiConversation(plugin, runId);
 }
 
 async function switchPlugin(plugin, preferredRun = '') {
@@ -310,25 +339,110 @@ function addMessage(role, text) {
   $('chat').scrollTop = $('chat').scrollHeight;
 }
 
-function resetAiConversation(plugin, runId = '') {
+function persistConversationIds() {
+  try {
+    if (typeof localStorage !== 'undefined') localStorage.setItem(AI_CONVERSATIONS_KEY, JSON.stringify(state.conversationIds));
+  } catch (_) { /* A blocked local store must not prevent local AI use. */ }
+}
+
+function newAiConversation() {
+  const provider = $('provider').value;
+  if (provider) {
+    delete state.conversationIds[provider];
+    persistConversationIds();
+  }
   $('chat').replaceChildren();
-  addMessage('assistant', runId
-    ? `当前上下文已切换到 ${plugin} / ${runId}。`
-    : '可以直接询问 Codex 或 DSH；选择运行后会自动附加结构化结果。');
+  addMessage('assistant', `${provider || 'AI'} 新会话已就绪。选择运行只会附加结果上下文。`);
+  updateAiControls();
 }
 
 async function askAi(message) {
   if (!message.trim()) return;
   const provider = $('provider').value;
   if (!state.providers.some((item) => item.name === provider && item.available)) { addMessage('assistant', '当前 AI 服务不可用。'); return; }
+  state.aiBusy = true;
+  updateAiControls();
   addMessage('user', message);
   const waiting = document.createElement('div');
   waiting.className = 'message assistant-message'; waiting.textContent = `${provider} 正在分析...`; $('chat').appendChild(waiting);
   try {
-    const result = await jsonFetch('/api/ai/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ provider, message, context: { run: state.selected, result_type: $('result-type').value } }) });
+    const result = await jsonFetch('/api/ai/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        provider,
+        message,
+        conversation_id: state.conversationIds[provider] || null,
+        context: { run: state.selected, result_type: $('result-type').value },
+      }),
+    });
+    if (result.conversation_id) {
+      state.conversationIds[provider] = result.conversation_id;
+      persistConversationIds();
+    }
     waiting.textContent = result.text;
   } catch (error) { waiting.textContent = `请求失败：${error.message}`; }
+  finally { state.aiBusy = false; updateAiControls(); }
   $('chat').scrollTop = $('chat').scrollHeight;
+}
+
+function selectAiTab(tab) {
+  document.querySelectorAll('[data-ai-tab]').forEach((button) => {
+    button.setAttribute('aria-selected', String(button.dataset.aiTab === tab));
+  });
+  $('ai-chat-panel').hidden = tab !== 'chat';
+  $('dsh-native-panel').hidden = tab !== 'dsh';
+  if (tab === 'dsh' && !state.dshWebUrl) openDshWeb();
+}
+
+async function openDshWeb() {
+  if (state.dshWebLoading) return;
+  const dshAvailable = state.providers.some((item) => item.name === 'dsh' && item.available);
+  if (!dshAvailable) {
+    $('dsh-native-status').textContent = '本机 DSH 命令不可用。';
+    return;
+  }
+  state.dshWebLoading = true;
+  $('dsh-native-open').disabled = true;
+  $('dsh-native-open').textContent = '正在启动';
+  $('dsh-native-status').textContent = '正在启动本机 DSH Web...';
+  try {
+    const result = await jsonFetch('/api/ai/dsh-web', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    if (!result.url) throw new Error('服务未返回 DSH Web 地址');
+    state.dshWebUrl = result.url;
+    $('dsh-native-frame').src = result.url;
+    $('dsh-native-frame').hidden = false;
+    $('dsh-native-status').textContent = 'DSH 已启动，正在连接界面...';
+    $('dsh-native-open').textContent = '重新连接';
+  } catch (error) {
+    state.dshWebUrl = '';
+    $('dsh-native-frame').hidden = true;
+    $('dsh-native-status').textContent = `启动失败：${error.message}`;
+    $('dsh-native-open').textContent = '重试';
+  } finally {
+    state.dshWebLoading = false;
+    updateAiControls();
+  }
+}
+
+function setPanelWidth(width, persist = true) {
+  const viewport = Number(window.innerWidth || 1440);
+  state.panelWidth = Math.max(320, Math.min(Number(width) || 400, Math.max(320, viewport - 360)));
+  if (typeof $('console').style.setProperty === 'function') $('console').style.setProperty('--assistant-width', `${state.panelWidth}px`);
+  $('ai-resize').setAttribute('aria-valuenow', String(state.panelWidth));
+  $('ai-resize').setAttribute('aria-valuemin', '320');
+  $('ai-resize').setAttribute('aria-valuemax', String(Math.max(320, viewport - 360)));
+  if (persist) {
+    try { if (typeof localStorage !== 'undefined') localStorage.setItem(AI_PANEL_WIDTH_KEY, String(state.panelWidth)); } catch (_) { /* Keep the current in-memory width. */ }
+  }
+}
+
+function toggleAiExpanded() {
+  const expanded = $('console').dataset.aiExpanded === 'true';
+  $('console').dataset.aiExpanded = String(!expanded);
+  $('ai-expand').textContent = expanded ? '↗' : '↙';
+  $('ai-expand').title = expanded ? '展开 AI 助手' : '恢复 AI 助手宽度';
+  $('ai-expand').setAttribute('aria-label', $('ai-expand').title);
 }
 
 document.querySelectorAll('.nav-item').forEach((button) => button.addEventListener('click', () => navigate(button.dataset.page)));
@@ -342,7 +456,34 @@ $('provider').addEventListener('change', updateAiControls);
 $('refresh').addEventListener('click', () => loadAll().catch(showLoadError));
 $('ai-toggle').addEventListener('click', () => { $('console').dataset.aiOpen = String($('console').dataset.aiOpen !== 'true'); });
 $('ai-close').addEventListener('click', () => { $('console').dataset.aiOpen = 'false'; });
+$('ai-expand').addEventListener('click', toggleAiExpanded);
+$('new-conversation').addEventListener('click', newAiConversation);
+$('dsh-native-open').addEventListener('click', openDshWeb);
+$('dsh-native-frame').addEventListener('load', () => { $('dsh-native-status').textContent = 'DSH 原生界面已连接'; });
+$('dsh-native-frame').addEventListener('error', () => { $('dsh-native-status').textContent = 'DSH 界面加载失败，请重新连接。'; });
+document.querySelectorAll('[data-ai-tab]').forEach((button) => button.addEventListener('click', () => selectAiTab(button.dataset.aiTab)));
 $('chat-form').addEventListener('submit', async (event) => { event.preventDefault(); const message = $('question').value; $('question').value = ''; await askAi(message); });
+
+let resizeStart = null;
+$('ai-resize').addEventListener('pointerdown', (event) => {
+  resizeStart = { x: event.clientX, width: state.panelWidth };
+  document.body.classList.toggle('resizing-ai', true);
+  event.preventDefault();
+});
+$('ai-resize').addEventListener('keydown', (event) => {
+  if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+  setPanelWidth(state.panelWidth + (event.key === 'ArrowLeft' ? 24 : -24));
+  event.preventDefault();
+});
+if (typeof window.addEventListener === 'function') {
+  window.addEventListener('pointermove', (event) => { if (resizeStart) setPanelWidth(resizeStart.width + resizeStart.x - event.clientX, false); });
+  window.addEventListener('pointerup', () => {
+    if (!resizeStart) return;
+    resizeStart = null;
+    document.body.classList.toggle('resizing-ai', false);
+    setPanelWidth(state.panelWidth);
+  });
+}
 
 function showLoadError(error) {
   state.selectionRequest += 1;
@@ -361,6 +502,7 @@ function showLoadError(error) {
 }
 
 $('snapshot-time').textContent = '--';
+setPanelWidth(state.panelWidth, false);
 if (window.matchMedia('(max-width: 1280px)').matches) $('console').dataset.aiOpen = 'false';
 navigate('results');
 loadAll().catch(showLoadError);

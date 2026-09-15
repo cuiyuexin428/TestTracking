@@ -304,7 +304,7 @@ if (Test-Path -LiteralPath (Join-Path $resultSource 'launcher.py')) {
         static_dir = '../result_service/web'
         workspace = '..'
         providers = [ordered]@{
-            codex = [ordered]@{ command = 'codex'; args = @('exec', '--json', '--ephemeral', '--skip-git-repo-check', '-'); timeout_seconds = 120 }
+            codex = [ordered]@{ command = 'codex'; args = @('exec', '--json', '--skip-git-repo-check', '-'); timeout_seconds = 120 }
             dsh = [ordered]@{ command = 'dsh'; args = @('--profile', 'headless'); prompt_mode = 'argument'; timeout_seconds = 120 }
         }
     }
@@ -350,7 +350,7 @@ Write-Host "scheduler started (pid $($proc.Id)); type help for commands"
 try { Wait-Process -Id $proc.Id } finally {
     Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
     if ($resultProc) {
-        Stop-Process -Id $resultProc.Id -ErrorAction SilentlyContinue
+        & taskkill.exe /PID $resultProc.Id /T /F 2>$null | Out-Null
         Remove-Item -LiteralPath $resultPidFile -Force -ErrorAction SilentlyContinue
     }
 }
@@ -392,8 +392,8 @@ if (-not (Test-Path $pidFile)) { Write-Host 'result service is not running'; exi
 $pidValue = [int](Get-Content -LiteralPath $pidFile -Raw).Trim()
 $proc = Get-Process -Id $pidValue -ErrorAction SilentlyContinue
 if ($proc) {
-    Stop-Process -Id $pidValue
-    try { Wait-Process -Id $pidValue -Timeout $TimeoutSeconds -ErrorAction Stop } catch { Stop-Process -Id $pidValue -Force -ErrorAction SilentlyContinue }
+    & taskkill.exe /PID $pidValue /T /F 2>$null | Out-Null
+    Wait-Process -Id $pidValue -Timeout $TimeoutSeconds -ErrorAction SilentlyContinue
 }
 Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
 Write-Host 'result service stopped'
@@ -459,7 +459,9 @@ UI: http://127.0.0.1:56330/ (host/port are configurable).
 To run only the UI/AI: scripts/start_result_service.ps1; stop with
 scripts/stop_result_service.ps1. AI works without a database or a selected run.
 Install/login to Codex or DSH as the account running this service. Local CLI
-settings and permissions apply; provider commands/cwd are configurable. With
+settings and permissions apply; provider commands/cwd are configurable. Codex
+conversations resume across page refreshes and service restarts. The DSH native
+tab starts and embeds the installed DSH Web UI on demand. With
 -UseSystemPython, the target machine must provide Python 3.10+ x64 and
 psycopg[binary] on its import path.
 

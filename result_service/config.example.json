@@ -7,7 +7,7 @@
   "providers": {
     "codex": {
       "command": "codex",
-      "args": ["exec", "--json", "--ephemeral", "--skip-git-repo-check", "-"],
+      "args": ["exec", "--json", "--skip-git-repo-check", "-"],
       "timeout_seconds": 120
     },
     "dsh": {

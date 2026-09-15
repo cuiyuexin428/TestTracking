@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .config import ServiceConfig
 from .plugins import default_plugins
-from .providers import ProviderError, build_providers
+from .providers import DshWebManager, ProviderError, build_providers
 from .repository import create_repository
 
 LOG = logging.getLogger("result_service")
@@ -36,6 +36,8 @@ class ResultService:
             name: replace(provider, cwd=provider.cwd or config.workspace)
             for name, provider in config.providers.items()
         })
+        dsh = self.providers.get("dsh")
+        self.dsh_web = DshWebManager(dsh.config) if dsh else None
         static_dir = config.static_dir or str(Path(__file__).resolve().parents[1] / "web")
         self.static_dir = Path(static_dir).resolve()
 
@@ -75,18 +77,39 @@ class ResultService:
         provider_name = str(body.get("provider", "codex"))
         message = str(body.get("message", "")).strip()
         context = body.get("context", {})
+        conversation_id = body.get("conversation_id")
         if not message or not isinstance(context, dict):
             return 400, {"error": "provider, message and object context are required"}
+        if conversation_id is not None and not isinstance(conversation_id, str):
+            return 400, {"error": "conversation_id must be a string or null"}
         if len(message) > 8000:
             return 400, {"error": "message is too long"}
         provider = self.providers.get(provider_name)
         if not provider:
             return 404, {"error": f"unknown provider: {provider_name}"}
         try:
-            result = provider.complete(message, context)
+            result = provider.complete(message, context, conversation_id)
         except (ProviderError, OSError) as exc:
             return 502, {"error": str(exc), "provider": provider_name}
-        return 200, {"provider": result.provider, "text": result.text}
+        return 200, {
+            "provider": result.provider,
+            "text": result.text,
+            "conversation_id": result.conversation_id,
+        }
+
+    def start_dsh_web(self) -> tuple[int, Any]:
+        if not self.dsh_web:
+            return 404, {"error": "dsh provider is not configured"}
+        if not self.providers["dsh"].available():
+            return 503, {"error": "dsh executable is not available"}
+        try:
+            return 200, {"url": self.dsh_web.start()}
+        except (ProviderError, OSError) as exc:
+            return 502, {"error": str(exc)}
+
+    def close(self) -> None:
+        if self.dsh_web:
+            self.dsh_web.close()
 
 
 class ResultHTTPServer(ThreadingHTTPServer):
@@ -130,6 +153,10 @@ class Handler(BaseHTTPRequestHandler):
         self._serve_static(parsed.path)
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path == "/api/ai/dsh-web":
+            status, value = self.service.start_dsh_web()
+            self._send(status, value)
+            return
         if self.path != "/api/ai/chat":
             self._send(404, {"error": "not found"})
             return
@@ -171,4 +198,5 @@ def serve(config: ServiceConfig) -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        service.close()
         server.server_close()
