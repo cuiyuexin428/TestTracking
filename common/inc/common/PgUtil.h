@@ -47,6 +47,9 @@ private:
     bool active_;
 };
 
+// Serialize schema DDL across scheduler/client processes. An existing caller
+// transaction retains the lock until commit; otherwise this owns the transaction.
+bool PgInitializeSchema(PGconn* connection, const char* ddl);
 bool EnsurePluginResultSchema(PGconn* connection);
 // First successful publication wins. Call inside the same transaction as raw
 // writes; the row lock serializes concurrent attempts for the file.

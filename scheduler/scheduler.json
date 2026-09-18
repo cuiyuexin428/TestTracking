@@ -1,6 +1,7 @@
 {
   "server": {
     "router_endpoint": "tcp://*:5555",
+    "management_endpoint": "http://127.0.0.1:5556",
     "poll_timeout_ms": 50,
     "client_timeout_ms": 5000,
     "task_lease_timeout_ms": 0,

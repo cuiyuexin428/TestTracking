@@ -1,4 +1,5 @@
 #include "scheduler/Scheduler.h"
+#include "scheduler/ManagementServer.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -24,8 +25,10 @@ void CancelAfterRecoveryFailure(common::TaskPlugin* plugin, const std::string& r
 }
 }  // namespace
 
-Scheduler::Scheduler(common::Config& config)
+Scheduler::Scheduler(common::Config& config, std::string config_path)
     : config_(config),
+      config_path_(std::move(config_path)),
+      instance_id_(GenerateRunId()),
       server_(config.get("server.router_endpoint", std::string("tcp://*:5555")),
               std::chrono::milliseconds(config.get("server.poll_timeout_ms", 50))) {
     server_.onHeartbeat([this](const IncomingMessage& msg) { HandleHeartbeat(msg); });
@@ -44,7 +47,15 @@ void Scheduler::start() {
     server_.start();
     running_.store(true);
     accepting_.store(true);
+    PublishStatus();
     processing_ = std::thread(&Scheduler::RunProcessing, this);
+    try {
+        management_ = std::make_unique<ManagementServer>(*this);
+        management_->start(config_.get("server.management_endpoint", std::string()));
+    } catch (...) {
+        stop();
+        throw;
+    }
 }
 
 void Scheduler::RestoreRuns() {
@@ -84,6 +95,9 @@ void Scheduler::RestoreRuns() {
         bool plugin_restored = false;
         try {
             plugin_restored = plugin->second->restore(run.run_id);
+        } catch (const common::RecoveryBlocked& e) {
+            CancelAfterRecoveryFailure(plugin->second, run.run_id);
+            abort_recovery("Scheduler: recovery blocked; original progress retained: " + std::string(e.what()));
         } catch (const std::exception& e) {
             LOG_ERROR("recovery: restore threw for run " << run.run_id << ": " << e.what());
         } catch (...) {
@@ -96,15 +110,11 @@ void Scheduler::RestoreRuns() {
             continue;
         }
         // processResult() durably writes the plugin completion before the framework task row.
-        // A crash between those commits is repaired from the completion journal before the run
-        // becomes active again.
-        if (!storage_.ReconcileCompletedTasks(run.run_id, run.plugin_type)) {
+        // Reconciliation, reclaiming all remaining attempts, and resuming the run commit as one
+        // state transition so a failed recovery remains retryable on the next start.
+        if (!storage_.RestoreRun(run.run_id, run.plugin_type)) {
             CancelAfterRecoveryFailure(plugin->second, run.run_id);
-            abort_recovery("Scheduler: cannot reconcile completed tasks for run " + run.run_id);
-        }
-        if (!storage_.ResumeRun(run.run_id)) {
-            CancelAfterRecoveryFailure(plugin->second, run.run_id);
-            abort_recovery("Scheduler: cannot persist resume for run " + run.run_id);
+            abort_recovery("Scheduler: cannot persist recovered state for run " + run.run_id);
         }
         active_runs_[plugin->second] = {run.run_id, run.plugin_type, false};
         restored.insert(run.plugin_type);
@@ -114,19 +124,28 @@ void Scheduler::RestoreRuns() {
 }
 
 bool Scheduler::Submit(ControlCommand command) {
-    std::future<bool> result;
+    return SubmitDetailed(std::move(command)).value("ok", false);
+}
+
+nlohmann::json Scheduler::SubmitDetailed(ControlCommand command, bool bounded) {
+    std::future<nlohmann::json> result;
     {
         std::lock_guard<std::mutex> lock(submit_mutex_);
-        if (!accepting_.load()) return false;
+        if (!accepting_.load()) return {{"ok", false}, {"error", "scheduler is stopping"}, {"http_status", 503}};
         if (command.kind == ControlCommand::Kind::Shutdown) accepting_.store(false);
-        command.completion = std::make_shared<std::promise<bool>>();
+        if (bounded) command.deadline = Clock::now() + std::chrono::seconds(30);
+        command.completion = std::make_shared<std::promise<nlohmann::json>>();
         result = command.completion->get_future();
         commands_.push(std::move(command));
     }
+    if (bounded && result.wait_for(std::chrono::seconds(30)) != std::future_status::ready)
+        return {{"ok", false}, {"error", "scheduler command timed out; inspect current status before retrying"},
+                {"http_status", 504}};
     return result.get();
 }
 
 void Scheduler::stop() {
+    if (management_) management_->stop();
     if (accepting_.load()) Submit({ControlCommand::Kind::Shutdown, {}, {}, {}, {}});
     if (processing_.joinable()) processing_.join();
     server_.stop();
@@ -171,16 +190,21 @@ void Scheduler::RunProcessing() {
     while (running_.load()) {
         ControlCommand command;
         if (commands_.pop(command, std::chrono::milliseconds(0))) {
-            bool ok = false;
+            nlohmann::json outcome = {{"ok", false}, {"error", "scheduler command failed"}, {"http_status", 503}};
             try {
-                ok = HandleCommand(command);
+                if (Clock::now() > command.deadline)
+                    outcome = {{"ok", false}, {"error", "command expired before execution"}, {"http_status", 504}};
+                else
+                    outcome = HandleCommand(command);
             } catch (const std::exception& e) {
                 LOG_ERROR("command failed: " << e.what());
+                outcome["error"] = e.what();
             } catch (...) {
                 LOG_ERROR("command failed: unknown exception");
             }
             if (command.kind == ControlCommand::Kind::Shutdown) running_.store(false);
-            command.completion->set_value(ok);
+            PublishStatus();
+            command.completion->set_value(std::move(outcome));
             continue;
         }
         try {
@@ -189,6 +213,7 @@ void Scheduler::RunProcessing() {
             if (Clock::now() - last_check >= std::chrono::milliseconds(200)) {
                 last_check = Clock::now();
                 RunTimeoutChecks();
+                PublishStatus();
             }
         } catch (const std::exception& e) {
             LOG_ERROR("scheduler operation failed; retained state for retry: " << e.what());
@@ -198,25 +223,45 @@ void Scheduler::RunProcessing() {
     }
 }
 
-bool Scheduler::HandleCommand(const ControlCommand& command) {
+nlohmann::json Scheduler::HandleCommand(const ControlCommand& command) {
+    const auto reject = [](const std::string& error) -> nlohmann::json {
+        return {{"ok", false}, {"error", error}, {"http_status", 409}};
+    };
+    if (command.kind != ControlCommand::Kind::Shutdown &&
+        !(command.kind == ControlCommand::Kind::Wake && command.plugin_type.empty()) &&
+        !plugins_by_type_.count(command.plugin_type))
+        return reject("plugin is not enabled: " + command.plugin_type);
     switch (command.kind) {
-        case ControlCommand::Kind::Run:
-            return HandleCreateRun(command);
-        case ControlCommand::Kind::Stop:
-            return HandleStopRun(command.plugin_type);
+        case ControlCommand::Kind::Run: {
+            auto* plugin = plugins_by_type_.at(command.plugin_type);
+            if (active_runs_.count(plugin) && !CommitFinished(plugin))
+                return reject("plugin already has an active run");
+            if (!HandleCreateRun(command))
+                return reject("run could not be created; check scheduler logs and plugin configuration");
+            return {{"ok", true}, {"run_id", active_runs_.at(plugin).run_id}};
+        }
+        case ControlCommand::Kind::Stop: {
+            const auto run = active_runs_.find(plugins_by_type_.at(command.plugin_type));
+            if (!command.run_id.empty() && (run == active_runs_.end() || run->second.run_id != command.run_id))
+                return reject("run is no longer active; refresh before stopping");
+            const std::string run_id = run == active_runs_.end() ? std::string() : run->second.run_id;
+            if (!HandleStopRun(command.plugin_type))
+                return reject("stop requested but persistence is still pending; inspect current status and scheduler logs");
+            return {{"ok", true}, {"run_id", run_id}};
+        }
         case ControlCommand::Kind::Wake:
             SendWake(command.plugin_type);
-            return true;
+            return {{"ok", true}};
         case ControlCommand::Kind::Shutdown: {
             bool ok = true;
             for (const auto& type : pluginTypes()) {
                 if (active_runs_.count(plugins_by_type_.at(type))) ok = HandleStopRun(type) && ok;
             }
             if (!ok) LOG_WARN("shutdown: incomplete persistence retained for recovery");
-            return ok;
+            return {{"ok", ok}};
         }
     }
-    return false;
+    return reject("unknown command");
 }
 
 bool Scheduler::HandleCreateRun(const ControlCommand& command) {
@@ -287,6 +332,7 @@ bool Scheduler::HandleCreateRun(const ControlCommand& command) {
     active_runs_[plugin] = {request.run_id, command.plugin_type, false};
     active_run_count_.store(active_runs_.size());
     LOG_INFO("run started: " << request.run_id << " plugin_type=" << command.plugin_type);
+    SendWake(command.plugin_type);
     return true;
 }
 

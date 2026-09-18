@@ -17,6 +17,7 @@
 #include "scheduler/Storage.h"
 
 namespace scheduler {
+class ManagementServer;
 struct PluginDeleter {
     common::DestroyPluginFn destroy = nullptr;
     void operator()(common::TaskPlugin* plugin) const {
@@ -28,7 +29,7 @@ struct PluginDeleter {
 // runs on one worker. FIFO commands therefore form lifecycle barriers.
 class Scheduler {
    public:
-    explicit Scheduler(common::Config& config);
+    explicit Scheduler(common::Config& config, std::string config_path = {});
     ~Scheduler();
     Scheduler(const Scheduler&) = delete;
     Scheduler& operator=(const Scheduler&) = delete;
@@ -43,6 +44,9 @@ class Scheduler {
     size_t inFlightCount() const;
     std::vector<std::string> pluginTypes() const;
     size_t activeRunCount() const { return active_run_count_.load(); }
+    // The local HTTP bridge submits work to the same queue as CLI commands.
+    nlohmann::json managementStatus();
+    nlohmann::json managementCommand(const nlohmann::json& request);
 
    private:
     using Clock = std::chrono::steady_clock;
@@ -70,17 +74,22 @@ class Scheduler {
         enum class Kind { Run, Stop, Wake, Shutdown };
         Kind kind;
         std::string plugin_type, dataset_version, params;
-        std::shared_ptr<std::promise<bool>> completion;
+        std::shared_ptr<std::promise<nlohmann::json>> completion;
+        std::string run_id;
+        Clock::time_point deadline = Clock::time_point::max();
     };
     struct AcceptedReport {
         std::string identity, session_id, plugin_type, task_id, run_id, attempt_id;
     };
 
     bool Submit(ControlCommand command);
+    nlohmann::json SubmitDetailed(ControlCommand command, bool bounded = false);
+    nlohmann::json BuildStatus() const;
+    void PublishStatus();
     bool LoadPlugins();
     void RestoreRuns();
     void RunProcessing();
-    bool HandleCommand(const ControlCommand&);
+    nlohmann::json HandleCommand(const ControlCommand&);
     bool HandleCreateRun(const ControlCommand&);
     bool HandleStopRun(const std::string&);
     bool CommitStop(common::TaskPlugin*);
@@ -107,6 +116,7 @@ class Scheduler {
     bool HasInFlight(const std::string&) const;
 
     common::Config& config_;
+    std::string config_path_, instance_id_;
     Server server_;
     Storage storage_;
     std::vector<LoadedPlugin> plugins_;
@@ -114,8 +124,12 @@ class Scheduler {
     std::atomic<bool> running_{false}, accepting_{false};
     std::atomic<size_t> active_run_count_{0}, in_flight_count_{0};
     std::thread processing_;
+    std::unique_ptr<ManagementServer> management_;
     std::mutex submit_mutex_;
     mutable std::mutex clients_mutex_;
+    mutable std::mutex status_mutex_;
+    nlohmann::json status_snapshot_;
+    Clock::time_point status_updated_;
     std::unordered_map<std::string, ClientEntry> clients_;
     std::unordered_map<std::string, InFlight> in_flight_;
     std::unordered_map<common::TaskPlugin*, RunContext> active_runs_;

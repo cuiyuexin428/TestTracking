@@ -25,7 +25,7 @@ import tempfile
 import time
 import unittest
 from urllib.error import HTTPError, URLError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -162,11 +162,27 @@ class ServerPackageSmoke(unittest.TestCase):
                 status text,
                 detail text
             );
+            CREATE TABLE runs(
+                run_id text PRIMARY KEY,
+                plugin_type text,
+                status text,
+                finished_at timestamptz
+            );
+            CREATE TABLE tasks(
+                task_id text PRIMARY KEY,
+                run_id text,
+                status text
+            );
+            CREATE TABLE plugin_run_files(run_id text, plugin_type text, file text);
+            CREATE TABLE coverage_file_points(run_id text, file text, points bytea);
             INSERT INTO plugin_runs VALUES (
                 'smoke-run', 'coverage', 1, 'manifest-smoke', 'success',
                 'program-1', 'dataset-1', now(), now());
             INSERT INTO plugin_file_outcomes VALUES (
                 'smoke-run', 'coverage', 'sample.stp', 'success', 'ok');
+            INSERT INTO runs VALUES ('smoke-run', 'coverage', 'finished', now());
+            INSERT INTO plugin_run_files VALUES ('smoke-run', 'coverage', 'sample.stp');
+            INSERT INTO coverage_file_points VALUES ('smoke-run', 'sample.stp', decode('0100000000000000','hex'));
             """
         )
 
@@ -201,6 +217,11 @@ class ServerPackageSmoke(unittest.TestCase):
     def test_result_service_from_relocated_package(self) -> None:
         config_path = self.package / "config" / "result_service.json"
         config = json.loads(config_path.read_text(encoding="utf-8-sig"))
+        self.assertEqual("0.0.0.0", config["host"])
+        self.assertTrue((self.package / "result_service" / "plugin_adapters" / "coverage.py").is_file())
+        self.assertTrue((self.package / "data" / "result_views" / "coverage.json").is_file())
+        self.assertTrue((self.package / "result_service" / "report_templates" / "coverage.py").is_file())
+        self.assertTrue((self.package / "tools" / "open_result_service_firewall.ps1").is_file())
         port = free_port()
         config["host"] = "127.0.0.1"
         config["port"] = port
@@ -233,6 +254,17 @@ class ServerPackageSmoke(unittest.TestCase):
         status, html = request_text(base_url + "/")
         self.assertEqual(status, 200)
         self.assertIn("<!doctype html>", html.lower())
+        _, catalog = request_json(base_url + "/api/analysis/catalog?plugin=coverage")
+        self.assertEqual("complete", catalog["runs"][0]["result_readiness"]["status"])
+        request = Request(base_url + "/api/plugins/coverage/reports",
+                          data=json.dumps({"run_id": "smoke-run"}).encode(),
+                          headers={"Content-Type": "application/json"}, method="POST")
+        with urlopen(request, timeout=20) as response:
+            report = json.load(response)
+        _, html = request_text(base_url + report["url"])
+        self.assertIn("sample.stp", html)
+        self.assertIn("原始数据完整", html)
+        self.assertTrue((self.package / "data" / "reports" / report["report_id"] / "index.html").is_file())
 
     def test_scheduler_starts_and_stops_with_package_dlls(self) -> None:
         config_path = self.package / "config" / "scheduler-smoke.json"
@@ -278,6 +310,125 @@ class ServerPackageSmoke(unittest.TestCase):
                 process.wait(timeout=5)
         self.assertEqual(process.returncode, 0, output)
         self.assertIn("scheduler started", output)
+
+    def test_start_server_keeps_result_service_after_scheduler_exit(self) -> None:
+        powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+        if not powershell:
+            self.skipTest("PowerShell is required by the package launcher")
+
+        result_pid_path = self.package / "data" / "result_service.pid"
+        if result_pid_path.is_file():
+            stop_process_tree(int(result_pid_path.read_text(encoding="utf-8").strip()))
+            result_pid_path.unlink(missing_ok=True)
+
+        result_config_path = self.package / "config" / "result_service.json"
+        result_config = json.loads(result_config_path.read_text(encoding="utf-8-sig"))
+        result_port = free_port()
+        result_config["host"] = "127.0.0.1"
+        result_config["port"] = result_port
+        result_config["db_conn"] = self.pg.conn
+        management_url = f"http://127.0.0.1:{free_port()}"
+        result_config["scheduler_management_url"] = management_url
+        result_config_path.write_text(json.dumps(result_config, indent=2), encoding="utf-8")
+
+        scheduler_config_path = self.package / "config" / "scheduler.json"
+        scheduler_config_path.write_text(
+            json.dumps(
+                {
+                    "server": {
+                        "router_endpoint": f"tcp://127.0.0.1:{free_port()}",
+                        "management_endpoint": management_url,
+                        "log_file": "data/logs/scheduler.log",
+                        "poll_timeout_ms": 10,
+                        "client_timeout_ms": 1000,
+                        "task_lease_timeout_ms": 0,
+                        "db_conn": "",
+                    },
+                    "plugins": {},
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        start_server = self.package / "scripts" / "start_server.ps1"
+        process = subprocess.Popen(
+            [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(start_server)],
+            cwd=self.package,
+            env=self.env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        base_url = f"http://127.0.0.1:{result_port}"
+        scheduler_pid_path = self.package / "data" / "scheduler.pid"
+        try:
+            wait_for_ready(base_url, process)
+            deadline = time.monotonic() + 10
+            while not scheduler_pid_path.is_file() and time.monotonic() < deadline:
+                if process.poll() is not None:
+                    break
+                time.sleep(0.1)
+            self.assertTrue(scheduler_pid_path.is_file(), "start_server did not write scheduler PID")
+            self.assertTrue(result_pid_path.is_file(), "start_server did not write result service PID")
+            result_pid = int(result_pid_path.read_text(encoding="utf-8").strip())
+            self.assertGreater(int(scheduler_pid_path.read_text(encoding="utf-8").strip()), 0)
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                _, live = request_json(base_url + "/api/scheduler")
+                if live.get("online"):
+                    break
+                time.sleep(0.1)
+            self.assertTrue(live.get("online"), live)
+            _, editable = request_json(base_url + "/api/config/scheduler")
+            self.assertTrue(editable["available"])
+            self.assertFalse(editable["restart_required"])
+            _, logs = request_json(base_url + "/api/logs?file=scheduler.log")
+            self.assertTrue(any("scheduler started" in line for line in logs["lines"]))
+
+            self.assertIsNotNone(process.stdin)
+            process.stdin.write("quit\n")
+            process.stdin.flush()
+            process.stdin.close()
+            process.stdin = None
+            process.wait(timeout=20)
+            self.assertEqual(process.returncode, 0)
+            self.assertFalse(scheduler_pid_path.exists(), "scheduler PID was not cleaned up")
+
+            status, payload = request_json(base_url + "/readyz")
+            self.assertEqual(status, 200)
+            self.assertEqual(payload.get("status"), "ready")
+            _, offline = request_json(base_url + "/api/scheduler")
+            self.assertFalse(offline["online"])
+            self.assertEqual(
+                int(result_pid_path.read_text(encoding="utf-8").strip()), result_pid,
+                "scheduler exit replaced or stopped the result service",
+            )
+
+            start_result = self.package / "scripts" / "start_result_service.ps1"
+            second = subprocess.run(
+                [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                 str(start_result), "-NoWait"],
+                cwd=self.package, env=self.env, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=20,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertIn("already running", second.stdout)
+            self.assertEqual(int(result_pid_path.read_text(encoding="utf-8").strip()), result_pid)
+            type(self).service_pid = result_pid
+        finally:
+            if process.poll() is None:
+                if scheduler_pid_path.is_file():
+                    stop_process_tree(int(scheduler_pid_path.read_text(encoding="utf-8").strip()))
+                stop_process_tree(process.pid)
+                process.wait(timeout=5)
+            if process.stdout:
+                process.stdout.close()
 
 
 class SmokeOptions:

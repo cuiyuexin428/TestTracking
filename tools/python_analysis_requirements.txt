@@ -1,0 +1,21 @@
+# Direct analysis libraries.
+numpy==2.2.6
+pandas==2.2.3
+openpyxl==3.1.5
+matplotlib==3.10.3
+plotly==6.1.2
+
+# Fully pin transitive dependencies so rebuilding the wheelhouse is repeatable.
+contourpy==1.3.2
+cycler==0.12.1
+et_xmlfile==2.0.0
+fonttools==4.58.2
+kiwisolver==1.4.8
+narwhals==1.41.0
+packaging==25.0
+pillow==11.2.1
+pyparsing==3.2.3
+python-dateutil==2.9.0.post0
+pytz==2025.2
+six==1.17.0
+tzdata==2025.2

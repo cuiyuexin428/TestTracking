@@ -10,12 +10,14 @@ The script, in order:
   1. verifies the toolchain and builds the project (Release by default)
   2. installs/initializes/starts the bundled PostgreSQL server and creates the database
   3. stages the stp dataset and regenerates the dataset manifest
-  4. writes the scheduler config (db, manifest, expected versions)
+  4. writes scheduler and web console configs (db, management, logs, analysis)
   5. builds the full client package (client.exe + plugins + StepTest + dataset + OpenCppCoverage)
-  6. opens firewall ports and prints where everything is
+  6. installs the bundled Python analysis dependencies without using the network
+  7. opens LAN firewall ports and generates startup scripts
 
 Afterwards copy the client package to each client machine and run
-start_client.bat. Start the scheduler with runtime\start_scheduler.bat.
+start_client.bat. Start scheduler and web console with runtime\start_server.bat.
+The web console can also run independently via runtime\start_result_service.bat.
 
 Run as administrator so the Windows service and firewall rules can be set up;
 without elevation pg_ctl is used and firewall setup is skipped with a warning.
@@ -29,6 +31,8 @@ param(
     [string]$BuildDir = '',
     [string]$ServerIp = '',
     [int]$ServerPort = 0,
+    [int]$ManagementPort = 0,
+    [int]$ResultPort = 0,
     [int]$DbPort = 0,
     [string]$PgData = '',
     [string]$DbName = '',
@@ -37,6 +41,8 @@ param(
     [string]$DatasetDir = '',
     [string]$DatasetVersion = '',
     [string]$StepTestExe = '',
+    [ValidateSet('', 'coverage', 'stpcompare')][string]$Plugin = '',
+    [string]$ConverterExe = '',
     [string]$EngineSrcDir = '',
     [string]$OpenCppCoverageDir = '',
     [string]$ProgramVersion = '',
@@ -47,6 +53,7 @@ param(
     [switch]$SkipDataset,
     [switch]$SkipPackage,
     [switch]$SkipFirewall,
+    [switch]$SkipPythonAnalysis,
     [switch]$NoService,
     [switch]$StartScheduler
 )
@@ -67,7 +74,7 @@ if (-not $DeployConfig) {
 }
 $deploy = @{}
 if (Test-Path $DeployConfig) {
-    $parsed = Get-Content -Raw $DeployConfig | ConvertFrom-Json
+    $parsed = Get-Content -LiteralPath $DeployConfig -Raw -Encoding UTF8 | ConvertFrom-Json
     $parsed.PSObject.Properties | ForEach-Object {
         $deploy[$_.Name] = $_.Value
     }
@@ -105,7 +112,15 @@ function Build-DbConn([string]$HostName, [int]$Port, [string]$Db, [string]$User,
 
 $buildConfig = if ($Config) { $Config } else { [string](Get-DeployValue 'build_config' 'Release') }
 $serverPort = if ($ServerPort -gt 0) { $ServerPort } else { [int](Get-DeployValue 'server_port' 5555) }
+$managementPort = if ($ManagementPort -gt 0) { $ManagementPort } else { [int](Get-DeployValue 'management_port' 5556) }
+$resultPort = if ($ResultPort -gt 0) { $ResultPort } else { [int](Get-DeployValue 'result_port' 56330) }
 $dbPort = if ($DbPort -gt 0) { $DbPort } else { [int](Get-DeployValue 'db_port' 5432) }
+foreach ($port in @($serverPort, $managementPort, $resultPort, $dbPort)) {
+    if ($port -lt 1 -or $port -gt 65535) { throw "Invalid TCP port: $port" }
+}
+if (@($serverPort, $managementPort, $resultPort, $dbPort | Select-Object -Unique).Count -ne 4) {
+    throw 'Scheduler, management, result service and database must use different TCP ports.'
+}
 $dbName = if ($DbName) { $DbName } else { [string](Get-DeployValue 'db_name' 'testtracking') }
 $dbUser = if ($DbUser) { $DbUser } else { [string](Get-DeployValue 'db_user' 'postgres') }
 $dbPassword = if ($DbPassword) { $DbPassword } else { [string](Get-DeployValue 'db_password' '') }
@@ -119,6 +134,9 @@ $engineDlls = @()
 $rawDlls = Get-DeployValue 'engine_dlls' @()
 if ($rawDlls) { $engineDlls = @($rawDlls) }
 $stepTestExe = if ($StepTestExe) { $StepTestExe } else { [string](Get-DeployValue 'step_test_exe' '') }
+$plugin = if ($Plugin) { $Plugin } else { [string](Get-DeployValue 'plugin' 'coverage') }
+if ($plugin -notin @('coverage', 'stpcompare')) { throw 'plugin must be coverage or stpcompare' }
+$converterExe = if ($ConverterExe) { $ConverterExe } else { [string](Get-DeployValue 'converter_exe' '') }
 $engineSrcDir = if ($EngineSrcDir) { $EngineSrcDir } else { [string](Get-DeployValue 'engine_src_dir' '') }
 $opencppcoverageDir = if ($OpenCppCoverageDir) { $OpenCppCoverageDir } else { [string](Get-DeployValue 'opencppcoverage_dir' '') }
 $programVersion = if ($ProgramVersion) { $ProgramVersion } else { [string](Get-DeployValue 'program_version' '1.0') }
@@ -134,6 +152,7 @@ $BuildDir = if ($BuildDir) { Resolve-ProjectPath $BuildDir } else { '' }
 $PgData = if ($PgData) { Resolve-ProjectPath $PgData } else { '' }
 $datasetDir = if ($datasetDir) { Resolve-ProjectPath $datasetDir } else { '' }
 $stepTestExe = if ($stepTestExe) { Resolve-ProjectPath $stepTestExe } else { '' }
+$converterExe = if ($converterExe) { Resolve-ProjectPath $converterExe } else { '' }
 $engineSrcDir = if ($engineSrcDir) { Resolve-ProjectPath $engineSrcDir } else { '' }
 $opencppcoverageDir = if ($opencppcoverageDir) { Resolve-ProjectPath $opencppcoverageDir } else { '' }
 
@@ -154,6 +173,7 @@ if ([System.IO.Path]::IsPathRooted($outDirRaw)) {
 $runtimeDir = Join-Path $ProjectRoot 'runtime'
 $datasetStage = Join-Path $runtimeDir 'dataset'
 $binDir = Join-Path $BuildDir ("bin\" + $buildConfig)
+$managedDatabase = $null
 
 Write-Host ''
 Write-Host '=== 1. build ==='
@@ -184,6 +204,14 @@ if (-not $SkipDatabase) {
         -AuthMethod $authMethod -ClientCidr $clientCidr `
         -NoService:$(-not $registerService) `
         -NoFirewall:$SkipFirewall
+    $managedPgRoot = Join-Path $ProjectRoot 'third_party\pgsql'
+    if (-not (Test-Path -LiteralPath (Join-Path $managedPgRoot 'bin\initdb.exe'))) {
+        $managedPgRoot = Join-Path $runtimeDir 'pgsql'
+    }
+    $managedDatabase = @{
+        pg_ctl = Join-Path $managedPgRoot 'bin\pg_ctl.exe'
+        data_dir = if ($PgData) { $PgData } else { Join-Path $runtimeDir 'pgdata' }
+    }
 } else {
     Write-Host 'Skipped (as requested).'
 }
@@ -193,6 +221,12 @@ Write-Host '=== 3. dataset staging + manifest ==='
 if (-not $SkipDataset) {
     if (-not (Test-Path $datasetDir)) {
         throw "dataset source not found: $datasetDir"
+    }
+    $sourceDatasetPath = (Resolve-Path -LiteralPath $datasetDir).Path.TrimEnd('\', '/')
+    $stagedDatasetPath = [IO.Path]::GetFullPath($datasetStage).TrimEnd('\', '/')
+    if ($sourceDatasetPath.Equals($stagedDatasetPath, [StringComparison]::OrdinalIgnoreCase) -or
+        $sourceDatasetPath.StartsWith($stagedDatasetPath + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Dataset source must be outside runtime\dataset. Use -SkipDataset to reuse an already staged dataset; no data was removed.'
     }
     if (Test-Path $datasetStage) {
         Assert-OwnedPath $datasetStage $runtimeDir | Out-Null
@@ -231,10 +265,12 @@ $schedTemplate = Join-Path $ProjectRoot 'scheduler\scheduler.json'
 if (-not (Test-Path $schedTemplate)) {
     throw "scheduler template not found: $schedTemplate"
 }
-$sched = Get-Content -Raw $schedTemplate | ConvertFrom-Json
+$sched = Get-Content -LiteralPath $schedTemplate -Raw -Encoding UTF8 | ConvertFrom-Json
 $localConn = Build-DbConn '127.0.0.1' $dbPort $dbName $dbUser $dbPassword
 $sched.server.db_conn = $localConn
 $sched.server.router_endpoint = "tcp://*:$serverPort"
+$sched.server | Add-Member -NotePropertyName log_file -NotePropertyValue (Join-Path $runtimeDir 'logs\scheduler.log') -Force
+$sched.server | Add-Member -NotePropertyName management_endpoint -NotePropertyValue "http://127.0.0.1:$managementPort" -Force
 $sched.plugins.coverage.db_conn = $localConn
 $sched.plugins.coverage.stp_manifest = ($datasetStage + '/manifest.txt').Replace('\', '/')
 $sched.plugins.coverage.expected_program_version = [string]$programVersion
@@ -248,9 +284,11 @@ foreach ($pluginName in @('coverage', 'stpcompare')) {
     $pluginConfig | Add-Member -NotePropertyName expected_program_version -NotePropertyValue ([string]$programVersion) -Force
     $pluginConfig | Add-Member -NotePropertyName expected_dataset_version -NotePropertyValue ([string]$datasetVersion) -Force
 }
-$outCfgDir = Join-Path $binDir 'config'
-New-Item -ItemType Directory -Force -Path $outCfgDir | Out-Null
-$outCfg = Join-Path $outCfgDir 'scheduler.json'
+# The CMake ALL target refreshes bin/config from the source template on every
+# build. Keep deployment settings outside build output so later Release
+# recompiles cannot replace the live database, endpoint and dataset choices.
+New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
+$outCfg = Join-Path $runtimeDir 'scheduler.json'
 Write-AtomicText $outCfg ($sched | ConvertTo-Json -Depth 10)
 Write-Host "Scheduler config written: $outCfg"
 
@@ -262,6 +300,7 @@ if (-not $SkipPackage) {
         -OutDir $outDir `
         -BinDir $binDir `
         -Config $buildConfig `
+        -Plugin $plugin -ConverterExe $converterExe `
         -Endpoint $endpoint `
         -ServerIp $serverIp `
         -ServerPort $serverPort `
@@ -271,15 +310,81 @@ if (-not $SkipPackage) {
         -StoreCov:$storeCov `
         -ProgramVersion $programVersion -DatasetVersion $datasetVersion `
         -StepTestExe $stepTestExe -EngineSrcDir $engineSrcDir -EngineDlls $engineDlls `
-        -DatasetDir $datasetDir -OpenCppCoverageDir $opencppcoverageDir
+        -DatasetDir $datasetStage -OpenCppCoverageDir $opencppcoverageDir
 } else {
     Write-Host 'Skipped (as requested).'
 }
 
 Write-Host ''
-Write-Host '=== 6. firewall ==='
+Write-Host '=== 6. result service and offline Python analysis ==='
+New-Item -ItemType Directory -Force -Path $runtimeDir, (Join-Path $runtimeDir 'logs') | Out-Null
+$resultTemplate = Join-Path $ProjectRoot 'result_service\config.example.json'
+if (-not (Test-Path -LiteralPath $resultTemplate -PathType Leaf)) {
+    throw "Result service template not found: $resultTemplate"
+}
+$result = Get-Content -LiteralPath $resultTemplate -Raw -Encoding UTF8 | ConvertFrom-Json
+$result.host = '0.0.0.0'
+$result.port = $resultPort
+$result.db_conn = $localConn
+foreach ($entry in @{
+    workspace = '..'
+    static_dir = '../result_service/web'
+    plugin_views_dir = ''
+    plugin_adapters_dir = ''
+    analysis_scripts_dir = 'result_service/analysis_scripts'
+    analysis_reports_dir = 'result_service/reports'
+    report_templates_dir = ''
+    scheduler_management_url = "http://127.0.0.1:$managementPort"
+    scheduler_config_path = $outCfg
+    logs_dir = 'logs'
+}.GetEnumerator()) {
+    $result | Add-Member -NotePropertyName $entry.Key -NotePropertyValue $entry.Value -Force
+}
+$clientConfig = Join-Path $outDir 'config\client.json'
+if ($SkipPackage -or -not (Test-Path -LiteralPath $clientConfig -PathType Leaf)) {
+    $templateName = if ($plugin -eq 'stpcompare') { 'client.stpcompare.json' } else { 'client.json' }
+    $clientTemplate = Get-Content -LiteralPath (Join-Path $ProjectRoot "client\$templateName") -Raw -Encoding UTF8 | ConvertFrom-Json
+    $clientTemplate.scheduler.endpoint = "tcp://${serverIp}:$serverPort"
+    $clientTemplate.client.worker_id = $workerId
+    $clientTemplate.client.task_threads = $taskThreads
+    $remoteConn = Build-DbConn $serverIp $dbPort $dbName $dbUser $dbPassword
+    foreach ($property in $clientTemplate.plugins.PSObject.Properties) {
+        if ($property.Value.PSObject.Properties.Name -contains 'db_conn') { $property.Value.db_conn = $remoteConn }
+        if ($property.Value.PSObject.Properties.Name -contains 'dry_run') { $property.Value.dry_run = $false }
+    }
+    $clientConfig = Join-Path $runtimeDir 'client.template.json'
+    Write-AtomicText $clientConfig ($clientTemplate | ConvertTo-Json -Depth 20)
+    Write-Host 'Client template only: configure actual business executables and dataset paths before use; dry_run is disabled.'
+}
+$result | Add-Member -NotePropertyName client_config_path -NotePropertyValue $clientConfig -Force
+$resultCfg = Join-Path $runtimeDir 'result_service.json'
+# Preserve user-edited AI provider settings on repeated setup. Endpoint and
+# dataset choices still come from this invocation's deployment configuration.
+if (Test-Path -LiteralPath $resultCfg -PathType Leaf) {
+    $previousResult = Get-Content -LiteralPath $resultCfg -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($previousResult.providers) { $result.providers = $previousResult.providers }
+    if ($previousResult.plugin_options) { $result.plugin_options = $previousResult.plugin_options }
+}
+$dshCommand = [string](Get-DeployValue 'dsh_command' '')
+if ($dshCommand) { $result.providers.dsh.command = $dshCommand }
+$clientForAnalysis = Get-Content -LiteralPath $clientConfig -Raw -Encoding UTF8 | ConvertFrom-Json
+if ($clientForAnalysis.plugins.stpcompare -and $clientForAnalysis.plugins.stpcompare.table) {
+    $result.plugin_options.stpcompare.result_table = [string]$clientForAnalysis.plugins.stpcompare.table
+} elseif (-not $result.plugin_options.stpcompare.result_table) {
+    $result.plugin_options.stpcompare.result_table = 'stp_compare_old'
+}
+Write-AtomicText $resultCfg ($result | ConvertTo-Json -Depth 20)
+if (-not $SkipPythonAnalysis) {
+    & (Join-Path $PSScriptRoot 'install_python_analysis_offline.ps1') `
+        -RuntimeDir (Join-Path $runtimeDir 'python') `
+        -Wheelhouse (Join-Path $runtimeDir 'python-analysis-wheelhouse') `
+        -SupportScript (Join-Path $PSScriptRoot 'python_analysis_support.py')
+} else { Write-Host 'Python analysis installation skipped (as requested).' }
+
+Write-Host ''
+Write-Host '=== 7. firewall and startup scripts ==='
 if (-not $SkipFirewall) {
-    foreach ($port in @($serverPort, $dbPort)) {
+    foreach ($port in @($serverPort, $dbPort, $resultPort)) {
         & netsh advfirewall firewall delete rule name="TestTracking $port" 2>$null | Out-Null
         & netsh advfirewall firewall add rule name="TestTracking $port" dir=in action=allow protocol=TCP localport=$port | Out-Null
         if ($LASTEXITCODE -ne 0) {
@@ -292,28 +397,36 @@ if (-not $SkipFirewall) {
     Write-Host 'Skipped (as requested).'
 }
 
-$startBat = Join-Path $runtimeDir 'start_scheduler.bat'
-New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
-@"
+$launchSettings = @{ bin_dir = $binDir; scheduler_config_path = $outCfg; managed_database = $managedDatabase }
+Write-AtomicText (Join-Path $runtimeDir 'source_launch.json') ($launchSettings | ConvertTo-Json)
+# Keep generated batch files ASCII: all non-ASCII paths are resolved by
+# PowerShell from the runtime directory, never interpolated into cmd.exe text.
+foreach ($action in @('start_server', 'start_scheduler', 'start_result_service', 'stop_result_service')) {
+    $targetAction = if ($action -eq 'start_scheduler') { 'start_server' } else { $action }
+    $batch = @"
 @echo off
-cd /d "$binDir"
-scheduler.exe config\scheduler.json
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\tools\source_services.ps1" -Action $targetAction -RuntimeDir "%~dp0."
 pause
-"@ | Set-Content -Path $startBat -Encoding ASCII
+"@
+    [IO.File]::WriteAllText((Join-Path $runtimeDir ($action + '.bat')), $batch, [Text.Encoding]::ASCII)
+}
+$startBat = Join-Path $runtimeDir 'start_server.bat'
 
 Write-Host ''
 Write-Host '=== Setup complete ==='
 Write-Host "Scheduler exe : $schedulerExe"
 Write-Host "Scheduler cfg : $outCfg"
 Write-Host "Start script  : $startBat"
+Write-Host "Result cfg    : $resultCfg"
+Write-Host "Web console   : http://${serverIp}:$resultPort/"
+Write-Host "Management    : http://127.0.0.1:$managementPort (local only)"
 Write-Host "Client package: $outDir"
 Write-Host "Database      : host=$serverIp port=$dbPort dbname=$dbName user=$dbUser"
 Write-Host ''
 Write-Host 'Next steps:'
-Write-Host "  1. Start the scheduler: $startBat"
+Write-Host "  1. Start scheduler and web console: $startBat"
 Write-Host "  2. Copy '$outDir' to each client machine and run start_client.bat"
+Write-Host '  3. Install/configure DSH with tools\setup_offline_dependencies.ps1 if it is not already available.'
 if ($StartScheduler) {
-    Push-Location $binDir
-    & $schedulerExe (Join-Path $binDir 'config\scheduler.json')
-    Pop-Location
+    & (Join-Path $PSScriptRoot 'source_services.ps1') -Action start_server -RuntimeDir $runtimeDir
 }

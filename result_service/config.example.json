@@ -1,9 +1,21 @@
 {
-  "host": "127.0.0.1",
+  "host": "0.0.0.0",
   "port": 56330,
   "db_conn": "",
+  "scheduler_management_url": "http://127.0.0.1:5556",
+  "scheduler_config_path": "../scheduler/scheduler.json",
+  "client_config_path": "../client/client.json",
+  "logs_dir": "../runtime/logs",
   "workspace": "",
   "stp_result_table": "",
+  "plugin_options": {
+    "stpcompare": {"result_table": ""}
+  },
+  "plugin_views_dir": "",
+  "plugin_adapters_dir": "",
+  "analysis_scripts_dir": "../runtime/result_service/analysis_scripts",
+  "analysis_reports_dir": "../runtime/result_service/reports",
+  "report_templates_dir": "",
   "providers": {
     "codex": {
       "command": "codex",

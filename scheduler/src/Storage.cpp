@@ -17,13 +17,14 @@ bool Storage::init(const std::string& conninfo) {
         " task_id text PRIMARY KEY, run_id text, client_identity text, status text,"
         " sent_at timestamptz DEFAULT now(), acked_at timestamptz, reported_at timestamptz,"
         " exit_code int, duration_ms bigint, artifact_path text, result bytea, payload bytea);"
-        "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS attempt_id text NOT NULL DEFAULT '';"
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_attribute "
+        "WHERE attrelid='tasks'::regclass AND attname='attempt_id' AND NOT attisdropped) THEN "
+        "ALTER TABLE tasks ADD COLUMN attempt_id text NOT NULL DEFAULT ''; END IF; END $$;"
         "CREATE TABLE IF NOT EXISTS plugin_task_completions("
         " run_id text NOT NULL, plugin_type text NOT NULL, task_id text NOT NULL,"
         " completed_at timestamptz DEFAULT now(), PRIMARY KEY(run_id,plugin_type,task_id));"
         "CREATE INDEX IF NOT EXISTS idx_tasks_run ON tasks(run_id);";
-    auto result = common::PgResult(PQexec(connection_.get(), ddl), PQclear);
-    enabled_ = result && PQresultStatus(result.get()) == PGRES_COMMAND_OK;
+    enabled_ = common::PgInitializeSchema(connection_.get(), ddl);
     return enabled_;
 }
 bool Storage::Exec(const char* sql, const std::vector<common::PgParam>& params) {
@@ -105,9 +106,6 @@ bool Storage::FinishRun(const std::string& id, const std::string& status) {
     return Exec("UPDATE runs SET status=$2,finished_at=now() WHERE run_id=$1",
                 {{id, false}, {status, false}});
 }
-bool Storage::ResumeRun(const std::string& id) {
-    return Exec("UPDATE runs SET status='running',finished_at=NULL WHERE run_id=$1", {{id, false}});
-}
 bool Storage::LoadUnfinishedRuns(std::vector<RunRecord>& runs) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto* connection = connection_.get();
@@ -165,21 +163,50 @@ bool Storage::ReportTask(const std::string& id, const common::TaskResult& result
          {result.attempt_id(), false},
          {result.run_id(), false}});
 }
-bool Storage::ReconcileCompletedTasks(const std::string& run, const std::string& plugin) {
+bool Storage::RestoreRun(const std::string& run, const std::string& plugin) {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto result = common::PgQuery(
-        connection_.get(),
+    auto* connection = connection_.get();
+    common::PgTransaction transaction(connection);
+    if (!transaction.active()) return false;
+
+    auto reconciled = common::PgQuery(
+        connection,
         "UPDATE tasks AS task SET status='reported',reported_at=COALESCE(reported_at,now()) "
         "FROM plugin_task_completions AS completion "
         "WHERE task.run_id=$1 AND completion.run_id=$1 AND completion.plugin_type=$2 "
         "AND completion.task_id=task.task_id AND task.status<>'reported'",
         {{run, false}, {plugin, false}});
-    if (!result || PQresultStatus(result.get()) != PGRES_COMMAND_OK) {
+    if (!reconciled || PQresultStatus(reconciled.get()) != PGRES_COMMAND_OK) {
         LOG_ERROR("storage: completion reconciliation failed: "
-                  << (result ? PQresultErrorMessage(result.get()) : connection_.lastError()));
+                  << (reconciled ? PQresultErrorMessage(reconciled.get())
+                                 : connection_.lastError()));
         return false;
     }
-    return true;
+
+    auto reclaimed = common::PgQuery(
+        connection,
+        "UPDATE tasks SET status='reclaimed' "
+        "WHERE run_id=$1 AND status IS DISTINCT FROM 'reported'",
+        {{run, false}});
+    if (!reclaimed || PQresultStatus(reclaimed.get()) != PGRES_COMMAND_OK) {
+        LOG_ERROR("storage: recovery task reclaim failed: "
+                  << (reclaimed ? PQresultErrorMessage(reclaimed.get())
+                                : connection_.lastError()));
+        return false;
+    }
+
+    auto resumed = common::PgQuery(
+        connection,
+        "UPDATE runs SET status='running',finished_at=NULL "
+        "WHERE run_id=$1 AND plugin_type=$2 AND status IN ('running','stopped')",
+        {{run, false}, {plugin, false}});
+    if (!resumed || PQresultStatus(resumed.get()) != PGRES_COMMAND_OK ||
+        std::string(PQcmdTuples(resumed.get())) != "1") {
+        LOG_ERROR("storage: run recovery activation failed: "
+                  << (resumed ? PQresultErrorMessage(resumed.get()) : connection_.lastError()));
+        return false;
+    }
+    return transaction.commit();
 }
 bool Storage::ReclaimTasks(const std::vector<std::string>& ids) {
     if (ids.empty()) return true;

@@ -1,0 +1,9 @@
+# The DSH process is loopback-only behind the result-service LAN proxy. Its
+# default auto picker otherwise opens a native dialog on the server desktop.
+- id: directory-picker
+  disabled: true
+- insert:
+    - id: result-service-directory-backend
+      name: '@deepseek-ai/dsh-host-directory-picker-browse'
+    - id: result-service-directory-browser
+      name: '@deepseek-ai/dsh-client-ui-directory-picker-browse'

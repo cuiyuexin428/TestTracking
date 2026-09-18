@@ -2,6 +2,8 @@ add_library(scheduler_core STATIC
     src/Server.cpp
     src/Scheduler.cpp
     src/SchedulerMessages.cpp
+    src/SchedulerManagement.cpp
+    src/ManagementServer.cpp
     src/Storage.cpp
 )
 
@@ -11,6 +13,9 @@ target_include_directories(scheduler_core PUBLIC
 )
 
 target_link_libraries(scheduler_core PUBLIC common ${PG_LIBRARY})
+if(WIN32)
+    target_link_libraries(scheduler_core PUBLIC ws2_32)
+endif()
 add_executable(scheduler src/main.cpp)
 target_link_libraries(scheduler PRIVATE scheduler_core)
 

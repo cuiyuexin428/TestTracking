@@ -43,7 +43,9 @@ bool RunStore::init(const std::string& config, const std::string& plugin,
 }
 
 bool RunStore::savePlan(const std::string& run, const std::string& blob,
-                        const std::vector<std::string>& files, const std::string& fingerprint) {
+                        const std::vector<std::string>& files, const std::string& fingerprint,
+                        std::size_t planned_tasks, const std::string& dataset_version) {
+    const auto& effective_dataset = dataset_version.empty() ? dataset_version_ : dataset_version;
 #ifdef _WIN32
     if (postgres_) {
         auto conn = connection_.get();
@@ -52,11 +54,13 @@ bool RunStore::savePlan(const std::string& run, const std::string& blob,
             ("INSERT INTO " + checkpoint_table_ + "(run_id,blob) VALUES($1,$2) "
              "ON CONFLICT(run_id) DO UPDATE SET blob=EXCLUDED.blob,updated_at=now()").c_str(),
             {{run,false},{blob,true}}) || !PgExec(conn,
-            "INSERT INTO plugin_runs(run_id,plugin_type,expected_files,manifest_fingerprint,program_version,dataset_version,status) "
-            "VALUES($1,$2,$3,$4,$5,$6,'planned') ON CONFLICT(run_id,plugin_type) DO UPDATE SET "
-            "expected_files=EXCLUDED.expected_files,manifest_fingerprint=EXCLUDED.manifest_fingerprint",
-            {{run,false},{plugin_,false},{std::to_string(files.size()),false},{fingerprint,false},
-             {program_version_,false},{dataset_version_,false}})) return false;
+            "INSERT INTO plugin_runs(run_id,plugin_type,expected_files,planned_tasks,manifest_fingerprint,program_version,dataset_version,status) "
+            "VALUES($1,$2,$3,$4,$5,$6,$7,'planned') ON CONFLICT(run_id,plugin_type) DO UPDATE SET "
+            "expected_files=EXCLUDED.expected_files,planned_tasks=EXCLUDED.planned_tasks,"
+            "manifest_fingerprint=EXCLUDED.manifest_fingerprint",
+            {{run,false},{plugin_,false},{std::to_string(files.size()),false},
+             {std::to_string(planned_tasks),false},{fingerprint,false},
+             {program_version_,false},{effective_dataset,false}})) return false;
         // Batched INSERT avoids one round trip per manifest entry.
         nlohmann::json manifest = files;
         if (!PgExec(conn,
@@ -68,8 +72,9 @@ bool RunStore::savePlan(const std::string& run, const std::string& blob,
 #endif
     const auto directory = std::filesystem::path(directory_) / run;
     nlohmann::json metadata = {{"run_id",run},{"plugin_type",plugin_},{"expected_files",files.size()},
+        {"planned_tasks",planned_tasks},
         {"manifest_fingerprint",fingerprint},{"files",files},{"status","planned"},
-        {"program_version",program_version_},{"dataset_version",dataset_version_}};
+        {"program_version",program_version_},{"dataset_version",effective_dataset}};
     return WriteAtomicFile(directory / "checkpoint.bin", blob) &&
            WriteAtomicFile(directory / "run-metadata.json", metadata.dump());
 }
@@ -85,6 +90,31 @@ bool RunStore::loadPlan(const std::string& run, std::string* blob) {
     }
 #endif
     return ReadCompleteFile(std::filesystem::path(directory_) / run / "checkpoint.bin", blob);
+}
+
+bool RunStore::loadIdentity(const std::string& run, RunIdentity* identity) {
+    if (!identity) return false;
+#ifdef _WIN32
+    if (postgres_) {
+        auto result = PgQuery(connection_.get(),
+            "SELECT program_version,dataset_version,manifest_fingerprint FROM plugin_runs "
+            "WHERE run_id=$1 AND plugin_type=$2", {{run,false},{plugin_,false}});
+        if (!result || PQresultStatus(result.get()) != PGRES_TUPLES_OK || PQntuples(result.get()) != 1)
+            return false;
+        *identity = {PgCell(result.get(),0,0), PgCell(result.get(),0,1), PgCell(result.get(),0,2)};
+        return true;
+    }
+#endif
+    std::string bytes;
+    if (!ReadCompleteFile(std::filesystem::path(directory_) / run / "run-metadata.json", &bytes))
+        return false;
+    const auto metadata = nlohmann::json::parse(bytes,nullptr,false);
+    if (!metadata.is_object() || metadata.value("run_id",std::string()) != run ||
+        metadata.value("plugin_type",std::string()) != plugin_) return false;
+    *identity = {metadata.value("program_version",std::string()),
+                 metadata.value("dataset_version",std::string()),
+                 metadata.value("manifest_fingerprint",std::string())};
+    return true;
 }
 
 bool RunStore::recordCompletion(const std::string& run, const std::string& task) {

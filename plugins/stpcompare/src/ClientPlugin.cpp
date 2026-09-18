@@ -210,7 +210,9 @@ bool ClientPlugin::execute(const common::Task& task, common::TaskResult& result,
         if(cancellation.isCancellationRequested()) { result.set_exit_code(-2); return false; }
         FileResult output;
         output.run_id=payload.run_id(); output.file=file; output.attempt_id=task.attempt_id();
-        if(dry_run_) {
+        const bool cached=store_->hasSuccessfulResult(payload.run_id(),file);
+        if(cached) output.successful=true;
+        else if(dry_run_) {
             if(cancellation.waitFor(std::chrono::milliseconds(dry_run_delay_ms_))) {
                 result.set_exit_code(-2); return false;
             }
@@ -219,7 +221,7 @@ bool ClientPlugin::execute(const common::Task& task, common::TaskResult& result,
             output.info_new_txt="dry-run file="+file+" (converted)\n";
         } else output.successful=RunOneFile(payload.run_id(),file,&output,cancellation);
         if(cancellation.isCancellationRequested()) { result.set_exit_code(-2); return false; }
-        if(!store_->publish(output)) {
+        if(!cached && !store_->publish(output)) {
             output.successful=false; all_persisted=false;
             output.detail="failed to publish raw execution result";
         }

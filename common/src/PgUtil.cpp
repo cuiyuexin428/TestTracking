@@ -90,6 +90,27 @@ bool PgTransaction::commit() {
     return true;
 }
 
+bool PgInitializeSchema(PGconn* connection, const char* ddl) {
+    if (!connection || !ddl) return false;
+    std::unique_ptr<PgTransaction> transaction;
+    if (PQtransactionStatus(connection) == PQTRANS_IDLE) {
+        transaction = std::make_unique<PgTransaction>(connection);
+        if (!transaction->active()) return false;
+    } else if (PQtransactionStatus(connection) != PQTRANS_INTRANS) {
+        return false;
+    }
+    // CREATE TABLE IF NOT EXISTS alone is not concurrent-safe: two first-time
+    // processes can race on PostgreSQL's pg_type catalog before either commits.
+    // Use the same namespace for framework and plugin DDL in this database.
+    auto lock = PgQuery(connection,
+        "SELECT pg_advisory_xact_lock(1414810699, hashtext(current_schema()))");
+    if (!lock || PQresultStatus(lock.get()) != PGRES_TUPLES_OK) {
+        LOG_ERROR("pg: schema initialization lock failed: " << PQerrorMessage(connection));
+        return false;
+    }
+    return PgExec(connection, ddl, {}) && (!transaction || transaction->commit());
+}
+
 bool EnsurePluginResultSchema(PGconn* connection) {
     const char* ddl =
         "CREATE TABLE IF NOT EXISTS plugin_runs("
@@ -97,6 +118,9 @@ bool EnsurePluginResultSchema(PGconn* connection) {
         "manifest_fingerprint text, program_version text, dataset_version text,"
         "status text NOT NULL, created_at timestamptz DEFAULT now(), finished_at timestamptz,"
         "PRIMARY KEY(run_id,plugin_type));"
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_attribute "
+        "WHERE attrelid='plugin_runs'::regclass AND attname='planned_tasks' AND NOT attisdropped) THEN "
+        "ALTER TABLE plugin_runs ADD COLUMN planned_tasks int NOT NULL DEFAULT 0; END IF; END $$;"
         "CREATE TABLE IF NOT EXISTS plugin_run_files("
         "run_id text NOT NULL, plugin_type text NOT NULL, file text NOT NULL,"
         "PRIMARY KEY(run_id,plugin_type,file));"
@@ -107,7 +131,7 @@ bool EnsurePluginResultSchema(PGconn* connection) {
         "CREATE TABLE IF NOT EXISTS plugin_task_completions("
         "run_id text NOT NULL, plugin_type text NOT NULL, task_id text NOT NULL,"
         "completed_at timestamptz DEFAULT now(), PRIMARY KEY(run_id,plugin_type,task_id));";
-    return PgExec(connection, ddl, {});
+    return PgInitializeSchema(connection, ddl);
 }
 
 bool LockFileOutcome(PGconn* connection, const std::string& plugin,

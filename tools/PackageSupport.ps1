@@ -1,4 +1,20 @@
 # Runtime assets shared by the Windows x64 release package builders.
+function Resolve-PackageBinaryDir {
+    param([string]$ProjectRoot, [string]$Explicit, [string]$Executable, [string]$Config = 'Release')
+    # Match setup_offline_server.ps1. Never silently use an older development
+    # build copied with the source tree; other outputs must be explicit.
+    $candidate = if ($Explicit) {
+        if ([IO.Path]::IsPathRooted($Explicit)) { [IO.Path]::GetFullPath($Explicit) }
+        else { [IO.Path]::GetFullPath((Join-Path $ProjectRoot $Explicit)) }
+    } else { Join-Path $ProjectRoot "build\offline_verify\bin\$Config" }
+    if (Test-Path -LiteralPath (Join-Path $candidate $Executable) -PathType Leaf) { return $candidate }
+    if ($Explicit) {
+        $nested = Join-Path $candidate "bin\$Config"
+        if (Test-Path -LiteralPath (Join-Path $nested $Executable) -PathType Leaf) { return $nested }
+    }
+    throw "$Executable not found under $candidate; pass -BinDir with the output of the current build."
+}
+
 function Copy-VCRuntime {
     param([Parameter(Mandatory = $true)][string]$Destination, [string]$RuntimeDir = '')
     $required = @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll')

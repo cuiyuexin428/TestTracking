@@ -13,9 +13,24 @@ add_test(NAME test_coverage_client COMMAND test_coverage_client)
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
+    add_test(NAME test_scheduler_logging COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_scheduler_logging.py --scheduler $<TARGET_FILE:scheduler> -v)
+    set_tests_properties(test_scheduler_logging PROPERTIES TIMEOUT 40)
+    add_test(NAME test_scheduler_management COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_scheduler_management.py
+        --scheduler $<TARGET_FILE:scheduler> --probe $<TARGET_FILE:scheduler_probe> -v)
+    set_tests_properties(test_scheduler_management PROPERTIES TIMEOUT 120)
     add_test(NAME test_result_service COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/test_result_service.py -v)
     set_tests_properties(test_result_service PROPERTIES TIMEOUT 30)
+    add_test(NAME test_plugin_views COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_plugin_views.py -v)
+    set_tests_properties(test_plugin_views PROPERTIES TIMEOUT 30)
+    foreach(name dsh_proxy reports analysis_catalog python_analysis_dependencies ai_providers management management_http)
+        add_test(NAME test_${name} COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_${name}.py -v)
+        set_tests_properties(test_${name} PROPERTIES TIMEOUT 90)
+    endforeach()
     if(WIN32)
         add_test(NAME test_package_portability COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/test_package_portability.py -v)
@@ -56,6 +71,14 @@ target_link_libraries(test_plugin_runtime PRIVATE common coverage_core stpcompar
 add_test(NAME test_plugin_runtime COMMAND test_plugin_runtime)
 set_tests_properties(test_plugin_runtime PROPERTIES TIMEOUT 60)
 if(WIN32 AND Python3_Interpreter_FOUND AND EXISTS "${PG_BIN_DIR}/initdb.exe")
+    add_test(NAME test_schema_startup COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_schema_startup.py
+        --bin-dir $<TARGET_FILE_DIR:scheduler> --pg-bin ${PG_BIN_DIR} -v)
+    set_tests_properties(test_schema_startup PROPERTIES TIMEOUT 90)
+    add_test(NAME test_management_integration COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_management_integration.py
+        --bin-dir $<TARGET_FILE_DIR:scheduler> --pg-bin ${PG_BIN_DIR} -v)
+    set_tests_properties(test_management_integration PROPERTIES TIMEOUT 150)
     add_test(NAME test_coverage_settle COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/test_coverage_settle.py
         --exe $<TARGET_FILE:coverage_settle> --pg-bin ${PG_BIN_DIR} -v)

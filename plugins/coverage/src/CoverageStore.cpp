@@ -65,11 +65,11 @@ public:
         const auto cfg=nlohmann::json::parse(config);
         if (!connection_.connect(cfg.value("db_conn",std::string()))) return false;
         auto conn=connection_.get();
-        return common::EnsurePluginResultSchema(conn) && common::PgExec(conn,
+        return common::EnsurePluginResultSchema(conn) && common::PgInitializeSchema(conn,
             "CREATE TABLE IF NOT EXISTS coverage_file_points(run_id text NOT NULL,file text NOT NULL,"
             "points bytea NOT NULL,PRIMARY KEY(run_id,file));"
             "CREATE TABLE IF NOT EXISTS coverage_cov_files(run_id text NOT NULL,file text NOT NULL,"
-            "cov bytea,size_bytes bigint,PRIMARY KEY(run_id,file));",{});
+            "cov bytea,size_bytes bigint,PRIMARY KEY(run_id,file));");
     }
     bool publish(const FileCoverageResult& result) override {
         std::lock_guard<std::mutex> lock(mutex_);

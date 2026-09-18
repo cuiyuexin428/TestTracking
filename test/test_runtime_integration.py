@@ -94,7 +94,7 @@ class ExclusiveFile:
 class RuntimeIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        for name in ('scheduler.exe', 'client.exe', 'coverage.dll', 'scheduler_probe.dll'):
+        for name in ('scheduler.exe', 'client.exe', 'coverage.dll', 'stpcompare.dll', 'scheduler_probe.dll'):
             if not (OPTIONS.bin_dir / name).is_file():
                 raise RuntimeError(f'Missing runtime binary: {OPTIONS.bin_dir / name}')
         cls.pg = PrivatePostgres(OPTIONS.pg_bin, OPTIONS.bin_dir / 'scheduler.exe')
@@ -127,6 +127,12 @@ class RuntimeIntegrationTests(unittest.TestCase):
 
     def configure(self, *, file_store=False, delay=1200, framework_db=True,
                   client_timeout_ms=650):
+        self.program = self.root / 'program'
+        self.dataset = self.root / 'dataset'
+        self.program.mkdir(exist_ok=True)
+        self.dataset.mkdir(exist_ok=True)
+        (self.program / 'version.txt').write_text('v1', encoding='utf-8')
+        (self.dataset / 'version.txt').write_text('d1', encoding='utf-8')
         plugin = {'dll': str(OPTIONS.bin_dir / 'coverage.dll'), 'enabled': True,
                   'store_type': 'file' if file_store else 'postgres',
                   'store_dir': str(self.store), 'db_conn': self.conn}
@@ -134,7 +140,8 @@ class RuntimeIntegrationTests(unittest.TestCase):
             'server': {'router_endpoint': self.endpoint, 'poll_timeout_ms': 10,
                        'process_threads': 2, 'client_timeout_ms': client_timeout_ms,
                        'task_lease_timeout_ms': 0},
-            'plugins': {'coverage': dict(plugin, stp_manifest=str(self.manifest), task_size=1)}}
+            'plugins': {'coverage': dict(plugin, stp_manifest=str(self.manifest), task_size=1,
+                                        expected_program_version='v1', expected_dataset_version='d1')}}
         if framework_db:
             self.server_json['server']['db_conn'] = self.conn
         self.client_json = {
@@ -144,7 +151,8 @@ class RuntimeIntegrationTests(unittest.TestCase):
                        'request_backoff_max_ms': 100, 'request_timeout_ms': 500,
                        'register_timeout_ms': 1000, 'register_max_attempts': 3},
             'plugins': {'coverage': dict(plugin, dry_run=True, dry_run_delay_ms=delay,
-                                        store_cov=False, export_dir=str(self.root / 'reports'))}}
+                                        store_cov=False, export_dir=str(self.root / 'reports'),
+                                        program_dir=str(self.program), stp_root=str(self.dataset))}}
         self.write_configs()
 
     def write_configs(self):
@@ -185,9 +193,9 @@ class RuntimeIntegrationTests(unittest.TestCase):
                    'client registration')
         self.assertIsNone(self.client.process.poll(), self.client.text())
 
-    def start_run(self, version='d1'):
+    def start_run(self, label=''):
         previous = self.server.text().count('run started:')
-        self.server.send(f'run coverage {version}')
+        self.server.send(f'run coverage d1 {label}'.strip())
         self.until(lambda: self.server.text().count('run started:') > previous, 'run start')
         return re.findall(r'run started: (\S+)', self.server.text())[-1]
 
@@ -206,7 +214,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
     def test_stop_then_run_and_wakeup_follow_command_order(self):
         self.start_server()
         first = self.start_run()
-        self.server.send('stop coverage', 'run coverage d2', 'wakeup coverage')
+        self.server.send('stop coverage', 'run coverage d1 second', 'wakeup coverage')
         self.until(lambda: self.server.text().count('run started:') == 2, 'second run after stop')
         text = self.server.text()
         self.assertNotIn('run already active', text)
@@ -256,13 +264,13 @@ class RuntimeIntegrationTests(unittest.TestCase):
                    == 'stopped', 'original run stopped before replacement')
 
         self.manifest.write_text('', encoding='utf-8')
-        self.server.send('run coverage invalid-replacement')
+        self.server.send('run coverage d1 invalid-replacement')
         self.until(lambda: 'createRun: plan failed for coverage' in self.server.text(),
                    'replacement plan failure')
         self.assertEqual(self.sql('SELECT status FROM runs WHERE run_id=' + sql_text(old_run)),
                          'stopped', 'failed replacement must preserve the resumable run')
         self.assertEqual(
-            self.sql("SELECT count(*) FROM runs WHERE dataset_version='invalid-replacement' "
+            self.sql("SELECT count(*) FROM runs WHERE params='invalid-replacement' "
                      "AND status='failed'"),
             '1', 'the rejected replacement must be recorded as failed')
 
@@ -305,14 +313,14 @@ class RuntimeIntegrationTests(unittest.TestCase):
             self.assertIsNone(
                 lock_process.poll(), lock_log.read_text(encoding='utf-8', errors='replace'))
 
-            self.server.send('run coverage replacement')
+            self.server.send('run coverage d1 replacement')
             self.until(
                 lambda: self.sql(
-                    "SELECT count(*) FROM runs WHERE dataset_version='replacement' "
+                    "SELECT count(*) FROM runs WHERE params='replacement' "
                     "AND status='planning'") == '1',
                 'replacement persisted before its coverage plan can commit')
             planning_run = self.sql(
-                "SELECT run_id FROM runs WHERE dataset_version='replacement' "
+                "SELECT run_id FROM runs WHERE params='replacement' "
                 "AND status='planning'")
             self.assertNotIn('run started: ' + planning_run, self.server.text())
             self.server.crash()
@@ -358,7 +366,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.start_server()
         self.start_client()
         self.fault_trigger("TG_OP='INSERT'")
-        self.server.send('run coverage blocked')
+        self.server.send('run coverage d1 blocked')
         self.until(lambda: 'runtime injected persistence failure' in self.server.text(), 'SaveRun failure')
         time.sleep(.4)
         self.assertEqual(self.sql('SELECT count(*) FROM runs'), '0')
@@ -455,9 +463,14 @@ class RuntimeIntegrationTests(unittest.TestCase):
             'plugin completion before blocked framework report')
         self.until(lambda: 'runtime injected persistence failure' in self.server.text(),
                    'blocked framework report')
-        self.assertNotEqual(
-            self.sql("SELECT status FROM tasks WHERE run_id=" + sql_text(run)), 'reported')
+        task_status_before_recovery = self.sql(
+            "SELECT status FROM tasks WHERE run_id=" + sql_text(run))
+        self.assertNotEqual(task_status_before_recovery, 'reported')
         self.server.crash()
+
+        self.sql('DROP TRIGGER runtime_failure ON tasks; DROP FUNCTION inject_fault(); '
+                 'DROP TABLE fault_gate;')
+        self.fault_trigger("TG_OP='UPDATE' AND NEW.status='running'", table='runs')
 
         self.server_number += 1
         failed_restart = CapturedProcess(
@@ -465,16 +478,20 @@ class RuntimeIntegrationTests(unittest.TestCase):
             f'scheduler-{self.server_number}', self.pg.env)
         self.procs.append(failed_restart)
         self.assertNotEqual(failed_restart.process.wait(timeout=10), 0)
-        self.assertIn('cannot reconcile completed tasks for run ' + run, failed_restart.text())
+        self.assertIn('cannot persist recovered state for run ' + run, failed_restart.text())
         self.assertNotIn('scheduler started', failed_restart.text())
         self.assertEqual(
             self.sql('SELECT status FROM runs WHERE run_id=' + sql_text(run)), 'running',
             'failed recovery must leave the original run available for the next start')
+        self.assertEqual(
+            self.sql("SELECT status FROM tasks WHERE run_id=" + sql_text(run)),
+            task_status_before_recovery,
+            'failed recovery must roll back task reconciliation and reclaim together')
 
         self.sql('UPDATE fault_gate SET enabled=false')
         self.start_server()
         self.until(lambda: 'run restored: ' + run in self.server.text(),
-                   'run restoration after split commit')
+                   'run restoration after recovery retry')
         self.finished(run)
         self.assertEqual(
             self.sql("SELECT status FROM tasks WHERE run_id=" + sql_text(run)), 'reported')
@@ -527,9 +544,23 @@ class RuntimeIntegrationTests(unittest.TestCase):
                        self.rows(f"SELECT task_id,attempt_id FROM tasks WHERE run_id={sql_text(run)}"
                                  " AND status='acked'")}
         self.server.crash()
+        self.client.crash()
         self.start_server()
         self.until(lambda: 'run restored: ' + run in self.server.text(),
                    'run restoration after the crash')
+        restored_statuses = {
+            row[0]: row[1] for row in self.rows(
+                f"SELECT task_id,status FROM tasks WHERE run_id={sql_text(run)}")
+        }
+        self.assertEqual(
+            {task_id: 'reported' for task_id in committed},
+            {task_id: restored_statuses.get(task_id) for task_id in committed},
+            'durably committed tasks must remain reported during recovery')
+        self.assertEqual(
+            {task_id: 'reclaimed' for task_id in uncommitted},
+            {task_id: restored_statuses.get(task_id) for task_id in uncommitted},
+            'unfinished attempts must be reclaimable before a client reconnects')
+        self.start_client()
         self.finished(run)
         final = {row[0]: row[1] for row in
                  self.rows(f"SELECT task_id,attempt_id FROM tasks WHERE run_id={sql_text(run)}")}
@@ -585,6 +616,124 @@ class RuntimeIntegrationTests(unittest.TestCase):
             self.sql(f"SELECT attempt_id FROM tasks WHERE task_id={sql_text(task_id)}"), attempt,
             'the crashed attempt must be reclaimed and re-dispatched as a new attempt')
         self.assertEqual(self.sql(f"SELECT count(*) FROM tasks WHERE run_id={sql_text(run)}"), '2')
+
+    def use_stpcompare(self, *, task_size=1):
+        server_plugin = self.server_json['plugins'].pop('coverage')
+        server_plugin.update(dll=str(OPTIONS.bin_dir / 'stpcompare.dll'), task_size=task_size)
+        self.server_json['plugins']['stpcompare'] = server_plugin
+        client_plugin = self.client_json['plugins'].pop('coverage')
+        client_plugin.update(dll=str(OPTIONS.bin_dir / 'stpcompare.dll'), table='stp_runtime_results')
+        self.client_json['plugins']['stpcompare'] = client_plugin
+
+    def test_requested_dataset_rejects_conflict_and_is_persisted_without_config_default(self):
+        self.start_server()
+        self.server.send('run coverage d2')
+        self.until(lambda: self.sql("SELECT count(*) FROM runs WHERE status='failed'") == '1',
+                   'conflicting request rejected')
+        self.assertEqual(self.sql('SELECT count(*) FROM plugin_runs'), '0')
+        self.assertEqual(self.sql('SELECT count(*) FROM tasks'), '0')
+        self.server.crash()
+
+        self.server_json['plugins']['coverage'].pop('expected_dataset_version')
+        self.write_configs()
+        self.start_server()
+        run = self.start_run()
+        self.assertEqual(self.sql('SELECT dataset_version FROM plugin_runs WHERE run_id=' + sql_text(run)), 'd1')
+        self.start_client()
+        self.finished(run)
+
+    def test_pre_registered_client_cannot_receive_another_dataset(self):
+        self.server_json['plugins']['coverage'].pop('expected_dataset_version')
+        self.write_configs()
+        self.start_server()
+        self.start_client()  # d1 registration succeeds before a run exists.
+        self.server.send('run coverage d2')
+        self.until(lambda: 'run started:' in self.server.text(), 'd2 run planned')
+        run = re.findall(r'run started: (\S+)', self.server.text())[-1]
+        time.sleep(.4)
+        self.assertEqual(self.sql('SELECT count(*) FROM tasks'), '0')
+        self.assertEqual(self.sql('SELECT dataset_version FROM plugin_runs'), 'd2')
+        self.client.crash()
+        (self.dataset / 'version.txt').write_text('d2', encoding='utf-8')
+        self.start_client()
+        self.finished(run)
+
+    def test_recovery_blocks_changed_deployment_without_losing_original_progress(self):
+        self.use_stpcompare()
+        self.manifest.write_text('one.stp,1\ntwo.stp,1\n', encoding='utf-8')
+        self.client_json['plugins']['stpcompare']['dry_run_delay_ms'] = 2500
+        self.write_configs()
+        self.start_server()
+        self.start_client()
+        self.server.send('run stpcompare d1')
+        self.until(lambda: self.sql("SELECT count(*) FROM tasks WHERE status='reported'") == '1',
+                   'first committed STP task')
+        run = re.findall(r'run started: (\S+)', self.server.text())[-1]
+        committed = self.sql("SELECT task_id||'|'||attempt_id FROM tasks WHERE status='reported'")
+        self.server.crash()
+        self.client.crash()
+        plugin = self.server_json['plugins']['stpcompare']
+        original_manifest = self.manifest.read_text(encoding='utf-8')
+
+        for field, value in (('expected_program_version', 'v2'), ('expected_dataset_version', 'd2'),
+                             ('manifest', 'different.stp,1\n')):
+            with self.subTest(changed=field):
+                if field == 'manifest':
+                    self.manifest.write_text(value, encoding='utf-8')
+                else:
+                    plugin[field] = value
+                self.write_configs()
+                rejected = CapturedProcess(OPTIONS.bin_dir / 'scheduler.exe', self.scheduler_config,
+                                           self.root, 'blocked-' + field, self.pg.env)
+                self.procs.append(rejected)
+                self.assertNotEqual(rejected.process.wait(timeout=10), 0)
+                self.assertIn('recovery blocked; original progress retained', rejected.text())
+                self.assertEqual(self.sql('SELECT status FROM runs WHERE run_id=' + sql_text(run)), 'running')
+                self.assertEqual(self.sql("SELECT task_id||'|'||attempt_id FROM tasks WHERE status='reported'"), committed)
+                if field == 'manifest':
+                    self.manifest.write_text(original_manifest, encoding='utf-8')
+                else:
+                    plugin[field] = 'v1' if field == 'expected_program_version' else 'd1'
+
+        self.write_configs()
+        self.start_server()
+        self.start_client()
+        self.finished(run)
+        self.assertEqual(self.sql('SELECT program_version,dataset_version FROM plugin_runs'), 'v1|d1')
+
+    def test_stp_client_crash_reuses_persisted_success_and_reports_consistent_outcomes(self):
+        self.use_stpcompare(task_size=2)
+        self.manifest.write_text('a.stp,3\nb.stp,3\n', encoding='utf-8')
+        for filename in ('a.stp', 'b.stp'):
+            (self.dataset / filename).write_text('STP', encoding='utf-8')
+        converter = self.program / 'converter.py'
+        converter.write_text(
+            'import sys,time\nfrom pathlib import Path\n'
+            'source=Path(sys.argv[1]); marker=source.parent/"first-success.marker"\n'
+            'if source.name=="a.stp":\n'
+            ' if marker.exists(): sys.exit(7)\n'
+            ' marker.write_text("done")\n'
+            'else: time.sleep(2)\n'
+            'Path("info.txt").write_text("current")\n'
+            'Path("info_new.txt").write_text("converted")\n', encoding='utf-8')
+        self.client_json['plugins']['stpcompare'].update(
+            dry_run=False, program_exe=sys.executable, program_args=[str(converter), '{stp}'],
+            work_dir=str(self.root / 'work'))
+        self.write_configs()
+        self.start_server()
+        self.start_client()
+        self.server.send('run stpcompare d1')
+        self.until(lambda: self.sql("SELECT count(*) FROM plugin_file_outcomes "
+                                    "WHERE file='a.stp' AND status='success'") == '1',
+                   'first STP file persisted before client crash')
+        run = re.findall(r'run started: (\S+)', self.server.text())[-1]
+        self.client.crash()
+        self.start_client()
+        self.finished(run)
+        self.assertEqual(self.sql('SELECT status,exit_code FROM tasks'), 'reported|0')
+        self.assertEqual(self.sql('SELECT file,status FROM plugin_file_outcomes ORDER BY file'),
+                         'a.stp|success\nb.stp|success')
+        self.assertNotIn('converter failed', self.client.text())
 
     def test_unrestorable_run_is_closed_instead_of_blocking_startup(self):
         self.sql("CREATE TABLE IF NOT EXISTS runs (run_id text PRIMARY KEY, plugin_type text,"

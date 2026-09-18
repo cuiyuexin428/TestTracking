@@ -23,11 +23,15 @@ bool Unhex(const std::string& text, std::string* bytes) {
 }
 bool TaskLedger::init(const std::string& config, const std::string& plugin,
                       const std::string& checkpoint_table) {
+    const auto cfg = nlohmann::json::parse(config);
+    expected_program_version_ = cfg.value("expected_program_version",std::string());
+    expected_dataset_version_ = cfg.value("expected_dataset_version",std::string());
     return store_.init(config, plugin, checkpoint_table);
 }
 void TaskLedger::clear() {
     run_.clear(); tasks_.clear(); pending_.clear(); priority_.clear(); queued_.clear();
     in_flight_.clear(); done_.clear(); finished_=false;
+    identity_ = {};
 }
 bool TaskLedger::loadTasks(const std::vector<Task>& tasks,const std::set<std::string>& completed) {
     for (const auto& task : tasks) {
@@ -39,24 +43,38 @@ bool TaskLedger::loadTasks(const std::vector<Task>& tasks,const std::set<std::st
     return true;
 }
 bool TaskLedger::plan(const std::string& run,const std::vector<Task>& tasks,
-                      const std::vector<std::string>& files,const std::string& fingerprint) {
+                      const std::vector<std::string>& files,const std::string& fingerprint,
+                      const std::string& dataset_version) {
     clear(); run_=run;
+    identity_ = {expected_program_version_,
+                 dataset_version.empty() ? expected_dataset_version_ : dataset_version, fingerprint};
     if (!loadTasks(tasks,{})) { clear(); return false; }
     nlohmann::json state={{"version",4},{"run",run},{"files",files},{"fingerprint",fingerprint},
                            {"tasks",nlohmann::json::array()}};
     for (const auto& task : tasks) state["tasks"].push_back(Hex(task.SerializeAsString()));
-    if (!store_.savePlan(run,state.dump(),files,fingerprint)) { clear(); return false; }
+    if (!store_.savePlan(run,state.dump(),files,fingerprint,tasks.size(),identity_.dataset_version)) {
+        clear(); return false;
+    }
     if (tasks.empty()) finished_=store_.finish(run_);
     return true;
 }
 bool TaskLedger::loadLegacy(const std::string& run,std::string* bytes) { return store_.loadPlan(run,bytes); }
-bool TaskLedger::restore(const std::string& run) {
+bool TaskLedger::restore(const std::string& run, const std::string& manifest_fingerprint) {
     clear();
     std::string bytes;
     if (!store_.loadPlan(run,&bytes)) return false;
     auto state=nlohmann::json::parse(bytes,nullptr,false);
     if (state.is_discarded() || !state.is_object() || state.value("version",0)!=4 ||
         state.value("run",std::string())!=run || !state.contains("tasks") || !state["tasks"].is_array()) return false;
+    if (!manifest_fingerprint.empty()) {
+        if (!store_.loadIdentity(run,&identity_))
+            throw RecoveryBlocked("cannot read saved deployment identity for run " + run);
+        if (identity_.program_version != expected_program_version_ ||
+            (!expected_dataset_version_.empty() && identity_.dataset_version != expected_dataset_version_) ||
+            identity_.manifest_fingerprint != manifest_fingerprint)
+            throw RecoveryBlocked("deployment version or manifest differs from saved run " + run +
+                                  "; restore its original program, dataset and manifest");
+    }
     std::vector<Task> tasks;
     for (const auto& encoded : state["tasks"]) {
         std::string data; Task task;

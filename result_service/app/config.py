@@ -35,12 +35,23 @@ class ProviderConfig:
 
 @dataclass(frozen=True)
 class ServiceConfig:
-    host: str = "127.0.0.1"
+    host: str = "0.0.0.0"
     port: int = 56330
     db_conn: str = ""
     stp_result_table: str | None = None
     workspace: str | None = None
     static_dir: str | None = None
+    plugin_views_dir: str | None = None
+    plugin_adapters_dir: str | None = None
+    analysis_scripts_dir: str | None = None
+    analysis_reports_dir: str | None = None
+    report_templates_dir: str | None = None
+    scheduler_management_url: str = "http://127.0.0.1:5556"
+    scheduler_config_path: str | None = None
+    client_config_path: str | None = None
+    logs_dir: str | None = None
+    config_path: str | None = None
+    plugin_options: dict[str, dict[str, Any]] = field(default_factory=dict)
     providers: dict[str, ProviderConfig] = field(default_factory=dict)
 
     @classmethod
@@ -80,6 +91,16 @@ class ServiceConfig:
                 host=config.host, port=config.port, db_conn=config.db_conn,
                 stp_result_table=config.stp_result_table,
                 workspace=resolved(config.workspace), static_dir=resolved(config.static_dir),
+                plugin_views_dir=resolved(config.plugin_views_dir),
+                plugin_adapters_dir=resolved(config.plugin_adapters_dir),
+                analysis_scripts_dir=resolved(config.analysis_scripts_dir),
+                analysis_reports_dir=resolved(config.analysis_reports_dir),
+                report_templates_dir=resolved(config.report_templates_dir),
+                scheduler_management_url=config.scheduler_management_url,
+                scheduler_config_path=resolved(config.scheduler_config_path),
+                client_config_path=resolved(config.client_config_path),
+                logs_dir=resolved(config.logs_dir), config_path=str(config_path),
+                plugin_options=config.plugin_options,
                 providers={name: ProviderConfig(name=item.name, command=item.command, args=item.args,
                            timeout_seconds=item.timeout_seconds, cwd=resolved(item.cwd), prompt_mode=item.prompt_mode)
                            for name, item in config.providers.items()},
@@ -92,9 +113,25 @@ class ServiceConfig:
             raise ValueError("port must be between 0 and 65535")
         db_conn = env.get("RESULT_SERVICE_DB", config.db_conn)
         workspace = env.get("RESULT_SERVICE_WORKSPACE", config.workspace or "") or None
+        plugin_views_dir = env.get(
+            "RESULT_SERVICE_PLUGIN_VIEWS", config.plugin_views_dir or ""
+        ) or None
+        plugin_adapters_dir = env.get(
+            "RESULT_SERVICE_PLUGIN_ADAPTERS", config.plugin_adapters_dir or ""
+        ) or None
         return cls(host=host, port=port, db_conn=db_conn,
                    stp_result_table=config.stp_result_table,
                    workspace=workspace, static_dir=config.static_dir,
+                   plugin_views_dir=plugin_views_dir,
+                   plugin_adapters_dir=plugin_adapters_dir,
+                   analysis_scripts_dir=config.analysis_scripts_dir,
+                   analysis_reports_dir=config.analysis_reports_dir,
+                   report_templates_dir=config.report_templates_dir,
+                   scheduler_management_url=config.scheduler_management_url,
+                   scheduler_config_path=config.scheduler_config_path,
+                   client_config_path=config.client_config_path,
+                   logs_dir=config.logs_dir, config_path=config.config_path,
+                   plugin_options=config.plugin_options,
                    providers=config.providers)
 
     @staticmethod
@@ -109,6 +146,11 @@ class ServiceConfig:
             if "prompt_mode" not in merged_value and name.lower() == "dsh":
                 merged_value["prompt_mode"] = "argument"
             providers[name] = ProviderConfig.from_dict(name, merged_value)
+        plugin_options = raw.get("plugin_options", base.plugin_options)
+        if not isinstance(plugin_options, dict) or not all(
+                isinstance(name, str) and isinstance(value, dict)
+                for name, value in plugin_options.items()):
+            raise ValueError("plugin_options must map plugin names to objects")
         return ServiceConfig(
             host=str(raw.get("host", base.host)),
             port=int(raw.get("port", base.port)),
@@ -116,5 +158,15 @@ class ServiceConfig:
             stp_result_table=raw.get("stp_result_table", base.stp_result_table),
             workspace=raw.get("workspace", base.workspace),
             static_dir=raw.get("static_dir", base.static_dir),
+            plugin_views_dir=raw.get("plugin_views_dir", base.plugin_views_dir),
+            plugin_adapters_dir=raw.get("plugin_adapters_dir", base.plugin_adapters_dir),
+            analysis_scripts_dir=raw.get("analysis_scripts_dir", base.analysis_scripts_dir),
+            analysis_reports_dir=raw.get("analysis_reports_dir", base.analysis_reports_dir),
+            report_templates_dir=raw.get("report_templates_dir", base.report_templates_dir),
+            scheduler_management_url=raw.get("scheduler_management_url", base.scheduler_management_url),
+            scheduler_config_path=raw.get("scheduler_config_path", base.scheduler_config_path),
+            client_config_path=raw.get("client_config_path", base.client_config_path),
+            logs_dir=raw.get("logs_dir", base.logs_dir), config_path=base.config_path,
+            plugin_options=plugin_options,
             providers=providers,
         )

@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -115,8 +116,21 @@ int main(int argc, char* argv[]) {
         common::Config& config = common::Config::instance();
         config.load(config_path);
         common::Logger::instance().setLevel(common::Logger::Level::Info);
+        const std::string log_file = config.get("server.log_file", std::string());
+        if (!log_file.empty()) {
+            const std::filesystem::path log_path(log_file);
+            if (log_path.has_parent_path()) {
+                std::filesystem::create_directories(log_path.parent_path());
+            }
+            // Validate the destination before starting the scheduler. Logger
+            // appends and flushes each entry while leaving console/stdin intact.
+            std::ofstream probe(log_file, std::ios::app);
+            if (!probe) { throw std::runtime_error("cannot open scheduler log: " + log_file); }
+            probe.close();
+            common::Logger::instance().setFile(log_file);
+        }
 
-        scheduler::Scheduler sched(config);
+        scheduler::Scheduler sched(config, std::filesystem::absolute(config_path).string());
         sched.start();
         LOG_INFO("scheduler started, config=" << config_path);
         PrintHelp();
@@ -183,7 +197,7 @@ int main(int argc, char* argv[]) {
         sched.stop();
         LOG_INFO("scheduler stopped");
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "scheduler failed: %s\n", e.what());
+        LOG_ERROR("scheduler failed: " << e.what());
         return 1;
     }
     return 0;

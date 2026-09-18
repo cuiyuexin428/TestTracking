@@ -12,9 +12,12 @@
 #include "common/TaskLedger.h"
 #include "common/Util.h"
 #include "coverage/CoverageStore.h"
+#include "coverage/SchedulerPlugin.h"
+#include "coverage.pb.h"
 #include "stpcompare.pb.h"
 #include "stpcompare/ClientPlugin.h"
 #include "stpcompare/StpStore.h"
+#include "stpcompare/SchedulerPlugin.h"
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -183,6 +186,51 @@ void resultTests(const fs::path& root) {
     a.successful = true;
     CHECK(second->publish(a), "failed result may retry successfully");
 }
+template<class Plugin, class Registration>
+void schedulerVersionTests(const fs::path& root, const std::string& name) {
+    const auto manifest = root / (name + "-manifest.txt");
+    write(manifest, "sample.stp,3\n");
+    nlohmann::json config = {{"store_type","file"}, {"store_dir",(root/name).string()},
+        {"stp_manifest",manifest.string()}, {"expected_program_version","v1"},
+        {"expected_dataset_version","d1"}};
+    Plugin plugin;
+    CHECK(plugin.init(config.dump()), "versioned plugin init");
+    CHECK(!plugin.plan({name+"-conflict","d2",{}},{}), "configured dataset rejects conflicting run");
+    CHECK(plugin.plan({name+"-run","d1",{}},{}), "matching dataset plan");
+    Registration registration;
+    registration.set_program_version("v1"); registration.set_dataset_version("d2");
+    common::ClientInfo client; registration.SerializeToString(&client.registration_payload);
+    common::Task issued;
+    CHECK(!plugin.requestTask(client,{},issued), "pre-registered wrong dataset cannot receive task");
+    registration.set_dataset_version("d1"); registration.SerializeToString(&client.registration_payload);
+    CHECK(plugin.requestTask(client,{},issued), "matching client receives task");
+    config["expected_program_version"]="v2";
+    Plugin changed; CHECK(changed.init(config.dump()), "changed deployment init");
+    bool blocked=false;
+    try { changed.restore(name+"-run"); } catch(const common::RecoveryBlocked&) { blocked=true; }
+    CHECK(blocked, "program change blocks recovery instead of mixing results");
+    config["expected_program_version"]="v1";
+    Plugin resumed; CHECK(resumed.init(config.dump()) && resumed.restore(name+"-run"),
+                          "original deployment remains recoverable");
+    CHECK(resumed.requestTask(client,{},issued), "uncommitted task remains available");
+    config.erase("expected_dataset_version");
+    Plugin unconfigured; CHECK(unconfigured.init(config.dump()), "optional expected dataset");
+    CHECK(unconfigured.plan({name+"-requested","d3",{}},{}), "request supplies dataset version");
+    const auto metadata=nlohmann::json::parse(read(root/name/(name+"-requested")/"run-metadata.json"));
+    CHECK(metadata["dataset_version"]=="d3", "request version persisted in plugin metadata");
+}
+void stpStoreTests(const nlohmann::json& config) {
+    auto store=stpcompare::CreateStpResultStore(config.dump());
+    CHECK(store->init(config.dump()), "STP result store init");
+    stpcompare::FileResult result;
+    result.run_id="stp-idempotent"; result.file="cached.stp"; result.successful=true;
+    result.info_txt="old"; result.info_new_txt="new";
+    CHECK(store->publish(result), "STP success published");
+    CHECK(store->hasSuccessfulResult(result.run_id,result.file), "STP success can be reused");
+    result.successful=false; result.detail="later attempt failed";
+    CHECK(store->publish(result) && result.successful && result.detail.empty(),
+          "STP publication returns durable success when a competing attempt failed");
+}
 int fakeConverter(int argc, char** argv) {
     if (argc != 3 || !fs::exists(argv[2])) return 20;
     const auto name = fs::path(argv[2]).filename().string();
@@ -237,6 +285,7 @@ void stpClientTests(const fs::path& root, const std::string& executable) {
 #ifdef _WIN32
 void postgresTests(const std::string& connection) {
     const nlohmann::json cfg = {{"store_type", "postgres"}, {"db_conn", connection}};
+    stpStoreTests(cfg);
     auto first = coverage_plugin::CreateCoverageResultStore(cfg.dump()),
          second = coverage_plugin::CreateCoverageResultStore(cfg.dump());
     CHECK(first->init(cfg.dump()) && second->init(cfg.dump()), "postgres stores initialized");
@@ -347,6 +396,9 @@ int main(int argc, char** argv) {
     fs::create_directories(root);
     ledgerTests(root);
     resultTests(root);
+    stpStoreTests({{"store_type","file"},{"store_dir",(root/"stp-idempotent").string()}});
+    schedulerVersionTests<coverage_plugin::SchedulerPlugin,coverage::CoverageClientInfo>(root,"coverage");
+    schedulerVersionTests<stpcompare::SchedulerPlugin,stpcompare::StpCompareClientInfo>(root,"stpcompare");
     stpClientTests(root, fs::absolute(argv[0]).string());
     std::error_code error;
     fs::remove_all(root, error);

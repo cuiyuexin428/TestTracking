@@ -6,13 +6,13 @@
 #   2. third-party installs (or rebuilds them offline from third_party_src)
 #   3. PostgreSQL client libpq (project-local third_party/pgsql, PG_ROOT env,
 #      or common install paths)
-#   4. cmake configure + build (Debug)
+#   4. cmake configure + build (Release by default)
 param(
     [string]$ProjectRoot = (Split-Path -Parent $PSScriptRoot),
     [string]$BuildDir = "",
     [string]$PgRoot = "",
     [switch]$SkipThirdParty,
-    [string]$Config = 'Debug',
+    [ValidateSet('Debug', 'Release')][string]$Config = 'Release',
     [switch]$SkipBuild
 )
 $ErrorActionPreference = "Stop"
@@ -51,14 +51,17 @@ $tpChecks = @(
     "tinyxml2/tinyxml2.h"
 )
 $tpComplete = $true
+$missingThirdParty = @()
 foreach ($rel in $tpChecks) {
     $ok = Test-Path (Join-Path $tp $rel)
-    if (-not $ok) { $tpComplete = $false }
+    if (-not $ok) { $tpComplete = $false; $missingThirdParty += $rel }
     Check $rel $ok "missing under third_party"
 }
 if (-not $tpComplete -and -not $SkipThirdParty) {
     Write-Host "== rebuilding third-party offline =="
     & (Join-Path $PSScriptRoot "build_third_party.ps1") -ProjectRoot $ProjectRoot
+    # Replace preliminary missing-file failures with the post-build checks.
+    $failures -= $missingThirdParty.Count
     foreach ($rel in $tpChecks) {
         Check $rel (Test-Path (Join-Path $tp $rel)) "still missing after rebuild"
     }
@@ -91,6 +94,10 @@ if ($SkipBuild) {
 Write-Host "== 4. configure + build =="
 $cfgArgs = @("-S", $ProjectRoot, "-B", $BuildDir, "-A", "x64")
 if ($PgRoot) { $cfgArgs += "-DPG_ROOT=$PgRoot" }
+$bundledPython = Join-Path $ProjectRoot 'runtime\python\python.exe'
+if (Test-Path -LiteralPath $bundledPython -PathType Leaf) {
+    $cfgArgs += "-DPython3_EXECUTABLE=$bundledPython"
+}
 & cmake @cfgArgs
 if ($LASTEXITCODE -ne 0) { Write-Host "[FAIL] cmake configure failed"; exit 1 }
 & cmake --build $BuildDir --config $Config --parallel 8

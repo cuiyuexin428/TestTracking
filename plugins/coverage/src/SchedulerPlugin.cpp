@@ -21,13 +21,20 @@ bool SchedulerPlugin::init(const std::string& config) {
 }
 bool SchedulerPlugin::validateClient(const common::ClientInfo&,const std::string& bytes,common::ValidationResult& result) {
     coverage::CoverageClientInfo info;
+    const auto& dataset = ledger_.hasRun() && !ledger_.finished()
+        ? ledger_.datasetVersion() : expected_dataset_version_;
     result.accepted=info.ParseFromString(bytes) &&
         (expected_program_version_.empty() || expected_program_version_==info.program_version()) &&
-        (expected_dataset_version_.empty() || expected_dataset_version_==info.dataset_version());
+        (dataset.empty() || dataset==info.dataset_version());
     result.reason=result.accepted?"ok":"invalid client information or version mismatch";
     return true;
 }
 bool SchedulerPlugin::plan(const common::RunRequest& request,const std::vector<common::ClientInfo>&) {
+    if (!request.dataset_version.empty() && !expected_dataset_version_.empty() &&
+        request.dataset_version != expected_dataset_version_) {
+        LOG_ERROR("coverage: requested dataset version differs from configured dataset");
+        return false;
+    }
     std::vector<common::ManifestEntry> manifest; std::string fingerprint;
     if (!common::ReadManifest(manifest_path_,&manifest,&fingerprint)) {
         LOG_ERROR("coverage: invalid, duplicate or unreadable manifest " << manifest_path_); return false;
@@ -41,9 +48,16 @@ bool SchedulerPlugin::plan(const common::RunRequest& request,const std::vector<c
         task.set_task_id(request.run_id+"-t"+std::to_string(tasks.size()));
         payload.SerializeToString(task.mutable_payload()); tasks.push_back(task);
     }
-    return ledger_.plan(request.run_id,tasks,files,fingerprint);
+    return ledger_.plan(request.run_id,tasks,files,fingerprint,request.dataset_version);
 }
-bool SchedulerPlugin::requestTask(const common::ClientInfo&,const std::string&,common::Task& task) { return ledger_.request(&task); }
+bool SchedulerPlugin::requestTask(const common::ClientInfo& client,const std::string&,common::Task& task) {
+    coverage::CoverageClientInfo info;
+    if (!info.ParseFromString(client.registration_payload) ||
+        (!ledger_.programVersion().empty() && ledger_.programVersion()!=info.program_version()) ||
+        (!ledger_.datasetVersion().empty() && ledger_.datasetVersion()!=info.dataset_version()))
+        return false;
+    return ledger_.request(&task);
+}
 bool SchedulerPlugin::processResult(const common::TaskResult& result) {
     if (result.exit_code()<0) return false;
     const auto* task=ledger_.task(result.task_id());
@@ -59,7 +73,10 @@ void SchedulerPlugin::cancel() { ledger_.clear(); }
 void SchedulerPlugin::requeue(const std::vector<std::string>& ids) { ledger_.requeue(ids); }
 bool SchedulerPlugin::saveCheckpoint(const std::string& run) { return ledger_.save(run); }
 bool SchedulerPlugin::restore(const std::string& run) {
-    if (ledger_.restore(run)) return true;
+    std::vector<common::ManifestEntry> current_manifest; std::string current_fingerprint;
+    if (!common::ReadManifest(manifest_path_,&current_manifest,&current_fingerprint))
+        throw common::RecoveryBlocked("coverage: current manifest cannot be read; original progress retained");
+    if (ledger_.restore(run,current_fingerprint)) return true;
     // Legacy snapshots contain their exact remaining tasks. Configuration
     // changes must not reconstruct tasks and invent completed progress.
     std::string bytes; coverage::CoverageCheckpoint legacy;

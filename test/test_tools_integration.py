@@ -2,19 +2,29 @@
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import unittest
 import uuid
+from urllib.request import urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_coverage_settle import PrivatePostgres, sql_text
 
 ROOT = Path(__file__).resolve().parents[1]
 OPTIONS = None
+
+
+def plain_output(text):
+    """PowerShell 7 wraps/colorizes errors while Windows PowerShell uses plain text."""
+    text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text)
+    text = re.sub(r'(?m)^\s*\|\s?', '', text)
+    return ' '.join(text.split())
 
 
 class ToolIntegrationTests(unittest.TestCase):
@@ -39,7 +49,7 @@ class ToolIntegrationTests(unittest.TestCase):
     def script(self, name, *args, succeeds=True):
         command = [OPTIONS.powershell, '-NoProfile', '-ExecutionPolicy', 'Bypass',
                    '-File', str(ROOT / 'tools' / name), *map(str, args)]
-        if name == 'init_postgres_offline.ps1':
+        if name in {'init_postgres_offline.ps1', 'source_services.ps1'}:
             # A restarted PostgreSQL can inherit the script's output handles.
             # A file lets us wait for the script without waiting for server EOF.
             result = self.pg.run(command, check=False, timeout=45,
@@ -201,9 +211,15 @@ class ToolIntegrationTests(unittest.TestCase):
         self.assertNotIn('different\tone.stp', output.read_text())
 
     def test_deploy_relative_paths_from_non_project_working_directory(self):
-        project = self.root / 'project with spaces'
+        project_name = 'project with spaces 源码'
+        project = self.root / project_name
         (project / 'scheduler').mkdir(parents=True)
         shutil.copyfile(ROOT / 'scheduler/scheduler.json', project / 'scheduler/scheduler.json')
+        (project / 'result_service').mkdir()
+        shutil.copyfile(ROOT / 'result_service/config.example.json', project / 'result_service/config.example.json')
+        (project / 'client').mkdir()
+        for name in ('client.json', 'client.stpcompare.json'):
+            shutil.copyfile(ROOT / 'client' / name, project / 'client' / name)
         build = project / 'build outputs'
         binaries = build / 'bin/Release'
         binaries.mkdir(parents=True)
@@ -216,18 +232,99 @@ class ToolIntegrationTests(unittest.TestCase):
         for filename in ('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll'):
             (crt / filename).write_bytes(b'configuration fixture; never executed')
         deploy = project / 'deployment.json'
+        with socket.socket() as reserve:
+            reserve.bind(('127.0.0.1', 0))
+            web_port = reserve.getsockname()[1]
         deploy.write_text(json.dumps({'build_config':'Release','server_ip':'192.0.2.17','server_port':6123,'db_port':6543,
+                                      'management_port':6124,'result_port':web_port,'plugin':'stpcompare',
                                       'db_name':'test_db','db_user':'test_user','program_version':'p17',
                                       'dataset_version':'d17'}))
         # Invoke from the parent directory while every deployment path is
         # relative to the project root. This catches accidental resolution
         # against the caller's working directory.
-        self.script('setup_offline_server.ps1', '-ProjectRoot', 'project with spaces',
+        self.script('setup_offline_server.ps1', '-ProjectRoot', project_name,
                     '-BuildDir', 'build outputs', '-DeployConfig', 'deployment.json',
                     '-SkipBuild', '-SkipDatabase', '-SkipDataset',
-                    '-SkipPackage', '-SkipFirewall')
-        config = json.loads((binaries / 'config/scheduler.json').read_text())
+                    '-SkipPackage', '-SkipFirewall', '-SkipPythonAnalysis')
+        runtime_scheduler = project / 'runtime/scheduler.json'
+        config = json.loads(runtime_scheduler.read_text(encoding='utf-8'))
         self.assertEqual(config['server']['router_endpoint'], 'tcp://*:6123')
+        self.assertEqual(Path(config['server']['log_file']), project / 'runtime/logs/scheduler.log')
+        self.assertEqual(config['server']['management_endpoint'], 'http://127.0.0.1:6124')
+        result = json.loads((project / 'runtime/result_service.json').read_text(encoding='utf-8'))
+        self.assertEqual('http://127.0.0.1:6124', result['scheduler_management_url'])
+        self.assertEqual(web_port, result['port'])
+        self.assertEqual('0.0.0.0', result['host'])
+        self.assertEqual('logs', result['logs_dir'])
+        self.assertFalse(result['plugin_views_dir'])
+        self.assertFalse(result['plugin_adapters_dir'])
+        self.assertFalse(result['report_templates_dir'])
+        self.assertEqual('stp_compare_old', result['plugin_options']['stpcompare']['result_table'])
+        self.assertEqual(runtime_scheduler, Path(result['scheduler_config_path']))
+        template = json.loads(Path(result['client_config_path']).read_text(encoding='utf-8'))
+        self.assertEqual('tcp://192.0.2.17:6123', template['scheduler']['endpoint'])
+        self.assertEqual(['stpcompare'], [key for key, value in template['plugins'].items() if value['enabled']])
+        self.assertIn('port=6543', template['plugins']['stpcompare']['db_conn'])
+        for name in ('start_server', 'start_scheduler', 'start_result_service', 'stop_result_service'):
+            batch = (project / 'runtime' / (name + '.bat')).read_text(encoding='ascii')
+            self.assertIn('%~dp0..\\tools\\source_services.ps1', batch)
+        settings = json.loads((project / 'runtime/source_launch.json').read_text(encoding='utf-8'))
+        self.assertEqual(binaries, Path(settings['bin_dir']))
+        self.assertIsNone(settings['managed_database'])
+        self.assertEqual(runtime_scheduler, Path(settings['scheduler_config_path']))
+        # CMake's scheduler_config ALL target copies its default template on
+        # every build. A subsequent offline Release compile must not overwrite
+        # the deployed database/ports/manifest or change either launch path.
+        (binaries / 'config').mkdir(exist_ok=True)
+        shutil.copyfile(ROOT / 'scheduler/scheduler.json', binaries / 'config/scheduler.json')
+        self.assertEqual(config, json.loads(runtime_scheduler.read_text(encoding='utf-8')))
+        self.assertEqual(runtime_scheduler, Path(json.loads(
+            (project / 'runtime/source_launch.json').read_text(encoding='utf-8'))['scheduler_config_path']))
+        # Run the source-specific web launcher with the prepared embedded
+        # runtime. Reuse immutable stdlib/extension files; site-packages remain
+        # in the repository runtime, so no network or installed system Python
+        # is needed and the test does not copy thousands of third-party files.
+        portable = ROOT / 'runtime/python'
+        if (portable / 'python.exe').is_file():
+            shutil.copytree(ROOT / 'result_service', project / 'result_service', dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+            for name in ('coverage', 'stpcompare'):
+                target = project / 'plugins' / name
+                target.mkdir(parents=True)
+                for artifact in ('result_adapter.py', 'result_view.json', 'result_report.py'):
+                    shutil.copyfile(ROOT / 'plugins' / name / artifact, target / artifact)
+            local_python = project / 'runtime/python'
+            local_python.mkdir()
+            for source in portable.iterdir():
+                if source.is_file() and source.suffix != '._pth':
+                    os.link(source, local_python / source.name)
+            path_file = next(portable.glob('python*._pth'))
+            original_paths = path_file.read_text(encoding='utf-8').splitlines()
+            relocated_paths = [str((portable / item).resolve()) if item and not item.startswith(('#', 'import '))
+                               else item for item in original_paths]
+            (local_python / path_file.name).write_text('\n'.join(relocated_paths) + '\n', encoding='utf-8')
+            runtime = project / 'runtime'
+            self.addCleanup(self.script, 'source_services.ps1', '-Action', 'stop_result_service', '-RuntimeDir', runtime)
+            self.script('source_services.ps1', '-Action', 'start_result_service', '-RuntimeDir', runtime, '-NoWait')
+            first_pid = (runtime / 'result_service.pid').read_text()
+            self.script('source_services.ps1', '-Action', 'start_result_service', '-RuntimeDir', runtime, '-NoWait')
+            self.assertEqual(first_pid, (runtime / 'result_service.pid').read_text())
+            with urlopen(f'http://127.0.0.1:{web_port}/api/plugins', timeout=5) as response:
+                plugin_response = json.load(response)
+            self.assertEqual({'coverage', 'stpcompare'}, {entry['name'] for entry in plugin_response})
+            self.script('source_services.ps1', '-Action', 'stop_result_service', '-RuntimeDir', runtime)
+            self.assertFalse((runtime / 'result_service.pid').exists())
+        # Reject a source inside the owned staging tree before deleting it.
+        dataset = project / 'runtime/dataset'
+        dataset.mkdir()
+        precious = dataset / 'only-copy.stp'
+        precious.write_text('the only complete copy')
+        refused = self.script('setup_offline_server.ps1', '-ProjectRoot', project_name,
+                             '-BuildDir', 'build outputs', '-DeployConfig', 'deployment.json',
+                             '-DatasetDir', 'runtime/dataset', '-SkipBuild', '-SkipDatabase',
+                             '-SkipPackage', '-SkipFirewall', '-SkipPythonAnalysis', succeeds=False)
+        self.assertIn('no data was removed', plain_output(refused.stderr))
+        self.assertEqual('the only complete copy', precious.read_text())
         for name in ('coverage', 'stpcompare'):
             self.assertIn('port=6543', config['plugins'][name]['db_conn'])
             self.assertEqual(config['plugins'][name]['stp_manifest'], str(project / 'runtime/dataset/manifest.txt').replace('\\','/'))
@@ -242,6 +339,39 @@ class ToolIntegrationTests(unittest.TestCase):
             enabled = [key for key,value in client['plugins'].items() if value['enabled']]
             self.assertEqual(enabled, [name])
             self.assertIn('port=6543', client['plugins'][name]['db_conn'])
+
+    def test_source_start_restarts_only_its_prepared_database(self):
+        project = self.root / 'source restart'
+        runtime = project / 'runtime'
+        runtime.mkdir(parents=True)
+        private = PrivatePostgres(OPTIONS.pg_bin, OPTIONS.pg_bin / 'psql.exe')
+        self.addCleanup(private.close)
+        private.start()
+        settings = {'bin_dir': str(project / 'missing-build'),
+                    'scheduler_config_path': str(runtime / 'scheduler.json'),
+                    'managed_database': {'pg_ctl': str(private.program('pg_ctl')),
+                                         'data_dir': str(private.data)}}
+        (runtime / 'source_launch.json').write_text(json.dumps(settings), encoding='utf-8')
+        private.run([private.program('pg_ctl'), '-D', private.data, '-m', 'fast', '-w', 'stop'])
+        private.started = False
+        self.assertEqual(3, private.run([private.program('pg_ctl'), 'status', '-D', private.data], check=False).returncode)
+        # The rest of the application is intentionally absent. PostgreSQL
+        # must be ready before the launcher reports the missing web config.
+        result = self.script('source_services.ps1', '-Action', 'start_server', '-RuntimeDir', runtime, succeeds=False)
+        self.assertIn('Managed PostgreSQL ready', result.stdout)
+        self.assertIn('Required source deployment file not found', plain_output(result.stdout + result.stderr))
+        self.assertEqual('1', private.sql('SELECT 1'))
+        private.started = True
+        actual = Path(private.sql('SHOW data_directory')).resolve()
+        self.assertEqual(private.data.resolve(), actual)
+        # External database mode must not start any stopped database.
+        private.run([private.program('pg_ctl'), '-D', private.data, '-m', 'fast', '-w', 'stop'])
+        private.started = False
+        settings['managed_database'] = None
+        (runtime / 'source_launch.json').write_text(json.dumps(settings), encoding='utf-8')
+        self.script('source_services.ps1', '-Action', 'start_server', '-RuntimeDir', runtime, succeeds=False)
+        self.assertEqual(3, private.run([private.program('pg_ctl'), 'status', '-D', private.data], check=False).returncode)
+        private.started = False
 
 
 if __name__ == '__main__':

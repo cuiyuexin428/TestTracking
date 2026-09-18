@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "plugin-view.schema.json",
+  "title": "Test Tracking plugin result view",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "plugin", "title", "widgets"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "plugin": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_-]*$", "maxLength": 64},
+    "title": {"$ref": "#/$defs/title"},
+    "description": {"type": "string", "maxLength": 500},
+    "primary_metric": {"$ref": "#/$defs/metric"},
+    "widgets": {"type": "array", "maxItems": 12, "items": {"$ref": "#/$defs/widget"}},
+    "empty_states": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "pending": {"$ref": "#/$defs/message"},
+        "error": {"$ref": "#/$defs/message"},
+        "not_configured": {"$ref": "#/$defs/message"},
+        "not_selected": {"$ref": "#/$defs/message"}
+      }
+    }
+  },
+  "$defs": {
+    "title": {"type": "string", "minLength": 1, "maxLength": 120},
+    "message": {"type": "string", "minLength": 1, "maxLength": 300},
+    "path": {"type": "string", "pattern": "^(run|analysis|result_completeness|outcomes)(\\.[A-Za-z_][A-Za-z0-9_]*)+$"},
+    "format": {"enum": ["text", "number", "integer", "percent", "datetime", "duration"]},
+    "tone": {"enum": ["neutral", "success", "warning", "danger", "accent"]},
+    "metric": {
+      "type": "object", "additionalProperties": false, "required": ["label", "value"],
+      "properties": {
+        "label": {"type": "string", "minLength": 1, "maxLength": 100},
+        "value": {"$ref": "#/$defs/path"}, "format": {"$ref": "#/$defs/format"},
+        "suffix": {"type": "string", "maxLength": 40}, "tone": {"$ref": "#/$defs/tone"},
+        "empty": {"type": "string", "maxLength": 40}
+      }
+    },
+    "progress": {
+      "type": "object", "additionalProperties": false, "required": ["label", "value", "total"],
+      "properties": {
+        "label": {"type": "string", "minLength": 1, "maxLength": 100},
+        "value": {"$ref": "#/$defs/path"}, "total": {"$ref": "#/$defs/path"},
+        "format": {"$ref": "#/$defs/format"}, "tone": {"$ref": "#/$defs/tone"}
+      }
+    },
+    "column": {
+      "type": "object", "additionalProperties": false, "required": ["label", "value"],
+      "properties": {
+        "label": {"type": "string", "minLength": 1, "maxLength": 100},
+        "value": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$"},
+        "format": {"$ref": "#/$defs/format"}
+      }
+    },
+    "widget": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["id", "type", "title", "items"],
+          "properties": {
+            "id": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_-]*$", "maxLength": 64},
+            "type": {"enum": ["metrics", "key_value"]}, "title": {"$ref": "#/$defs/title"},
+            "description": {"type": "string", "maxLength": 500},
+            "items": {"type": "array", "minItems": 1, "maxItems": 24, "items": {"$ref": "#/$defs/metric"}}
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["id", "type", "title", "items"],
+          "properties": {
+            "id": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_-]*$", "maxLength": 64},
+            "type": {"const": "progress"}, "title": {"$ref": "#/$defs/title"},
+            "description": {"type": "string", "maxLength": 500},
+            "items": {"type": "array", "minItems": 1, "maxItems": 24, "items": {"$ref": "#/$defs/progress"}}
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["id", "type", "title", "source", "columns"],
+          "properties": {
+            "id": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_-]*$", "maxLength": 64},
+            "type": {"const": "data_table"}, "title": {"$ref": "#/$defs/title"},
+            "description": {"type": "string", "maxLength": 500}, "source": {"$ref": "#/$defs/path"},
+            "columns": {"type": "array", "minItems": 1, "maxItems": 24, "items": {"$ref": "#/$defs/column"}},
+            "empty_text": {"$ref": "#/$defs/message"}
+          }
+        }
+      ]
+    }
+  }
+}

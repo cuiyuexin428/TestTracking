@@ -10,7 +10,10 @@ class StpResultStore {
 public:
     virtual ~StpResultStore()=default;
     virtual bool init(const std::string& config)=0;
-    virtual bool publish(const FileResult& result)=0;
+    virtual bool hasSuccessfulResult(const std::string& run, const std::string& file)=0;
+    // On success, update the outcome to the durable winner if another attempt
+    // already published success. Transport summaries must reflect that winner.
+    virtual bool publish(FileResult& result)=0;
 };
 std::unique_ptr<StpResultStore> CreateStpResultStore(const std::string& config);
 }

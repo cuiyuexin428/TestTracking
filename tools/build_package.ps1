@@ -11,7 +11,7 @@
 #
 # Versions are tracked per component in testenv\program\version.txt and
 # testenv\dataset\version.txt. Update only the component that changed:
-#   -OnlyClient   rebuild the client binaries/config only
+#   -OnlyClient   update binaries; preserve deployment config unless explicitly overridden
 #   -OnlyProgram  replace testenv\program and bump its version
 #   -OnlyDataset  replace testenv\dataset and bump its version
 param(
@@ -69,6 +69,18 @@ if ($Config -ne 'Release') {
     throw 'Deployment packages require -Config Release; Debug runtimes cannot be redistributed'
 }
 
+$OutDir = if ($OutDir) { Resolve-ProjectPath $OutDir } else { Join-Path $root 'dist\client_package' }
+$clientConfigPath = Join-Path $OutDir 'config\client.json'
+$previousConfig = $null
+if (($OnlyClient -or $OnlyProgram -or $OnlyDataset) -and (Test-Path -LiteralPath $clientConfigPath)) {
+    $previousConfig = Get-Content -LiteralPath $clientConfigPath -Raw | ConvertFrom-Json
+    if (-not $PSBoundParameters.ContainsKey('Plugin')) {
+        $enabled = @($previousConfig.plugins.PSObject.Properties | Where-Object { $_.Value.enabled })
+        if ($enabled.Count -eq 1) { $Plugin = $enabled[0].Name }
+    }
+}
+$preserveClientConfig = $OnlyClient -and $null -ne $previousConfig
+
 if ($Plugin -eq 'stpcompare') {
     if (-not $ConverterExe -and -not $OnlyClient -and -not $OnlyDataset) {
         throw 'Pass -ConverterExe for a stpcompare program package'
@@ -91,43 +103,23 @@ function Get-LocalIPv4 {
     throw 'Cannot auto-detect server IPv4 address; pass -ServerIp or -Endpoint.'
 }
 
-if (-not $OnlyProgram -and -not $OnlyDataset -and -not $ServerIp -and (-not $Endpoint -or (-not $DbConn -and $StoreType -eq 'postgres'))) {
+if (-not $preserveClientConfig -and -not $OnlyProgram -and -not $OnlyDataset -and -not $ServerIp -and (-not $Endpoint -or (-not $DbConn -and $StoreType -eq 'postgres'))) {
     $candidateIps = @(Get-LocalIPv4)
     $ServerIp = $candidateIps[0]
     Write-Host "detected IPv4 candidates: $($candidateIps -join ', '); using $ServerIp (override with -ServerIp)"
 }
-if (-not $Endpoint) { $Endpoint = "tcp://${ServerIp}:$ServerPort" }
-if (-not $DbConn -and $StoreType -eq 'postgres') {
+if (-not $Endpoint -and -not $preserveClientConfig) { $Endpoint = "tcp://${ServerIp}:$ServerPort" }
+if (-not $DbConn -and $StoreType -eq 'postgres' -and -not $preserveClientConfig) {
     $DbConn = New-PostgresConnection $ServerIp $DbPort $DbName $DbUser $DbPassword
 }
 
-if (-not $OutDir) {
-    $OutDir = Join-Path $root 'dist\client_package'
-} else {
-    $OutDir = Resolve-ProjectPath $OutDir
-}
 $StepTestExe = Resolve-ProjectPath $StepTestExe
 $EngineSrcDir = Resolve-ProjectPath $EngineSrcDir
 $DatasetDir = Resolve-ProjectPath $DatasetDir
 $OpenCppCoverageDir = Resolve-ProjectPath $OpenCppCoverageDir
 $VCRuntimeDir = Resolve-ProjectPath $VCRuntimeDir
-if (-not $OnlyProgram -and -not $OnlyDataset -and -not $BinDir) {
-    $candidates = @(
-        (Join-Path $root 'build\rt\bin\Release'),
-        (Join-Path $root 'out\build\x64-Release\bin\Release'),
-        (Join-Path $root 'out\build\Release\bin\Release'),
-        (Join-Path $root 'build\bin\Release')
-    )
-    foreach ($c in $candidates) {
-        if (Test-Path (Join-Path $c 'client.exe')) {
-            $BinDir = $c
-            break
-        }
-    }
-}
-$BinDir = Resolve-ProjectPath $BinDir
-if (-not $OnlyProgram -and -not $OnlyDataset -and (-not $BinDir -or -not (Test-Path (Join-Path $BinDir 'client.exe')))) {
-    throw "client.exe not found; pass -BinDir <bin dir>"
+if (-not $OnlyProgram -and -not $OnlyDataset) {
+    $BinDir = Resolve-PackageBinaryDir -ProjectRoot $root -Explicit $BinDir -Executable 'client.exe' -Config $Config
 }
 
 if (-not $OnlyClient -and -not $OnlyDataset -and -not $StepTestExe) {
@@ -141,11 +133,26 @@ if (-not $OnlyClient -and -not $OnlyDataset -and $Plugin -eq 'coverage' -and -no
 }
 
 $testenv = Join-Path $OutDir 'testenv'
-$clientConfigPath = Join-Path $OutDir 'config\client.json'
+function Assert-SeparateInput([string]$Source, [string]$Destination) {
+    if (-not $Source) { return }
+    $inputPath = [IO.Path]::GetFullPath($Source).TrimEnd('\', '/')
+    $outputPath = [IO.Path]::GetFullPath($Destination).TrimEnd('\', '/')
+    if ($inputPath -eq $outputPath -or $inputPath.StartsWith($outputPath + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Input is inside the directory being replaced; preserve it outside the package first: $inputPath"
+    }
+}
+# Validate all component inputs before replacing any deployed files.
+if (-not $OnlyClient -and -not $OnlyDataset) {
+    Assert-SeparateInput $StepTestExe (Join-Path $testenv 'program')
+    Assert-SeparateInput $EngineSrcDir (Join-Path $testenv 'program')
+    Assert-SeparateInput $OpenCppCoverageDir (Join-Path $testenv 'opencppcoverage')
+}
+if (-not $OnlyClient -and -not $OnlyProgram) {
+    Assert-SeparateInput $DatasetDir (Join-Path $testenv 'dataset')
+}
 $programFileName = if ($StepTestExe) { Split-Path -Leaf $StepTestExe }
     elseif ($Plugin -eq 'stpcompare') { 'Converter.exe' } else { 'StepTest.exe' }
-if ($OnlyClient -and -not $programInputProvided -and (Test-Path -LiteralPath $clientConfigPath)) {
-    $previousConfig = Get-Content -LiteralPath $clientConfigPath -Raw | ConvertFrom-Json
+if ($preserveClientConfig -and -not $programInputProvided) {
     $previousPlugin = $previousConfig.plugins.$Plugin
     $previousProgram = if ($Plugin -eq 'coverage') { $previousPlugin.target_exe } else { $previousPlugin.program_exe }
     if ($previousProgram) { $programFileName = [System.IO.Path]::GetFileName([string]$previousProgram) }
@@ -205,11 +212,6 @@ if (-not $OnlyClient -and -not $OnlyDataset) {
     if (Test-Path $occDir) {
         Assert-OwnedPath $occDir $OutDir | Out-Null
         Remove-Item -LiteralPath $occDir -Recurse -Force
-    }
-    $occSourceName = Split-Path $OpenCppCoverageDir -Leaf
-    if (Test-Path (Join-Path $testenv $occSourceName)) {
-        Assert-OwnedPath (Join-Path $testenv $occSourceName) $OutDir | Out-Null
-        Remove-Item -LiteralPath (Join-Path $testenv $occSourceName) -Recurse -Force
     }
     New-Item -ItemType Directory -Force $occDir | Out-Null
     if (Get-Command robocopy -ErrorAction SilentlyContinue) {
@@ -304,11 +306,65 @@ if (-not $OnlyProgram -and -not $OnlyDataset) {
             register_max_attempts = 5
         }
         plugins = @{ $Plugin = $selectedPlugin }
-    } | ConvertTo-Json -Depth 6
-    [System.IO.File]::WriteAllText(
-        (Join-Path $OutDir 'config\client.json'),
-        $clientCfg,
-        (New-Object System.Text.UTF8Encoding($false)))
+    }
+    if ($preserveClientConfig) {
+        $clientCfg = $previousConfig
+        if ($PSBoundParameters.ContainsKey('Endpoint')) { $clientCfg.scheduler.endpoint = $Endpoint }
+        elseif ($PSBoundParameters.ContainsKey('ServerIp') -or $PSBoundParameters.ContainsKey('ServerPort')) {
+            $oldEndpoint = [string]$clientCfg.scheduler.endpoint
+            if ($oldEndpoint -notmatch '^tcp://(.+):(\d+)$') { throw 'Pass -Endpoint to replace this scheduler endpoint.' }
+            $endpointHost = if ($PSBoundParameters.ContainsKey('ServerIp')) { $ServerIp } else { $Matches[1] }
+            $endpointPort = if ($PSBoundParameters.ContainsKey('ServerPort')) { $ServerPort } else { $Matches[2] }
+            $clientCfg.scheduler.endpoint = "tcp://${endpointHost}:$endpointPort"
+        }
+        if ($PSBoundParameters.ContainsKey('WorkerId')) { $clientCfg.client.worker_id = $WorkerId }
+        if ($PSBoundParameters.ContainsKey('TaskThreads')) { $clientCfg.client.task_threads = $TaskThreads }
+        if ($PSBoundParameters.ContainsKey('Plugin')) {
+            if (-not $clientCfg.plugins.$Plugin) {
+                $oldEnabled = @($clientCfg.plugins.PSObject.Properties | Where-Object { $_.Value.enabled })
+                if ($oldEnabled.Count -eq 1) {
+                    foreach ($name in @('store_type', 'db_conn', 'store_dir', 'program_dir', 'stp_root')) {
+                        if ($oldEnabled[0].Value.PSObject.Properties[$name]) { $selectedPlugin[$name] = $oldEnabled[0].Value.$name }
+                    }
+                }
+                $clientCfg.plugins | Add-Member -NotePropertyName $Plugin -NotePropertyValue ([pscustomobject]$selectedPlugin)
+            }
+            foreach ($property in $clientCfg.plugins.PSObject.Properties) {
+                $property.Value | Add-Member -NotePropertyName enabled -NotePropertyValue ($property.Name -eq $Plugin) -Force
+            }
+        }
+        $targetPlugins = @($clientCfg.plugins.PSObject.Properties | Where-Object { $_.Value.enabled })
+        foreach ($property in $targetPlugins) {
+            $pluginConfig = $property.Value
+            if ($PSBoundParameters.ContainsKey('StoreType')) {
+                $pluginConfig | Add-Member -NotePropertyName store_type -NotePropertyValue $StoreType -Force
+            }
+            if ($PSBoundParameters.ContainsKey('DbConn')) {
+                $pluginConfig | Add-Member -NotePropertyName db_conn -NotePropertyValue $DbConn -Force
+            } else {
+                # libpq uses the last value for repeated connection keywords,
+                # so an explicit field override preserves all other settings.
+                $connection = [string]$pluginConfig.db_conn
+                foreach ($field in @(@('ServerIp', 'host'), @('DbPort', 'port'), @('DbName', 'dbname'), @('DbUser', 'user'), @('DbPassword', 'password'))) {
+                    if ($PSBoundParameters.ContainsKey($field[0])) {
+                        $value = ([string]$PSBoundParameters[$field[0]]).Replace('\', '\\').Replace("'", "\'")
+                        $connection += " $($field[1])='$value'"
+                    }
+                }
+                if ($connection -ne [string]$pluginConfig.db_conn) {
+                    $pluginConfig | Add-Member -NotePropertyName db_conn -NotePropertyValue $connection.Trim() -Force
+                }
+            }
+            if ($property.Name -eq 'coverage') {
+                if ($PSBoundParameters.ContainsKey('StoreCov')) { $pluginConfig.store_cov = [bool]$StoreCov }
+                if ($PSBoundParameters.ContainsKey('EngineDlls')) { $pluginConfig.engine_dlls = @($EngineDlls | ForEach-Object { "testenv/program/$_" }) }
+                if ($PSBoundParameters.ContainsKey('StepTestExe')) { $pluginConfig.target_exe = 'testenv/program/' + $programFileName }
+            } elseif ($property.Name -eq 'stpcompare' -and $PSBoundParameters.ContainsKey('ConverterExe')) {
+                $pluginConfig.program_exe = 'testenv/program/' + $programFileName
+            }
+        }
+    }
+    Write-AtomicText $clientConfigPath ($clientCfg | ConvertTo-Json -Depth 20)
 
     @"
 @echo off

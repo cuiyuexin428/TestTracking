@@ -13,19 +13,25 @@
         <span class="brandmark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
         <div><strong>TestTracking</strong><span>SERVER CONSOLE</span></div>
       </div>
-      <div class="service-state"><span class="dot" id="health-dot"></span><span id="health">正在连接结果服务</span></div>
+      <div class="top-actions">
+        <div class="text-scale" aria-label="界面文字大小">
+          <button type="button" class="icon-button" id="text-smaller" title="缩小界面文字" aria-label="缩小界面文字">A−</button>
+          <button type="button" class="icon-button" id="text-larger" title="放大界面文字" aria-label="放大界面文字">A+</button>
+        </div>
+        <div class="service-state"><span class="dot" id="health-dot"></span><span id="health">正在连接结果服务</span></div>
+      </div>
     </header>
     <div class="shell">
       <nav class="sidebar" aria-label="服务端导航">
         <div class="nav-label">工作空间</div>
         <button type="button" class="nav-item" data-page="overview"><span class="nav-icon">▦</span>运行总览</button>
         <button type="button" class="nav-item" data-page="results" aria-current="page"><span class="nav-icon">⌁</span>结果分析</button>
-        <button type="button" class="nav-item" data-page="clients"><span class="nav-icon">▣</span>客户端<span class="nav-count">待接入</span></button>
+        <button type="button" class="nav-item" data-page="clients"><span class="nav-icon">▣</span>客户端</button>
         <button type="button" class="nav-item" data-page="history"><span class="nav-icon">◷</span>历史运行</button>
         <button type="button" class="nav-item" data-page="plugins"><span class="nav-icon">▤</span>插件与配置</button>
         <button type="button" class="nav-item" data-page="logs"><span class="nav-icon">≡</span>运行日志</button>
         <div class="side-foot">
-          <strong>本地结果服务</strong>
+          <strong>服务端结果服务</strong>
           <div class="status-row"><span class="dot" id="api-dot"></span><span id="api-status">API 连接中</span></div>
           <div class="status-row"><span class="dot warning" id="db-dot"></span><span id="db-status">数据库检查中</span></div>
           <small id="provider-status">AI 接入检查中</small>
@@ -34,18 +40,30 @@
       <main class="main">
         <div class="breadcrumb"><span>工作空间 / <b id="crumb">结果分析</b></span><time id="snapshot-time"></time></div>
         <div class="headline">
-          <div><h1 id="page-title">结果分析</h1><p id="page-subtitle">查看已完成运行的业务结果与差异。</p></div>
+          <div><h1 id="page-title">结果分析</h1><p id="page-subtitle">从已入库结果生成可替换的 Python 交互报告。</p></div>
           <div class="head-actions"><button type="button" class="button" id="ai-toggle">✦ AI 助手</button><button type="button" class="button primary" id="refresh">↻ 刷新</button></div>
         </div>
         <div class="system-notice" id="system-notice" hidden><span class="notice-icon">!</span><div><strong id="notice-title"></strong><span id="notice-detail"></span></div></div>
         <section class="page" id="page-overview" hidden>
+          <section class="management-panel" aria-label="任务运行控制">
+            <div class="panel-head"><h2>调度控制</h2><span class="chip" id="scheduler-status">正在连接调度器</span></div>
+            <form class="management-form" id="run-start-form">
+              <div class="management-field"><label for="run-plugin">执行插件</label><select id="run-plugin" disabled></select></div>
+              <div class="management-field"><label for="run-dataset">数据版本</label><input id="run-dataset" placeholder="例如 d1" required disabled></div>
+              <div class="management-field grow-field"><label for="run-params">运行参数（可选）</label><input id="run-params" placeholder="传给执行插件的参数" disabled></div>
+              <button type="submit" class="button primary" id="run-start" disabled>启动运行</button>
+              <button type="button" class="button" id="run-wakeup" disabled>唤醒客户端</button>
+            </form>
+            <p class="management-status" id="scheduler-command-status" role="status"></p>
+            <div id="active-runs" class="active-runs"></div>
+          </section>
           <div class="metrics">
             <div class="metric"><span>最近运行</span><strong id="metric-runs">0<small>个运行</small></strong><em>最多加载 100 条</em></div>
-            <div class="metric"><span>其中已完成</span><strong id="metric-finished">0<small>个运行</small></strong><em>调度执行已结束</em></div>
-            <div class="metric"><span>成功文件</span><strong id="metric-success">0<small>个</small></strong><em>当前加载记录</em></div>
-            <div class="metric"><span>失败文件</span><strong id="metric-failed">0<small>个</small></strong><em>当前加载记录</em></div>
+            <div class="metric"><span>记录为运行中</span><strong id="metric-finished">0<small>个运行</small></strong><em>非进程在线状态</em></div>
+            <div class="metric"><span>已完成任务</span><strong id="metric-success">0<small>个</small></strong><em>已收到任务结果</em></div>
+            <div class="metric"><span>处理中任务</span><strong id="metric-failed">0<small>个</small></strong><em>已派发或已确认</em></div>
           </div>
-          <div class="section-head"><h2>最近运行<span class="count" id="overview-count"></span></h2><div class="segmented" id="overview-filter"><button data-filter="" aria-pressed="true">全部</button><button data-filter="coverage" aria-pressed="false">coverage</button><button data-filter="stpcompare" aria-pressed="false">stpcompare</button></div></div>
+          <div class="section-head"><h2>最近运行<span class="count" id="overview-count"></span></h2><div class="segmented" id="overview-filter"><button data-filter="" aria-pressed="true">全部</button></div></div>
           <div id="run-cards" class="run-list"></div>
           <div class="recovery"><span class="shield">i</span><div><strong>持久化恢复机制</strong><span>服务端重启后沿用原运行，已完成任务保持完成，未完成任务重新派发。</span></div></div>
         </section>
@@ -57,28 +75,76 @@
             </div>
             <div class="analysis-state waiting" id="analysis-status"><span class="dot warning"></span><span id="analysis-state">等待选择运行</span></div>
           </div>
+          <form class="run-lookup" id="open-run-form">
+            <label for="open-run-id">查找更早的运行</label><input id="open-run-id" placeholder="输入当前结果类型的完整运行 ID" required><button class="button" type="submit">打开运行</button><span id="open-run-status" role="status"></span>
+          </form>
           <div class="result-kpis">
-            <div class="result-kpi"><span>执行状态</span><strong id="execution-status">--</strong></div>
+            <div class="result-kpi"><span>数据可用性</span><strong id="execution-status">--</strong></div>
             <div class="result-kpi"><span>结果完整性</span><strong id="completeness">--<small> / --</small></strong></div>
             <div class="result-kpi"><span id="analysis-label">分析状态</span><strong id="analysis-value">--</strong></div>
           </div>
-          <div id="coverage-view">
-            <div class="result-grid">
-              <article class="result-panel"><div class="panel-head"><h2>覆盖率概览</h2><span class="chip blue">coverage</span></div><div class="bars" id="coverage-bars"></div></article>
-              <article class="result-panel"><div class="panel-head"><h2>文件结果</h2><span class="chip" id="file-total-chip">0 个文件</span></div><div class="donut-wrap"><div class="donut" id="result-donut"><div><strong id="donut-total">0</strong>个文件</div></div><div class="legend"><div><span><i></i>成功</span><strong id="legend-success">0</strong></div><div><span><i class="pending"></i>待定</span><strong id="legend-pending">0</strong></div><div><span><i class="failed"></i>失败</span><strong id="legend-failed">0</strong></div></div></div></article>
+          <section class="analysis-report" aria-label="Python 交互报告">
+            <div class="plugin-view-head">
+              <div><h2>Python 交互报告</h2><p>读取数据库中的结果，可编辑脚本、重新运行，也可让 AI 生成新的展示。</p></div>
+              <div class="head-actions"><button type="button" class="button" id="edit-report-script">编辑 Python</button><button type="button" class="button" id="ai-design-report">✦ AI 生成报告</button><button type="button" class="button primary" id="run-report">运行报告</button></div>
             </div>
-            <div class="section-head"><h2>运行结果<span class="count">派生结果由独立后处理工具发布</span></h2></div>
-            <div class="table-wrap"><table><thead><tr><th>指标</th><th>数值</th><th>状态</th></tr></thead><tbody id="coverage-table"></tbody></table></div>
-          </div>
-          <div id="compare-view" hidden>
-            <div class="section-head"><h2>文本比较结果<span class="count">按长期文件清单统计</span></h2></div>
-            <div class="table-wrap"><table><thead><tr><th>分类</th><th>文件数</th><th>状态</th></tr></thead><tbody id="compare-table"></tbody></table></div>
-          </div>
+            <div class="report-state" id="report-state" role="status">选择运行后可以生成报告。</div>
+            <div class="report-empty" id="report-empty"><strong>把已入库的数据变成你需要的报告</strong><p>先让 AI 检查结果完整性，或直接运行当前插件的 Python 脚本。运行尚未结束时，也可以分析已经入库的数据。</p></div>
+            <!-- Generated report HTML is untrusted. Allow chart scripts but keep an opaque
+                 origin: never add allow-same-origin or grant access to the console APIs. -->
+            <iframe class="report-frame" id="report-frame" title="Python 交互分析报告" sandbox="allow-scripts" hidden></iframe>
+          </section>
+          <details class="plugin-summary">
+            <summary>插件预设摘要</summary>
+            <div class="plugin-view-head">
+            <div><h2 id="plugin-view-title">插件结果</h2><p id="plugin-view-description">展示结构由当前插件定义。</p></div>
+            <div class="head-actions"><button type="button" class="button" id="edit-plugin-view">{ } 编辑 JSON</button><button type="button" class="button" id="ai-design-view">✦ AI 调整摘要</button></div>
+            </div>
+            <div class="view-state" id="plugin-view-state" hidden></div>
+            <div class="plugin-result-view" id="plugin-result-view"></div>
+          </details>
         </section>
-        <section class="page" id="page-clients" hidden><div class="empty-panel"><span>▣</span><h2>客户端实时状态尚未接入</h2><p>结果服务当前只读取长期结果；在线心跳需要 scheduler 管理接口。</p></div></section>
-        <section class="page" id="page-history" hidden><div class="section-head"><h2>最近完成的运行<span class="count" id="history-count"></span></h2></div><div class="table-wrap"><table><thead><tr><th>运行 ID</th><th>插件</th><th>执行状态</th><th>文件结果</th><th>完成时间</th></tr></thead><tbody id="history-table"></tbody></table></div></section>
-        <section class="page" id="page-plugins" hidden><div class="config-grid" id="plugin-grid"></div></section>
-        <section class="page" id="page-logs" hidden><div class="empty-panel"><span>≡</span><h2>运行日志尚未接入</h2><p>发布包会将 scheduler 与结果服务日志写入 data/logs。</p></div></section>
+        <section class="page" id="page-clients" hidden>
+          <div class="section-head"><h2>连接到调度器的客户端<span class="count" id="client-count"></span></h2><button type="button" class="button" id="clients-refresh">刷新客户端</button></div>
+          <p class="management-status" id="clients-status" role="status"></p>
+          <div id="client-list" class="client-list"></div>
+        </section>
+        <section class="page" id="page-history" hidden>
+          <div class="section-head"><h2>全部运行记录<span class="count" id="history-count"></span></h2></div>
+          <form class="run-lookup" id="history-search-form"><label for="history-search">运行 ID</label><input id="history-search" type="search" placeholder="搜索全部历史运行"><button class="button" type="submit">搜索</button></form>
+          <div id="history-status" class="report-state" role="status"></div>
+          <div class="table-wrap"><table><thead><tr><th>运行 ID</th><th>插件</th><th>执行状态</th><th>文件结果</th><th>完成时间</th></tr></thead><tbody id="history-table"></tbody></table></div>
+          <div class="history-pager"><button type="button" class="button" id="history-prev" disabled>上一页</button><span id="history-page">第 1 页</span><button type="button" class="button" id="history-next" disabled>下一页</button></div>
+        </section>
+        <section class="page" id="page-plugins" hidden>
+          <div class="config-grid" id="plugin-grid"></div>
+          <section class="management-panel config-editor">
+            <div class="panel-head"><h2>部署配置</h2><span id="config-dirty" class="chip" hidden>有未保存修改</span></div>
+            <div class="management-form">
+              <div class="management-field"><label for="config-kind">配置文件</label><select id="config-kind"><option value="scheduler">调度服务</option><option value="result_service">结果服务与 AI</option><option value="client">客户端模板</option></select></div>
+              <button type="button" class="button" id="config-reload">读取最新配置</button><button type="button" class="button" id="config-discard" hidden>放弃草稿并重载</button><button type="button" class="button primary" id="config-save" disabled>保存配置</button>
+            </div>
+            <p class="config-path" id="config-path"></p><p class="management-status" id="config-notice"></p>
+            <p class="management-status" id="config-status" role="status"></p>
+            <textarea id="config-json" class="config-json" spellcheck="false" aria-label="部署配置 JSON" disabled></textarea>
+            <p class="config-help">保留 *** 可沿用已有密钥。保存写入配置文件，按提示重启相应服务后生效。</p>
+            <details class="config-reference"><summary>字段说明与当前生效值</summary><div id="config-fields"></div><pre id="config-effective"></pre></details>
+          </section>
+        </section>
+        <section class="page" id="page-logs" hidden>
+          <section class="management-panel">
+            <form class="management-form" id="logs-form">
+              <div class="management-field"><label for="logs-file">日志文件</label><select id="logs-file"><option value="">自动选择</option></select></div>
+              <div class="management-field"><label for="logs-level">级别</label><select id="logs-level"><option value="">全部级别</option><option>DEBUG</option><option>INFO</option><option>WARN</option><option>ERROR</option></select></div>
+              <div class="management-field grow-field"><label for="logs-search">搜索</label><input id="logs-search" type="search" placeholder="搜索运行 ID、客户端或错误"></div>
+              <div class="management-field"><label for="logs-limit">最近行数</label><select id="logs-limit"><option value="200">200</option><option value="500">500</option><option value="2000">2000</option></select></div>
+              <button type="submit" class="button primary" id="logs-refresh">读取日志</button>
+            </form>
+            <label class="inline-check" for="logs-auto"><input type="checkbox" id="logs-auto" checked>每 5 秒刷新</label>
+            <p class="management-status" id="logs-status" role="status"></p>
+            <pre id="logs-output" class="logs-output" tabindex="0" aria-label="日志内容"></pre>
+          </section>
+        </section>
       </main>
       <aside class="assistant" id="assistant">
         <div class="assistant-resize" id="ai-resize" role="separator" aria-label="调整 AI 助手宽度" aria-orientation="vertical" tabindex="0"></div>
@@ -100,22 +166,37 @@
             <span class="conversation-status" id="conversation-status">新会话</span>
           </div>
           <div class="ai-context" id="ai-context">上下文：尚未选择运行</div>
-          <div class="chat" id="chat" aria-live="polite"><div class="message assistant-message">可以直接询问 Codex 或 DSH；选择运行后会自动附加结构化结果。</div></div>
-          <div class="quick-actions" id="quick-actions"><button type="button" data-prompt="分析当前运行的结果完整性">检查完整性</button><button type="button" data-prompt="总结当前运行中需要优先处理的问题">归纳问题</button></div>
-          <form class="compose" id="chat-form"><textarea id="question" rows="3" placeholder="询问 Codex 或 DSH..." required disabled></textarea><div class="compose-actions"><span id="compose-hint">正在检查本机 AI 命令</span><button class="send-button" id="send-button" type="submit" title="发送" aria-label="发送" disabled>➤</button></div></form>
+          <div class="chat" id="chat" aria-live="polite"><div class="message assistant-message">可以直接询问服务器上的 Codex 或 DSH；AI 可查看已入库的运行，检查完整性，并生成 Python 交互报告。</div></div>
+          <div class="quick-actions" id="quick-actions"><button type="button" data-prompt="查看数据库中哪些运行已经有结果可以分析，说明结果完整性和失败情况">哪些结果可分析</button><button type="button" data-prompt="总结当前运行中需要优先处理的问题">归纳问题</button><button type="button" id="design-view-from-chat">生成 Python 报告</button></div>
+          <form class="compose" id="chat-form"><textarea id="question" rows="3" placeholder="询问 Codex 或 DSH..." required disabled></textarea><div class="compose-actions"><span id="compose-hint">正在检查服务器 AI 命令</span><button class="send-button" id="send-button" type="submit" title="发送" aria-label="发送" disabled>➤</button></div></form>
         </section>
         <section class="assistant-view dsh-native" id="dsh-native-panel" role="tabpanel" aria-labelledby="ai-tab-dsh" hidden>
           <div class="dsh-native-state" id="dsh-native-state">
             <strong>DSH 原生界面</strong>
-            <span id="dsh-native-status">切换到此视图后会启动本机 DSH Web。</span>
+            <span id="dsh-native-status">切换到此视图后会启动服务器上的 DSH Web。</span>
             <button type="button" class="button primary" id="dsh-native-open">启动 DSH</button>
           </div>
-          <iframe id="dsh-native-frame" title="DSH 原生界面" hidden></iframe>
+          <!-- DSH is the trusted server account's installed application, proxied on this
+               origin for its HTTP/WebSocket UI. It shares console privileges; unlike
+               generated reports, this frame is deliberately not a sandbox boundary. -->
+          <div class="dsh-native-viewport"><iframe id="dsh-native-frame" title="DSH 原生界面" hidden></iframe></div>
         </section>
       </aside>
     </div>
     <footer><span><span class="dot" id="footer-dot"></span><span id="footer-status">结果服务连接中</span></span><span>执行状态 · 结果完整性 · 分析状态独立展示</span></footer>
   </div>
+  <dialog class="view-editor-dialog" id="report-editor-dialog">
+    <div class="view-editor-head"><div><strong id="report-editor-title">编辑 Python 报告脚本</strong><span id="report-editor-plugin"></span></div><button type="button" class="icon-button" id="close-report-editor" title="关闭" aria-label="关闭">×</button></div>
+    <p class="report-editor-help">脚本只读取数据库中的结果，返回独立的 HTML 报告。可在报告内添加图表、筛选和交互。</p>
+    <div class="report-candidate-picker" id="report-candidate-picker" hidden><label for="report-candidate-index">AI 候选脚本</label><select id="report-candidate-index"></select></div>
+    <textarea id="report-editor-text" spellcheck="false" aria-label="Python 报告脚本"></textarea>
+    <div class="view-editor-actions"><span id="report-editor-status">保存后可用于当前插件的其他运行。</span><div class="head-actions"><button type="button" class="button" id="save-report-editor">保存脚本</button><button type="button" class="button primary" id="save-run-report-editor">保存并运行</button></div></div>
+  </dialog>
+  <dialog class="view-editor-dialog" id="view-editor-dialog">
+    <div class="view-editor-head"><div><strong>编辑插件展示</strong><span id="view-editor-plugin"></span></div><button type="button" class="icon-button" id="close-view-editor" title="关闭" aria-label="关闭">×</button></div>
+    <textarea id="view-editor-text" spellcheck="false" aria-label="插件展示 JSON"></textarea>
+    <div class="view-editor-actions"><span id="view-editor-status">保存后立即应用到结果页</span><button type="button" class="button primary" id="save-view-editor">保存并应用</button></div>
+  </dialog>
   <script src="/app.js"></script>
 </body>
 </html>

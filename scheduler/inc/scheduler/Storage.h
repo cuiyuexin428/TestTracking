@@ -41,13 +41,12 @@ class Storage {
     bool ActivateRun(const std::string& run_id, const std::string& plugin_type);
     bool FinishRun(const std::string& run_id, const std::string& status);
     bool LoadUnfinishedRuns(std::vector<RunRecord>& runs);
-    bool ResumeRun(const std::string& run_id);
+    bool RestoreRun(const std::string& run_id, const std::string& plugin_type);
     bool SaveTask(const std::string& task_id, const std::string& run_id,
                   const std::string& client_identity, const std::string& payload,
                   const std::string& attempt_id);
     bool AckTask(const std::string& task_id);
     bool ReportTask(const std::string& task_id, const common::TaskResult& result);
-    bool ReconcileCompletedTasks(const std::string& run_id, const std::string& plugin_type);
     bool ReclaimTasks(const std::vector<std::string>& task_ids);
 
    private:

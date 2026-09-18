@@ -4,6 +4,7 @@
 #include "heartbeat.pb.h"
 
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 namespace common {
@@ -17,6 +18,7 @@ struct ClientInfo {
     std::int64_t last_seen_age_ms = 0;  // filled by the scheduler snapshot
     bool registered = false;            // filled by the scheduler snapshot
     std::string peer_address;           // server-observed ip:port of the client
+    std::string registration_payload;   // opaque plugin metadata from the accepted registration
 };
 
 // Run request.
@@ -32,6 +34,13 @@ struct ValidationResult {
     bool accepted = false;
     std::string reply_payload;
     std::string reason;
+};
+
+// A valid durable run is temporarily incompatible with the deployment. Startup
+// must preserve its recovery index so restoring the original deployment can retry.
+class RecoveryBlocked : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
 };
 
 // Server plugin base class. plugin_type anchors the server plugin and the

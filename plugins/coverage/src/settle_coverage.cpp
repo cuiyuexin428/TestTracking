@@ -132,8 +132,7 @@ bool EnsureDerivedSchema(PGconn* conn) {
         " percent double precision, finished_at timestamptz);"
         "CREATE TABLE IF NOT EXISTS coverage_cumulative_cov ("
         " run_id text PRIMARY KEY, cov bytea, updated_at timestamptz DEFAULT now());";
-    QueryResult result(PQexec(conn, ddl), PQclear);
-    if (!result || PQresultStatus(result.get()) != PGRES_COMMAND_OK) {
+    if (!common::PgInitializeSchema(conn, ddl)) {
         LOG_ERROR("coverage_settle: schema init failed: " << PQerrorMessage(conn));
         return false;
     }
@@ -165,7 +164,6 @@ bool BackfillLegacyRun(PGconn* conn,const Args& args) {
 
 bool LoadCompleteRun(PGconn* conn,const Args& args,
                       std::unordered_map<std::string,std::set<std::uint64_t>>* files) {
-    if(!common::EnsurePluginResultSchema(conn)) return false;
     auto run=Query(conn,"SELECT expected_files::text,status FROM plugin_runs "
                         "WHERE run_id=$1 AND plugin_type='coverage'",args.run_id);
     if(!run) return false;
@@ -269,14 +267,16 @@ bool RunSettle(const Args& args) {
         LOG_ERROR("coverage_settle: another post-processor is settling this run");
         return false;
     }
+    // Schema setup uses short transactions. Never retain the shared schema
+    // lock while an external merge tool runs: execution clients may start then.
+    if (!common::EnsurePluginResultSchema(conn.get()) || !EnsureDerivedSchema(conn.get())) return false;
     Transaction transaction{conn.get()};
     if (!transaction.begin()) return false;
     std::unordered_map<std::string, std::set<std::uint64_t>> file_points;
     if (!LoadCompleteRun(conn.get(), args, &file_points)) return false;
     std::set<std::uint64_t> cumulative;
     const auto selected = coverage_plugin::SelectGreedyMinSet(file_points, &cumulative);
-    if (!EnsureDerivedSchema(conn.get()) ||
-        !common::PgExec(conn.get(), "DELETE FROM coverage_selected WHERE run_id=$1",
+    if (!common::PgExec(conn.get(), "DELETE FROM coverage_selected WHERE run_id=$1",
                         {{args.run_id, false}})) return false;
     for (const auto& file : selected) {
         if (!common::PgExec(conn.get(),

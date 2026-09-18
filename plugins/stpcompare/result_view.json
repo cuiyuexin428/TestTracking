@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "plugin": "stpcompare",
+  "title": "STP 文本比较",
+  "description": "按文件展示转换前后文本的一致性统计。",
+  "primary_metric": {
+    "label": "存在差异",
+    "value": "analysis.different",
+    "format": "integer",
+    "suffix": " 个文件",
+    "tone": "warning",
+    "empty": "--"
+  },
+  "widgets": [
+    {
+      "id": "comparison_summary",
+      "type": "metrics",
+      "title": "比较结论",
+      "items": [
+        {"label": "相同", "value": "analysis.same", "format": "integer", "tone": "success"},
+        {"label": "不同", "value": "analysis.different", "format": "integer", "tone": "warning"},
+        {"label": "不完整", "value": "analysis.incomplete", "format": "integer", "tone": "danger"}
+      ]
+    }
+  ],
+  "empty_states": {
+    "pending": "等待 stpcompare 后处理结果。",
+    "error": "stpcompare 后处理结果读取失败，请检查结果服务日志。",
+    "not_configured": "stpcompare 后处理表尚未配置。",
+    "not_selected": "请选择一个 stpcompare 运行。"
+  }
+}

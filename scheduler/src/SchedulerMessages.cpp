@@ -107,6 +107,7 @@ void Scheduler::HandleRegister(const IncomingMessage& msg) {
     client.identity = msg.identity;
     client.plugin_type = type;
     client.peer_address = msg.peer_address;
+    client.registration_payload = request.payload();
     std::string previous_session;
     {
         std::lock_guard<std::mutex> lock(clients_mutex_);

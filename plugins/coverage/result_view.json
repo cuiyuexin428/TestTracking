@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "plugin": "coverage",
+  "title": "覆盖率结果",
+  "description": "覆盖率后处理生成的精简用例和累计覆盖摘要。",
+  "primary_metric": {
+    "label": "行覆盖率",
+    "value": "analysis.percent",
+    "format": "percent",
+    "tone": "accent",
+    "empty": "--"
+  },
+  "widgets": [
+    {
+      "id": "coverage_progress",
+      "type": "progress",
+      "title": "覆盖摘要",
+      "items": [
+        {
+          "label": "覆盖行",
+          "value": "analysis.covered_lines",
+          "total": "analysis.total_lines",
+          "format": "integer",
+          "tone": "success"
+        },
+        {
+          "label": "精简用例",
+          "value": "analysis.selected_files",
+          "total": "analysis.total_files",
+          "format": "integer",
+          "tone": "accent"
+        }
+      ]
+    },
+    {
+      "id": "coverage_details",
+      "type": "key_value",
+      "title": "分析数据",
+      "items": [
+        {"label": "总文件", "value": "analysis.total_files", "format": "integer"},
+        {"label": "精简用例", "value": "analysis.selected_files", "format": "integer"},
+        {"label": "累计覆盖点", "value": "analysis.cumulative_points", "format": "integer"},
+        {"label": "覆盖行", "value": "analysis.covered_lines", "format": "integer"},
+        {"label": "总行数", "value": "analysis.total_lines", "format": "integer"},
+        {"label": "完成时间", "value": "analysis.finished_at", "format": "datetime"}
+      ]
+    }
+  ],
+  "empty_states": {
+    "pending": "等待 coverage 后处理结果。",
+    "error": "coverage 后处理结果读取失败，请检查结果服务日志。",
+    "not_configured": "coverage 后处理尚未配置。",
+    "not_selected": "请选择一个 coverage 运行。"
+  }
+}

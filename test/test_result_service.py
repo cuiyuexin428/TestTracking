@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from result_service.app.config import ProviderConfig, ServiceConfig
-from result_service.app.plugins import CoverageResultPlugin, ResultPluginError
+from result_service.app.plugins import ResultPluginError, default_plugins
 from result_service.app.providers import (
     CodexProvider,
     DshWebManager,
@@ -45,7 +45,7 @@ class _Rows:
 
 class _RepositoryConnection:
     def execute(self, query, params=()):
-        if query.startswith("SELECT run_id"):
+        if query.startswith("SELECT p.run_id"):
             return _Rows(one={"run_id": "run-1", "plugin_type": "coverage",
                               "expected_files": 2, "status": "finished"})
         if query.startswith("SELECT status"):
@@ -96,6 +96,28 @@ class _ReadyConnection:
         if self.fail_on and self.fail_on in query:
             raise RuntimeError("relation unavailable")
         return _Rows()
+
+
+class _ListRunsConnection:
+    def __init__(self, runs, task_counts=None, scheduler_runs=None):
+        self.runs = runs
+        self.task_counts = task_counts or []
+        self.scheduler_runs = scheduler_runs or []
+        self.queries = []
+
+    @contextmanager
+    def transaction(self):
+        yield
+
+    def execute(self, query, params=()):
+        self.queries.append((query, params))
+        if query.startswith("SELECT r.run_id"):
+            return _Rows(all_rows=self.runs)
+        if query.startswith("SELECT run_id, status, count(*)"):
+            return _Rows(all_rows=self.task_counts)
+        if query.startswith("SELECT run_id, status, finished_at FROM runs"):
+            return _Rows(all_rows=self.scheduler_runs)
+        raise AssertionError(f"unexpected query: {query}")
 
 
 class ResultServiceContractTests(unittest.TestCase):
@@ -202,7 +224,7 @@ class ProviderPromptTests(unittest.TestCase):
     def test_codex_default_invocation_keeps_local_permission_policy(self) -> None:
         provider = CodexProvider(ServiceConfig.defaults().providers["codex"])
         with patch("result_service.app.providers.resolve_provider_command", return_value="codex"), \
-                patch("result_service.app.providers.subprocess.run") as run:
+                patch("result_service.app.providers._run_command") as run:
             run.return_value.returncode = 0
             run.return_value.stdout = '\n'.join([
                 '{"type":"thread.started","thread_id":"123e4567-e89b-12d3-a456-426614174000"}',
@@ -223,7 +245,7 @@ class ProviderPromptTests(unittest.TestCase):
         conversation_id = "123e4567-e89b-12d3-a456-426614174000"
         provider = CodexProvider(ServiceConfig.defaults().providers["codex"])
         with patch("result_service.app.providers.resolve_provider_command", return_value="codex"), \
-                patch("result_service.app.providers.subprocess.run") as run:
+                patch("result_service.app.providers._run_command") as run:
             run.return_value.returncode = 0
             run.return_value.stdout = (
                 '{"type":"item.completed","item":{"type":"agent_message","text":"continued"}}'
@@ -239,7 +261,7 @@ class ProviderPromptTests(unittest.TestCase):
 
     def test_codex_rejects_non_uuid_conversation_before_execution(self) -> None:
         provider = CodexProvider(ServiceConfig.defaults().providers["codex"])
-        with patch("result_service.app.providers.subprocess.run") as run:
+        with patch("result_service.app.providers._run_command") as run:
             with self.assertRaisesRegex(ProviderError, "invalid Codex conversation id"):
                 provider.complete("continue", {}, "--last")
 
@@ -303,6 +325,18 @@ class ProviderPromptTests(unittest.TestCase):
         self.assertIn('{"run_id":"run-1"}', result)
         self.assertTrue(result.endswith("Question: Summarize"))
 
+    def test_plugin_view_schema_reaches_provider_without_depth_truncation(self) -> None:
+        schema = ResultService(ServiceConfig.defaults()).plugin_views.schema()
+
+        prompt = _build_prompt("design a result view", {
+            "purpose": "plugin_result_view_design",
+            "view_schema": schema,
+        })
+
+        self.assertNotIn("<depth-limit>", prompt)
+        self.assertIn('"data_table"', prompt)
+        self.assertIn('"required": ["id", "type", "title", "source", "columns"]', prompt)
+
     def test_plain_multiline_provider_output_is_preserved(self) -> None:
         output = "Summary:\n- first\n- second\n"
 
@@ -325,11 +359,13 @@ class DshWebManagerTests(unittest.TestCase):
         process.poll.return_value = None
         response = MagicMock()
         response.__enter__.return_value.status = 200
+        response.__enter__.return_value.read.return_value = b'__DSH_BOOT__'
 
         with patch("result_service.app.providers.resolve_provider_command", return_value="dsh"), \
                 patch.object(manager, "_free_loopback_port", return_value=56335), \
                 patch("result_service.app.providers.subprocess.Popen", return_value=process) as popen, \
-                patch("result_service.app.providers.urlopen", return_value=response):
+                patch("result_service.app.providers.urlopen", return_value=response), \
+                patch.object(manager, "_api_ready", return_value=True):
             first_url = manager.start()
             second_url = manager.start()
 
@@ -337,8 +373,8 @@ class DshWebManagerTests(unittest.TestCase):
         self.assertEqual(first_url, second_url)
         popen.assert_called_once()
         argv = popen.call_args.args[0]
-        self.assertEqual(["--profile", "web", "--host", "127.0.0.1",
-                          "--port", "56335", "--no-open"], argv[-7:])
+        self.assertIn("--patch", argv)
+        self.assertEqual(["--host", "127.0.0.1", "--port", "56335", "--no-open"], argv[-5:])
 
         with patch.object(manager, "_stop_process") as stop_process:
             manager.close()
@@ -351,7 +387,7 @@ class DshWebManagerTests(unittest.TestCase):
             status, payload = service.start_dsh_web()
 
         self.assertEqual(200, status)
-        self.assertEqual({"url": "http://127.0.0.1:56335/"}, payload)
+        self.assertEqual({"url": "/ai/dsh/"}, payload)
 
     def test_service_does_not_start_dsh_web_when_command_is_unavailable(self) -> None:
         service = ResultService(ServiceConfig.defaults())
@@ -391,6 +427,119 @@ class RepositoryReadinessTests(unittest.TestCase):
 
         self.assertFalse(self.repository_with(connection).ready())
 
+    def test_analysis_readiness_does_not_require_scheduler_tasks(self) -> None:
+        connection = _ReadyConnection("FROM tasks")
+
+        self.assertTrue(self.repository_with(connection).ready())
+
+
+class RepositoryRunProgressTests(unittest.TestCase):
+    def repository_with(self, connection):
+        repository = PostgresRepository("unused", {})
+
+        @contextmanager
+        def connect():
+            yield connection
+
+        repository._connect = connect
+        return repository
+
+    def test_list_runs_includes_task_totals_and_status_counts(self) -> None:
+        runs = [{
+            "run_id": "run-1", "plugin_type": "coverage", "success_files": 4,
+            "failed_files": 1,
+        }]
+        connection = _ListRunsConnection(runs, [
+            {"run_id": "run-1", "status": "reported", "count": 4},
+            {"run_id": "run-1", "status": "acked", "count": 2},
+            {"run_id": "run-1", "status": "dispatched", "count": 1},
+            {"run_id": "run-1", "status": "reclaimed", "count": 1},
+            {"run_id": "run-1", "status": "queued", "count": 3},
+        ])
+
+        result = self.repository_with(connection).list_runs("coverage", 25)
+
+        self.assertEqual(11, result[0]["total_tasks"])
+        self.assertEqual({
+            "reported": 4,
+            "acked": 2,
+            "dispatched": 1,
+            "reclaimed": 1,
+            "pending": 0,
+            "queued": 3,
+        }, result[0]["task_status_counts"])
+        self.assertEqual(4, result[0]["success_files"])
+        self.assertEqual(1, result[0]["failed_files"])
+        task_query, task_params = next(
+            item for item in connection.queries if "FROM tasks" in item[0]
+        )
+        self.assertIn("FROM tasks", task_query)
+        self.assertEqual((["run-1"],), task_params)
+
+    def test_list_runs_returns_zero_progress_without_task_rows(self) -> None:
+        runs = [{
+            "run_id": "legacy-run", "plugin_type": "coverage", "success_files": 2,
+            "failed_files": 0,
+        }]
+        connection = _ListRunsConnection(runs)
+
+        result = self.repository_with(connection).list_runs()
+
+        self.assertEqual(0, result[0]["total_tasks"])
+        self.assertEqual({
+            "reported": 0,
+            "acked": 0,
+            "dispatched": 0,
+            "reclaimed": 0,
+            "pending": 0,
+        }, result[0]["task_status_counts"])
+        self.assertEqual(2, result[0]["success_files"])
+        self.assertTrue(any("FROM tasks" in query for query, _ in connection.queries))
+
+    def test_planned_task_count_includes_tasks_not_dispatched_yet(self) -> None:
+        runs = [{
+            "run_id": "run-1", "plugin_type": "coverage", "planned_tasks": 20,
+            "success_files": 4, "failed_files": 1,
+        }]
+        connection = _ListRunsConnection(runs, [
+            {"run_id": "run-1", "status": "reported", "count": 8},
+            {"run_id": "run-1", "status": "acked", "count": 2},
+            {"run_id": "run-1", "status": "reclaimed", "count": 1},
+        ])
+
+        result = self.repository_with(connection).list_runs()
+
+        self.assertEqual(20, result[0]["total_tasks"])
+        self.assertEqual(9, result[0]["task_status_counts"]["pending"])
+
+    def test_scheduler_run_status_overrides_plugin_plan_status(self) -> None:
+        runs = [{
+            "run_id": "run-1", "plugin_type": "coverage", "status": "planned",
+            "finished_at": None, "success_files": 0, "failed_files": 0,
+        }]
+        connection = _ListRunsConnection(
+            runs,
+            scheduler_runs=[{
+                "run_id": "run-1", "status": "running", "finished_at": None,
+            }],
+        )
+
+        result = self.repository_with(connection).list_runs()
+
+        self.assertEqual("running", result[0]["status"])
+
+    def test_finished_pruned_run_keeps_complete_progress(self) -> None:
+        runs = [{
+            "run_id": "old-run", "plugin_type": "coverage", "status": "finished",
+            "planned_tasks": 12, "success_files": 12, "failed_files": 0,
+        }]
+
+        result = self.repository_with(_ListRunsConnection(runs)).list_runs()
+
+        self.assertEqual(12, result[0]["total_tasks"])
+        self.assertEqual(12, result[0]["task_status_counts"]["reported"])
+        self.assertEqual(0, result[0]["task_status_counts"]["pending"])
+
 
 class RepositoryAnalysisStatusTests(unittest.TestCase):
     def get_run(self, plugin):
@@ -408,6 +557,28 @@ class RepositoryAnalysisStatusTests(unittest.TestCase):
 
         self.assertEqual("ready", result["analysis_status"])
         self.assertEqual({"percent": 80}, result["analysis"])
+
+    def test_run_detail_uses_scheduler_execution_status(self) -> None:
+        class Connection(_RepositoryConnection):
+            def execute(self, query, params=()):
+                if query.startswith("SELECT p.run_id"):
+                    return _Rows(one={
+                        "run_id": "run-1", "plugin_type": "coverage",
+                        "expected_files": 2, "status": "running",
+                    })
+                return super().execute(query, params)
+
+        repository = PostgresRepository("unused", {
+            "coverage": _AnalysisPlugin(result={"percent": 50}),
+        })
+
+        @contextmanager
+        def connect():
+            yield Connection()
+
+        repository._connect = connect
+
+        self.assertEqual("running", repository.get_run("run-1", "coverage")["status"])
 
     def test_missing_analysis_row_is_pending(self) -> None:
         result = self.get_run(_AnalysisPlugin())
@@ -432,7 +603,7 @@ class CoverageAnalysisTests(unittest.TestCase):
     def test_missing_summary_table_is_pending(self) -> None:
         connection = _CoverageConnection(None)
 
-        result = CoverageResultPlugin().summary(connection, "run-1")
+        result = default_plugins(None)["coverage"].summary(connection, "run-1")
 
         self.assertEqual({}, result)
         self.assertFalse(connection.summary_queried)
@@ -441,7 +612,7 @@ class CoverageAnalysisTests(unittest.TestCase):
         summary = {"run_id": "run-1", "percent": 80}
         connection = _CoverageConnection("coverage_run_summary", summary)
 
-        result = CoverageResultPlugin().summary(connection, "run-1")
+        result = default_plugins(None)["coverage"].summary(connection, "run-1")
 
         self.assertEqual(summary, result)
         self.assertTrue(connection.summary_queried)
@@ -476,6 +647,19 @@ class WindowsProviderDiscoveryTests(unittest.TestCase):
 
             self.assertEqual(["cmd.exe", "/d", "/c", str(executable.resolve()),
                               "--profile", "headless"], argv)
+
+    def test_portable_dsh_command_is_found_without_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            executable = Path(temp_dir) / "dsh" / "dsh.cmd"
+            executable.parent.mkdir(parents=True)
+            executable.touch()
+            config = ProviderConfig(name="dsh", command="dsh")
+            environment = {"LOCALAPPDATA": temp_dir, "APPDATA": "", "USERPROFILE": "", "PNPM_HOME": ""}
+            with patch.dict(os.environ, environment, clear=True), \
+                    patch("result_service.app.providers.shutil.which", return_value=None):
+                resolved = resolve_provider_command(config)
+
+            self.assertEqual(executable.resolve(), Path(resolved))
 
     def test_directory_is_not_an_available_command(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
