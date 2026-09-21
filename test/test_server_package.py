@@ -220,6 +220,7 @@ class ServerPackageSmoke(unittest.TestCase):
         self.assertEqual("0.0.0.0", config["host"])
         self.assertTrue((self.package / "result_service" / "plugin_adapters" / "coverage.py").is_file())
         self.assertTrue((self.package / "data" / "result_views" / "coverage.json").is_file())
+        self.assertTrue((self.package / "result_service" / "plugin_ai_contexts" / "coverage.md").is_file())
         self.assertTrue((self.package / "result_service" / "report_templates" / "coverage.py").is_file())
         self.assertTrue((self.package / "tools" / "open_result_service_firewall.ps1").is_file())
         port = free_port()

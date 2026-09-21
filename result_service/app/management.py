@@ -22,9 +22,10 @@ from .config import ServiceConfig
 
 
 class ManagementError(Exception):
-    def __init__(self, message: str, status: int = 400):
+    def __init__(self, message: str, status: int = 400, *, details: dict[str, Any] | None = None):
         super().__init__(message)
         self.status = status
+        self.details = details or {}
 
 
 _MASK = "***"
@@ -45,7 +46,7 @@ _STRING_KEYS = {"host", "db_conn", "endpoint", "router_endpoint", "worker_id", "
                 "info_file", "info_new_file", "command", "prompt_mode", "management_endpoint"}
 _PATH_KEYS = {"workspace", "static_dir", "plugin_views_dir", "plugin_adapters_dir",
               "analysis_scripts_dir", "analysis_reports_dir", "report_templates_dir",
-              "scheduler_config_path", "client_config_path", "logs_dir", "cwd"}
+              "artifact_store_dir", "scheduler_config_path", "client_config_path", "logs_dir", "cwd"}
 _LABELS = {
     "server.router_endpoint": ("任务服务监听地址", "客户端连接此地址对应的服务器 IP 和端口。"),
     "server.client_timeout_ms": ("客户端超时（毫秒）", "超过此时间未收到心跳，回收客户端任务。"),
@@ -54,12 +55,18 @@ _LABELS = {
     "scheduler.endpoint": ("服务端地址", "客户端连接的 ZeroMQ 地址，如 tcp://192.168.1.10:5555。"),
     "client.worker_id": ("客户端标识", "每台运行中的客户端必须使用不同标识。"),
     "client.task_threads": ("并行任务数", "单台客户端同时执行的任务数。"),
+    "client.execution_windows": ("任务执行时间窗", "只在时间窗内领取新任务，已开始任务继续完成。"),
+    "client.update_windows": ("部署更新时间窗", "供客户端制品更新使用，与任务执行时间窗独立。"),
     "host": ("网页监听地址", "0.0.0.0 允许局域网访问。"),
     "port": ("网页端口", "修改后需重启结果服务并访问新端口。"),
     "scheduler_management_url": ("本机调度管理地址", "仅接受本机 HTTP 地址；调度器离线不影响数据库分析。"),
     "scheduler_config_path": ("调度器配置文件", "相对路径以结果服务配置文件所在目录为基准。"),
     "client_config_path": ("本机客户端配置或模板", "仅修改此文件，不会远程修改已部署客户端。"),
     "logs_dir": ("日志目录", "页面只能读取此目录下的日志文件。"),
+    "providers.dsh.command": ("DSH 命令", "服务器上 dsh 命令或 dsh.cmd 的完整路径；助手固定启动 DSH 原生 Web 界面。"),
+    "providers.dsh.cwd": ("DSH 工作目录", "留空沿用结果服务工作目录；所有路径属于服务器，修改后重启结果服务生效。"),
+    "providers.dsh.args": ("旧版命令参数", "为兼容旧配置保留；原生界面固定使用 web profile，不读取此字段。"),
+    "providers.dsh.prompt_mode": ("旧版提示词模式", "为兼容旧配置保留；原生界面不读取此字段。"),
 }
 
 
@@ -181,6 +188,23 @@ def _local_management_url(value: Any) -> str:
 
 
 def _validate(kind: str, value: dict[str, Any]) -> None:
+    def validate_windows(settings: dict[str, Any], key: str) -> None:
+        windows = settings.get(key, [])
+        if not isinstance(windows, list):
+            raise ManagementError(f"client.{key} 必须是数组")
+        for index, window in enumerate(windows):
+            path = f"client.{key}[{index}]"
+            if not isinstance(window, dict):
+                raise ManagementError(f"{path} 必须是对象")
+            for name in ("start", "end"):
+                if not isinstance(window.get(name), str) or not re.fullmatch(
+                        r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", window[name]):
+                    raise ManagementError(f"{path}.{name} 必须是 HH:MM")
+            days = window.get("days", [])
+            if (not isinstance(days, list) or any(isinstance(day, bool) or not isinstance(day, int)
+                                                   or day < 1 or day > 7 for day in days)):
+                raise ManagementError(f"{path}.days 必须是 1（周一）到 7（周日）的整数数组")
+
     def walk(item: Any, path: str = "") -> None:
         if not isinstance(item, dict):
             return
@@ -216,6 +240,10 @@ def _validate(kind: str, value: dict[str, Any]) -> None:
             if key in {"args", "engine_dlls"} and (
                     not isinstance(child, list) or not all(isinstance(part, str) for part in child)):
                 raise ManagementError(f"{here} 必须是字符串数组")
+            if key == "artifact_import_roots" and (
+                    not isinstance(child, list) or not all(
+                        isinstance(part, str) and part.strip() for part in child)):
+                raise ManagementError(f"{here} 必须是非空路径字符串数组")
             if key == "prompt_mode" and child not in {"stdin", "argument"}:
                 raise ManagementError(f"{here} 必须是 stdin 或 argument")
             walk(child, here)
@@ -232,8 +260,10 @@ def _validate(kind: str, value: dict[str, Any]) -> None:
                 raise ManagementError(f"plugins.{name}.dll 不能为空")
         if kind == "client":
             if sum(item.get("enabled", False) is True for item in value["plugins"].values()) != 1:
-                raise ManagementError("每个客户端必须且只能启用一个执行插件")
+                raise ManagementError("客户端必须恰好启用一个执行插件")
             settings = value["client"]
+            validate_windows(settings, "execution_windows")
+            validate_windows(settings, "update_windows")
             if settings.get("request_backoff_initial_ms", 200) > settings.get("request_backoff_max_ms", 30000):
                 raise ManagementError("request_backoff_initial_ms 不能大于 request_backoff_max_ms")
         elif "management_endpoint" in value["server"]:
@@ -313,11 +343,23 @@ class ManagementService:
                 raise ManagementError("调度器返回了无效响应", 502)
             return result
         except HTTPError as exc:
+            details = {}
             try:
-                error = json.loads(exc.read(65536).decode("utf-8")).get("error", str(exc))
+                rejection = json.loads(exc.read(65536).decode("utf-8"))
+                error = rejection.get("error", str(exc)) if isinstance(rejection, dict) else str(exc)
+                # Keep the duplicate-work contract through the local proxy.
+                # Other upstream error fields are not public console metadata.
+                if isinstance(rejection, dict) and rejection.get("duplicate") is True:
+                    details["duplicate"] = True
+                    for key in ("run_id", "status"):
+                        if isinstance(rejection.get(key), str):
+                            details[key] = rejection[key]
+                    if isinstance(rejection.get("force_rerun_available"), bool):
+                        details["force_rerun_available"] = rejection["force_rerun_available"]
             except (ValueError, UnicodeError):
                 error = str(exc)
-            raise ManagementError(str(error), exc.code if 400 <= exc.code < 600 else 502) from exc
+            raise ManagementError(str(error), exc.code if 400 <= exc.code < 600 else 502,
+                                  details=details) from exc
         except (URLError, OSError, TimeoutError) as exc:
             raise ManagementError("调度服务不可用，请检查调度进程及本机管理端口", 503) from exc
         except (ValueError, UnicodeError) as exc:
@@ -326,13 +368,23 @@ class ManagementService:
     def get_status(self) -> dict[str, Any]:
         try:
             result = self._request("/status")
-            return {"online": True, "clients": [], "plugins": [], "active_runs": [], "in_flight": 0,
+            return {"online": True, "clients": [], "plugins": [], "active_runs": [],
+                    "queued_runs": [], "in_flight": 0,
                     **result}
         except ManagementError as exc:
             return {"online": False, "reason": str(exc), "clients": [], "plugins": [],
-                    "active_runs": [], "in_flight": 0}
+                    "active_runs": [], "queued_runs": [], "in_flight": 0}
 
     def command(self, body: dict[str, Any]) -> dict[str, Any]:
+        # Installation/binding and UI task submission share the same lock.
+        with self._lock:
+            if isinstance(body, dict) and body.get("action") == "run":
+                path = self._path("scheduler")
+                if path and path.is_file() and self.get_config("scheduler")["restart_required"]:
+                    raise ManagementError("服务端配置已修改，请重启调度器使新配置生效后再创建任务", 409)
+            return self._command(body)
+
+    def _command(self, body: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(body, dict):
             raise ManagementError("命令必须是 JSON 对象")
         action = body.get("action")
@@ -342,6 +394,8 @@ class ManagementService:
         if not isinstance(plugin, str) or (action != "wakeup" and not plugin.strip()):
             raise ManagementError("plugin_type 不能为空")
         payload = {"action": action, "plugin_type": plugin.strip()}
+        if action != "run" and "worker_ids" in body:
+            raise ManagementError("worker_ids 仅适用于 run 命令")
         if action == "run":
             version = body.get("dataset_version", "")
             if not isinstance(version, str) or not version.strip():
@@ -350,11 +404,71 @@ class ManagementService:
             if not isinstance(params, (str, dict)):
                 raise ManagementError("params 必须是字符串或 JSON 对象")
             payload.update(dataset_version=version.strip(), params=params)
+            worker_ids = body.get("worker_ids", [])
+            if (not isinstance(worker_ids, list) or any(
+                    not isinstance(worker, str) or not worker.strip()
+                    or len(worker.encode("utf-8")) > 255
+                    or any(ord(character) < 32 or ord(character) == 127 for character in worker)
+                    for worker in worker_ids)):
+                raise ManagementError("worker_ids 必须是非空客户端标识字符串数组，每项不超过 255 字节")
+            payload["worker_ids"] = sorted(set(worker_ids))
+            force_rerun = body.get("force_rerun", False)
+            if not isinstance(force_rerun, bool):
+                raise ManagementError("force_rerun 必须是布尔值")
+            reason = body.get("force_rerun_reason", "")
+            if not isinstance(reason, str):
+                raise ManagementError("force_rerun_reason 必须是字符串")
+            if force_rerun and not reason.strip():
+                raise ManagementError("强制重跑需要填写原因")
+            if not force_rerun and "force_rerun_reason" in body:
+                raise ManagementError("force_rerun_reason 需要 force_rerun=true")
+            payload["force_rerun"] = force_rerun
+            if force_rerun:
+                payload["force_rerun_reason"] = reason.strip()
         if "run_id" in body:
             if not isinstance(body["run_id"], str):
                 raise ManagementError("run_id 必须是字符串")
             payload["run_id"] = body["run_id"]
         return self._request("/commands", payload)
+
+    def require_plugin_idle(self, plugin: str) -> None:
+        """Guard deployment changes against live and durable unfinished work.
+
+        Caller holds _lock through the config write. Offline is permitted only
+        when the scheduler's own database confirms there is no recoverable run.
+        """
+        path = self._path("scheduler")
+        if path is None:
+            raise ManagementError("未配置服务端配置文件", 409)
+        _, config = self._read_config(path)
+        status = self.get_status()
+        loaded = status.get("config_path")
+        if status.get("online") and loaded and Path(loaded).resolve() != path:
+            raise ManagementError("在线调度器加载的是另一份配置，无法安全发布插件", 409)
+        for collection in ("active_runs", "queued_runs", "unfinished_runs"):
+            for run in status.get(collection, []):
+                if run.get("plugin_type") == plugin:
+                    raise ManagementError(f"插件 {plugin} 还有未完成或排队任务，请先按原配置完成任务", 409)
+        connection = config.get("server", {}).get("db_conn", "")
+        if connection:
+            try:
+                import psycopg
+                with psycopg.connect(connection, connect_timeout=5, autocommit=True) as database:
+                    database.execute("SET statement_timeout = '5s'")
+                    exists = database.execute("SELECT to_regclass('runs')").fetchone()[0]
+                    if exists:
+                        run = database.execute(
+                            "SELECT run_id FROM runs WHERE plugin_type=%s "
+                            "AND status IN ('queued','planning','running','stopped') LIMIT 1", (plugin,),
+                        ).fetchone()
+                        if run:
+                            raise ManagementError(f"插件 {plugin} 有待恢复任务 {run[0]}，请先按原配置完成", 409)
+            except ManagementError:
+                raise
+            except Exception as exc:
+                raise ManagementError("无法核对调度数据库中的未完成任务，暂不更改部署配置", 503) from exc
+        elif not status.get("online") or not isinstance(status.get("unfinished_runs"), list):
+            raise ManagementError("无法确认插件是否存在待恢复任务，请启动调度器或配置其数据库后再发布", 503)
 
     def _path(self, kind: str) -> Path | None:
         if kind not in self._paths:

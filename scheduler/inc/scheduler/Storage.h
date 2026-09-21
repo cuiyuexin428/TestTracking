@@ -23,6 +23,20 @@ class Storage {
         std::string plugin_type;
         std::string dataset_version;
         std::string params;
+        std::string work_fingerprint;
+        bool force_rerun = false;
+        std::string force_rerun_reason;
+        std::string rerun_of;
+        std::string status;
+        std::vector<std::string> worker_ids;
+        std::string execution_fingerprint;
+    };
+
+    struct EnqueueResult {
+        enum class Outcome { Created, Duplicate, ForceTargetMissing, Error } outcome = Outcome::Error;
+        std::string run_id;
+        std::string status;
+        std::string rerun_of;
     };
 
     Storage() = default;
@@ -36,11 +50,12 @@ class Storage {
 
     bool enabled() const { return enabled_; }
 
-    bool SaveRun(const std::string& run_id, const std::string& plugin_type,
-                 const std::string& dataset_version, const std::string& params);
+    EnqueueResult EnqueueRun(const RunRecord& run);
+    bool BeginPlanning(const std::string& run_id, const std::string& plugin_type);
     bool ActivateRun(const std::string& run_id, const std::string& plugin_type);
     bool FinishRun(const std::string& run_id, const std::string& status);
-    bool LoadUnfinishedRuns(std::vector<RunRecord>& runs);
+    bool CancelQueuedRun(const std::string& run_id, const std::string& plugin_type);
+    bool LoadUnfinishedRuns(std::vector<RunRecord>& active, std::vector<RunRecord>& queued);
     bool RestoreRun(const std::string& run_id, const std::string& plugin_type);
     bool SaveTask(const std::string& task_id, const std::string& run_id,
                   const std::string& client_identity, const std::string& payload,

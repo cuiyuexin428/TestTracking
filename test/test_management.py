@@ -8,7 +8,7 @@ import unittest
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -41,6 +41,10 @@ class _SchedulerHandler(BaseHTTPRequestHandler):
         self.commands.append(body)
         if body.get("dataset_version") == "bad":
             self.reply(409, {"error": "dataset version mismatch"})
+        elif body.get("dataset_version") == "duplicate":
+            self.reply(409, {"error": "equivalent work already exists", "duplicate": True,
+                             "run_id": "completed-run", "status": "finished", "force_rerun_available": True,
+                             "internal_detail": "must not be forwarded"})
         else:
             self.reply(200, {"ok": True, "action": body["action"], "run_id": "run-1"})
 
@@ -70,6 +74,13 @@ class SchedulerManagementTests(unittest.TestCase):
                                        "params": {"tag": "试用"}})
         self.assertEqual("run-1", result["run_id"])
         self.assertEqual({"tag": "试用"}, _SchedulerHandler.commands[-1]["params"])
+        forced = self.service.command({
+            "action": "run", "plugin_type": "coverage", "dataset_version": "d1",
+            "params": {"tag": "试用"}, "force_rerun": True,
+            "force_rerun_reason": "修复环境后验证"})
+        self.assertEqual("run-1", forced["run_id"])
+        self.assertTrue(_SchedulerHandler.commands[-1]["force_rerun"])
+        self.assertEqual("修复环境后验证", _SchedulerHandler.commands[-1]["force_rerun_reason"])
         self.service.command({"action": "stop", "plugin_type": "coverage", "run_id": "run-1"})
         self.assertEqual("run-1", _SchedulerHandler.commands[-1]["run_id"])
 
@@ -78,6 +89,26 @@ class SchedulerManagementTests(unittest.TestCase):
             self.service.command({"action": "run", "plugin_type": "coverage", "dataset_version": "bad"})
         self.assertEqual(409, failure.exception.status)
         self.assertEqual("dataset version mismatch", str(failure.exception))
+
+    def test_duplicate_rejection_preserves_only_console_metadata(self):
+        with self.assertRaises(ManagementError) as failure:
+            self.service.command({"action": "run", "plugin_type": "coverage", "dataset_version": "duplicate"})
+        self.assertEqual(409, failure.exception.status)
+        self.assertEqual("equivalent work already exists", str(failure.exception))
+        self.assertEqual({"duplicate": True, "run_id": "completed-run", "status": "finished",
+                          "force_rerun_available": True}, failure.exception.details)
+
+    def test_run_worker_selection_is_forwarded_and_validated(self):
+        self.service.command({"action": "run", "plugin_type": "coverage", "dataset_version": "d1",
+                              "worker_ids": ["machine-b/coverage", "machine-a/coverage", "machine-b/coverage"]})
+        self.assertEqual(["machine-a/coverage", "machine-b/coverage"],
+                         _SchedulerHandler.commands[-1]["worker_ids"])
+        for value in ("machine-a", None, [1], [""], ["  "], ["bad\nidentity"]):
+            with self.subTest(value=value), self.assertRaises(ManagementError):
+                self.service.command({"action": "run", "plugin_type": "coverage", "dataset_version": "d1",
+                                      "worker_ids": value})
+        with self.assertRaises(ManagementError):
+            self.service.command({"action": "stop", "plugin_type": "coverage", "worker_ids": []})
 
     def test_offline_scheduler_does_not_raise_from_status(self):
         with patch.object(self.service, "_request", side_effect=ManagementError("offline", 503)):
@@ -91,6 +122,10 @@ class SchedulerManagementTests(unittest.TestCase):
             ManagementService(replace(ServiceConfig.defaults(), scheduler_management_url="http://192.168.1.10:5556"))
         for body in ({"action": "quit"}, {"action": []}, {"action": {}},
                      {"action": "run", "plugin_type": "coverage"},
+                     {"action": "run", "plugin_type": "coverage", "dataset_version": "d1",
+                      "force_rerun": True},
+                     {"action": "run", "plugin_type": "coverage", "dataset_version": "d1",
+                      "force_rerun_reason": "没有强制标记"},
                      {"action": "stop", "plugin_type": []}):
             with self.subTest(body=body), self.assertRaises(ManagementError):
                 self.service.command(body)
@@ -161,7 +196,7 @@ class ManagementConfigTests(unittest.TestCase):
             self.service.save_config("scheduler", loaded)
         self.assertEqual(409, failure.exception.status)
 
-    def test_invalid_task_size_and_multiple_client_plugins_do_not_write(self):
+    def test_invalid_task_size_and_client_without_enabled_plugin_do_not_write(self):
         original = self.scheduler.read_bytes()
         loaded = self.service.get_config("scheduler")
         loaded["config"]["plugins"]["coverage"]["task_size"] = 0
@@ -169,7 +204,81 @@ class ManagementConfigTests(unittest.TestCase):
             self.service.save_config("scheduler", loaded)
         self.assertEqual(original, self.scheduler.read_bytes())
         loaded = self.service.get_config("client")
+        loaded["config"]["plugins"]["coverage"]["enabled"] = False
+        with self.assertRaises(ManagementError):
+            self.service.save_config("client", loaded)
+
+    def test_single_plugin_and_independent_windows_are_valid(self):
+        loaded = self.service.get_config("client")
         loaded["config"]["plugins"]["stpcompare"]["enabled"] = True
+        before = self.client.read_bytes()
+        with self.assertRaises(ManagementError):
+            self.service.save_config("client", loaded)
+        self.assertEqual(before, self.client.read_bytes())
+        loaded["config"]["plugins"]["coverage"]["enabled"] = False
+        loaded["config"]["client"]["execution_windows"] = [
+            {"days": [1, 2, 3, 4, 5], "start": "18:00", "end": "08:00"}
+        ]
+        loaded["config"]["client"]["update_windows"] = [
+            {"days": [6, 7], "start": "00:00", "end": "00:00"}
+        ]
+        saved = self.service.save_config("client", loaded)
+        self.assertTrue(saved["saved"])
+        written = json.loads(self.client.read_text(encoding="utf-8"))
+        self.assertFalse(written["plugins"]["coverage"]["enabled"])
+        self.assertTrue(written["plugins"]["stpcompare"]["enabled"])
+        self.assertEqual("18:00", written["client"]["execution_windows"][0]["start"])
+
+    def test_pending_scheduler_change_blocks_new_run_but_allows_stop(self):
+        loaded = self.service.get_config("scheduler")
+        loaded["config"]["plugins"]["coverage"]["task_size"] = 3
+        self.service.save_config("scheduler", loaded)
+        with patch.object(self.service, "_request", return_value={"ok": True}) as request:
+            with self.assertRaises(ManagementError) as rejected:
+                self.service.command({"action": "run", "plugin_type": "coverage", "dataset_version": "d1"})
+            self.assertEqual(409, rejected.exception.status)
+            request.assert_not_called()
+            self.service.command({"action": "stop", "plugin_type": "coverage"})
+            request.assert_called_once()
+
+    def test_plugin_update_guard_checks_live_and_durable_unfinished_work(self):
+        with patch.object(self.service, "get_status", return_value={
+                "online": True, "unfinished_runs": [{"plugin_type": "coverage", "status": "stopped"}]}):
+            with self.assertRaises(ManagementError) as rejected:
+                self.service.require_plugin_idle("coverage")
+            self.assertEqual(409, rejected.exception.status)
+        database = MagicMock()
+        database.execute.return_value.fetchone.side_effect = [("runs",), ("stopped-run",)]
+        with patch("psycopg.connect") as connect:
+            connect.return_value.__enter__.return_value = database
+            with self.assertRaises(ManagementError) as rejected:
+                self.service.require_plugin_idle("coverage")
+            self.assertEqual(409, rejected.exception.status)
+            self.assertIn("stopped-run", str(rejected.exception))
+            self.assertEqual(("coverage",), database.execute.call_args.args[1])
+        database.execute.return_value.fetchone.side_effect = [("runs",), None]
+        with patch("psycopg.connect") as connect:
+            connect.return_value.__enter__.return_value = database
+            self.service.require_plugin_idle("coverage")
+        with patch("psycopg.connect", side_effect=OSError("storage unavailable")):
+            with self.assertRaises(ManagementError) as rejected:
+                self.service.require_plugin_idle("coverage")
+            self.assertEqual(503, rejected.exception.status)
+
+    def test_file_backend_update_guard_requires_live_complete_snapshot(self):
+        settings = json.loads(self.scheduler.read_text())
+        settings["server"].pop("db_conn")
+        self.scheduler.write_text(json.dumps(settings))
+        with self.assertRaises(ManagementError):
+            self.service.require_plugin_idle("coverage")
+        with patch.object(self.service, "get_status", return_value={"online": True, "unfinished_runs": []}):
+            self.service.require_plugin_idle("coverage")
+
+    def test_invalid_client_window_is_rejected(self):
+        loaded = self.service.get_config("client")
+        loaded["config"]["client"]["execution_windows"] = [
+            {"days": [0], "start": "25:00", "end": "08:00"}
+        ]
         with self.assertRaises(ManagementError):
             self.service.save_config("client", loaded)
 

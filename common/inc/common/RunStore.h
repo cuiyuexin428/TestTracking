@@ -1,5 +1,7 @@
 #pragma once
+#include "common/Manifest.h"
 #include "common/PgUtil.h"
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -15,11 +17,14 @@ public:
     bool init(const std::string& config, const std::string& plugin,
               const std::string& checkpoint_table);
     bool savePlan(const std::string& run, const std::string& blob,
-                  const std::vector<std::string>& files, const std::string& fingerprint,
+                  const std::vector<ManifestEntry>& files, const std::string& fingerprint,
                   std::size_t planned_tasks, const std::string& dataset_version = {});
+    // Reads return false for confirmed missing/invalid data. Storage access
+    // failures throw RecoveryBlocked so recovery cannot discard a valid run.
     bool loadPlan(const std::string& run, std::string* blob);
     bool loadIdentity(const std::string& run, RunIdentity* identity);
-    bool recordCompletion(const std::string& run, const std::string& task);
+    bool recordCompletion(const std::string& run, const std::string& task,
+                          std::optional<int> exit_code = std::nullopt);
     bool loadCompletions(const std::string& run, std::set<std::string>* tasks);
     bool finish(const std::string& run);
 private:

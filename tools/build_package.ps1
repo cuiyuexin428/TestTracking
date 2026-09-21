@@ -5,11 +5,11 @@
 #     config\client.json
 #     start_client.bat
 #     testenv\
-#       program\            StepTest.exe + PDB + all engine DLLs + version.txt
+#       program\            coverage program, or baseline/candidate STP programs
 #       dataset\            stp files + version.txt
 #       opencppcoverage\    OpenCppCoverage.exe + dependencies
 #
-# Versions are tracked per component in testenv\program\version.txt and
+# Versions are tracked beside each packaged program and in
 # testenv\dataset\version.txt. Update only the component that changed:
 #   -OnlyClient   update binaries; preserve deployment config unless explicitly overridden
 #   -OnlyProgram  replace testenv\program and bump its version
@@ -18,9 +18,11 @@ param(
     [string]$OutDir = '',
     [string]$BinDir = $null,
     [string]$Endpoint = '',
+    [string]$DeploymentEndpoint = '',
     [string]$WorkerId = 'worker-1',
     [ValidateSet('coverage', 'stpcompare')][string]$Plugin = 'coverage',
-    [string]$ConverterExe = '',
+    [string]$BaselineConverterExe = '',
+    [string]$CandidateConverterExe = '',
     [int]$TaskThreads = 2,
     [string]$StoreType = 'postgres',
     [string]$DbConn = '',
@@ -35,6 +37,8 @@ param(
     [switch]$OnlyProgram,
     [switch]$OnlyDataset,
     [string]$ProgramVersion = '1.0',
+    [string]$BaselineProgramVersion = '1.0',
+    [string]$CandidateProgramVersion = '1.0',
     [string]$DatasetVersion = 'd1',
     [string[]]$EngineDlls = @('TKernel.dll', 'TKBRep.dll', 'TKDESTEP.dll', 'TKTopAlgo.dll'),
     # These inputs belong to the deployment being packaged. Keep them empty
@@ -51,7 +55,7 @@ param(
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'ToolSupport.ps1')
 . (Join-Path $PSScriptRoot 'PackageSupport.ps1')
-$programInputProvided = [bool]($StepTestExe -or $ConverterExe)
+$programInputProvided = [bool]($StepTestExe -or $BaselineConverterExe -or $CandidateConverterExe)
 $root = [System.IO.Path]::GetFullPath((Split-Path $PSScriptRoot -Parent))
 
 function Resolve-ProjectPath([string]$Path) {
@@ -82,10 +86,10 @@ if (($OnlyClient -or $OnlyProgram -or $OnlyDataset) -and (Test-Path -LiteralPath
 $preserveClientConfig = $OnlyClient -and $null -ne $previousConfig
 
 if ($Plugin -eq 'stpcompare') {
-    if (-not $ConverterExe -and -not $OnlyClient -and -not $OnlyDataset) {
-        throw 'Pass -ConverterExe for a stpcompare program package'
+    if ((-not $BaselineConverterExe -or -not $CandidateConverterExe) -and
+        -not $OnlyClient -and -not $OnlyDataset) {
+        throw 'Pass both -BaselineConverterExe and -CandidateConverterExe for a stpcompare program package'
     }
-    $StepTestExe = if ($ConverterExe) { Resolve-ProjectPath $ConverterExe } else { 'Converter.exe' }
 }
 function Get-LocalIPv4 {
     $candidates = @()
@@ -114,6 +118,8 @@ if (-not $DbConn -and $StoreType -eq 'postgres' -and -not $preserveClientConfig)
 }
 
 $StepTestExe = Resolve-ProjectPath $StepTestExe
+$BaselineConverterExe = Resolve-ProjectPath $BaselineConverterExe
+$CandidateConverterExe = Resolve-ProjectPath $CandidateConverterExe
 $EngineSrcDir = Resolve-ProjectPath $EngineSrcDir
 $DatasetDir = Resolve-ProjectPath $DatasetDir
 $OpenCppCoverageDir = Resolve-ProjectPath $OpenCppCoverageDir
@@ -122,7 +128,7 @@ if (-not $OnlyProgram -and -not $OnlyDataset) {
     $BinDir = Resolve-PackageBinaryDir -ProjectRoot $root -Explicit $BinDir -Executable 'client.exe' -Config $Config
 }
 
-if (-not $OnlyClient -and -not $OnlyDataset -and -not $StepTestExe) {
+if (-not $OnlyClient -and -not $OnlyDataset -and $Plugin -eq 'coverage' -and -not $StepTestExe) {
         throw 'StepTest executable is required; pass -StepTestExe <path> (the package stores it under testenv/program)'
 }
 if (-not $OnlyClient -and -not $OnlyProgram -and -not $DatasetDir) {
@@ -144,64 +150,75 @@ function Assert-SeparateInput([string]$Source, [string]$Destination) {
 # Validate all component inputs before replacing any deployed files.
 if (-not $OnlyClient -and -not $OnlyDataset) {
     Assert-SeparateInput $StepTestExe (Join-Path $testenv 'program')
+    Assert-SeparateInput $BaselineConverterExe (Join-Path $testenv 'program')
+    Assert-SeparateInput $CandidateConverterExe (Join-Path $testenv 'program')
     Assert-SeparateInput $EngineSrcDir (Join-Path $testenv 'program')
     Assert-SeparateInput $OpenCppCoverageDir (Join-Path $testenv 'opencppcoverage')
 }
 if (-not $OnlyClient -and -not $OnlyProgram) {
     Assert-SeparateInput $DatasetDir (Join-Path $testenv 'dataset')
 }
-$programFileName = if ($StepTestExe) { Split-Path -Leaf $StepTestExe }
-    elseif ($Plugin -eq 'stpcompare') { 'Converter.exe' } else { 'StepTest.exe' }
+$programFileName = if ($StepTestExe) { Split-Path -Leaf $StepTestExe } else { 'StepTest.exe' }
+$baselineFileName = if ($BaselineConverterExe) { Split-Path -Leaf $BaselineConverterExe } else { 'BaselineConverter.exe' }
+$candidateFileName = if ($CandidateConverterExe) { Split-Path -Leaf $CandidateConverterExe } else { 'CandidateConverter.exe' }
 if ($preserveClientConfig -and -not $programInputProvided) {
     $previousPlugin = $previousConfig.plugins.$Plugin
-    $previousProgram = if ($Plugin -eq 'coverage') { $previousPlugin.target_exe } else { $previousPlugin.program_exe }
-    if ($previousProgram) { $programFileName = [System.IO.Path]::GetFileName([string]$previousProgram) }
+    if ($Plugin -eq 'coverage' -and $previousPlugin.target_exe) {
+        $programFileName = [System.IO.Path]::GetFileName([string]$previousPlugin.target_exe)
+    } elseif ($Plugin -eq 'stpcompare' -and $previousPlugin.programs) {
+        $baselineFileName = [System.IO.Path]::GetFileName([string]$previousPlugin.programs.baseline.executable)
+        $candidateFileName = [System.IO.Path]::GetFileName([string]$previousPlugin.programs.candidate.executable)
+    }
 }
 
 if (-not $OnlyClient -and -not $OnlyDataset) {
-    # testenv\program: target exe + PDB + all engine DLLs + instrumented PDBs.
-    if (-not (Test-Path $StepTestExe)) {
-        throw "StepTest.exe not found: $StepTestExe"
-    }
-    if ($EngineSrcDir -and -not (Test-Path $EngineSrcDir)) {
-        throw "engine source dir not found: $EngineSrcDir"
-    }
-    if ($Plugin -eq 'coverage' -and -not (Test-Path (Join-Path $OpenCppCoverageDir 'OpenCppCoverage.exe'))) {
-        throw "OpenCppCoverage.exe not found under $OpenCppCoverageDir"
-    }
     $progDir = Join-Path $testenv 'program'
     if (Test-Path $progDir) {
         Assert-OwnedPath $progDir $OutDir | Out-Null
         Remove-Item -LiteralPath $progDir -Recurse -Force
     }
     New-Item -ItemType Directory -Force $progDir | Out-Null
-    Copy-Item -LiteralPath $StepTestExe -Destination $progDir
-    $stepPdb = [System.IO.Path]::ChangeExtension($StepTestExe, '.pdb')
-    if (Test-Path $stepPdb) {
-        Copy-Item -LiteralPath $stepPdb -Destination $progDir
-    }
-    $stepDir = Split-Path $StepTestExe -Parent
-    foreach ($dll in $EngineDlls) {
-        $pdbPath = [System.IO.Path]::ChangeExtension((Join-Path $stepDir $dll), '.pdb')
-        if (Test-Path $pdbPath) {
-            Copy-Item -LiteralPath $pdbPath -Destination $progDir
+
+    function Copy-ProgramBundle([string]$Executable, [string]$Destination, [string]$Version) {
+        if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) {
+            throw "Program executable not found: $Executable"
         }
+        New-Item -ItemType Directory -Force $Destination | Out-Null
+        Copy-Item -LiteralPath $Executable -Destination $Destination
+        $sourceDir = Split-Path $Executable -Parent
+        $pdb = [System.IO.Path]::ChangeExtension($Executable, '.pdb')
+        if (Test-Path -LiteralPath $pdb -PathType Leaf) { Copy-Item -LiteralPath $pdb -Destination $Destination }
+        Get-ChildItem $sourceDir -File -Filter '*.dll' | Copy-Item -Destination $Destination
+        Copy-VCRuntime -Destination $Destination -RuntimeDir $VCRuntimeDir | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $Destination 'version.txt'), $Version,
+            (New-Object System.Text.UTF8Encoding($false)))
     }
-    Get-ChildItem $stepDir -Filter '*.dll' | Copy-Item -Destination $progDir
-    Copy-VCRuntime -Destination $progDir -RuntimeDir $VCRuntimeDir | Out-Null
-    if ($EngineSrcDir) {
-        Copy-Item -Path $EngineSrcDir -Destination (Join-Path $progDir 'engine_src') -Recurse
+
+    if ($Plugin -eq 'coverage') {
+        Copy-ProgramBundle $StepTestExe $progDir $ProgramVersion
+        $stepDir = Split-Path $StepTestExe -Parent
+        foreach ($dll in $EngineDlls) {
+            $pdbPath = [System.IO.Path]::ChangeExtension((Join-Path $stepDir $dll), '.pdb')
+            if (Test-Path $pdbPath) { Copy-Item -LiteralPath $pdbPath -Destination $progDir }
+        }
+        if ($EngineSrcDir) {
+            if (-not (Test-Path $EngineSrcDir)) { throw "engine source dir not found: $EngineSrcDir" }
+            Copy-Item -Path $EngineSrcDir -Destination (Join-Path $progDir 'engine_src') -Recurse
+        }
+    } else {
+        Copy-ProgramBundle $BaselineConverterExe (Join-Path $progDir 'baseline') $BaselineProgramVersion
+        Copy-ProgramBundle $CandidateConverterExe (Join-Path $progDir 'candidate') $CandidateProgramVersion
     }
-    [System.IO.File]::WriteAllText(
-        (Join-Path $progDir 'version.txt'),
-        $ProgramVersion,
-        (New-Object System.Text.UTF8Encoding($false)))
     if ($OnlyProgram -and (Test-Path -LiteralPath $clientConfigPath)) {
         $existingConfig = Get-Content -LiteralPath $clientConfigPath -Raw | ConvertFrom-Json
         $existingPlugin = $existingConfig.plugins.$Plugin
         if ($existingPlugin) {
-            $exeProperty = if ($Plugin -eq 'coverage') { 'target_exe' } else { 'program_exe' }
-            $existingPlugin | Add-Member -NotePropertyName $exeProperty -NotePropertyValue ('testenv/program/' + $programFileName) -Force
+            if ($Plugin -eq 'coverage') {
+                $existingPlugin.target_exe = 'testenv/program/' + $programFileName
+            } else {
+                $existingPlugin.programs.baseline.executable = 'testenv/program/baseline/' + $baselineFileName
+                $existingPlugin.programs.candidate.executable = 'testenv/program/candidate/' + $candidateFileName
+            }
             Write-AtomicText $clientConfigPath ($existingConfig | ConvertTo-Json -Depth 10)
         }
     }
@@ -224,6 +241,8 @@ if (-not $OnlyClient -and -not $OnlyDataset) {
     }
     Get-ChildItem $occDir -Filter 'unins*' | Remove-Item -Force
     Write-Host "built testenv\program (version $ProgramVersion) + opencppcoverage"
+    } else {
+        Write-Host "built baseline ($BaselineProgramVersion) and candidate ($CandidateProgramVersion) programs"
     }
 }
 
@@ -260,6 +279,8 @@ if (-not $OnlyClient -and -not $OnlyProgram) {
 
 if (-not $OnlyProgram -and -not $OnlyDataset) {
     New-Item -ItemType Directory -Force (Join-Path $OutDir 'config') | Out-Null
+    New-Item -ItemType Directory -Force (Join-Path $OutDir 'tools') | Out-Null
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'client_update.ps1') -Destination (Join-Path $OutDir 'tools')
     Copy-Item -LiteralPath (Join-Path $BinDir 'client.exe') -Destination $OutDir
     Get-ChildItem $BinDir -Filter '*.dll' | Copy-Item -Destination $OutDir
     Copy-VCRuntime -Destination $OutDir -RuntimeDir $VCRuntimeDir | Out-Null
@@ -286,9 +307,18 @@ if (-not $OnlyProgram -and -not $OnlyDataset) {
         $selectedPlugin = @{
             dll = 'stpcompare.dll'; enabled = $true; dry_run = $false
             store_type = $StoreType; db_conn = $DbConn; store_dir = 'store'
-            program_dir = 'testenv/program'; program_exe = ('testenv/program/' + $programFileName)
+            programs = [ordered]@{
+                baseline = [ordered]@{
+                    executable = ('testenv/program/baseline/' + $baselineFileName)
+                    arguments = @('--input', '{stp}', '--output-dir', '{outdir}')
+                }
+                candidate = [ordered]@{
+                    executable = ('testenv/program/candidate/' + $candidateFileName)
+                    arguments = @('--input', '{stp}', '--output-dir', '{outdir}')
+                }
+            }
             stp_root = 'testenv/dataset'; work_dir = 'stp_compare_work'
-            info_file = 'info.txt'; info_new_file = 'info_new.txt'; table = 'stp_compare_old'
+            table = 'stp_compare_old'
         }
     }
     $clientCfg = @{
@@ -304,6 +334,11 @@ if (-not $OnlyProgram -and -not $OnlyDataset) {
             request_backoff_max_ms = 30000
             register_timeout_ms = 5000
             register_max_attempts = 5
+            deployment_endpoint = $DeploymentEndpoint
+            deployment_poll_seconds = 30
+            deployment_stage_timeout_seconds = 0
+            execution_windows = @()
+            update_windows = @()
         }
         plugins = @{ $Plugin = $selectedPlugin }
     }
@@ -318,6 +353,9 @@ if (-not $OnlyProgram -and -not $OnlyDataset) {
             $clientCfg.scheduler.endpoint = "tcp://${endpointHost}:$endpointPort"
         }
         if ($PSBoundParameters.ContainsKey('WorkerId')) { $clientCfg.client.worker_id = $WorkerId }
+        if ($PSBoundParameters.ContainsKey('DeploymentEndpoint')) {
+            $clientCfg.client | Add-Member -NotePropertyName deployment_endpoint -NotePropertyValue $DeploymentEndpoint -Force
+        }
         if ($PSBoundParameters.ContainsKey('TaskThreads')) { $clientCfg.client.task_threads = $TaskThreads }
         if ($PSBoundParameters.ContainsKey('Plugin')) {
             if (-not $clientCfg.plugins.$Plugin) {
@@ -359,8 +397,13 @@ if (-not $OnlyProgram -and -not $OnlyDataset) {
                 if ($PSBoundParameters.ContainsKey('StoreCov')) { $pluginConfig.store_cov = [bool]$StoreCov }
                 if ($PSBoundParameters.ContainsKey('EngineDlls')) { $pluginConfig.engine_dlls = @($EngineDlls | ForEach-Object { "testenv/program/$_" }) }
                 if ($PSBoundParameters.ContainsKey('StepTestExe')) { $pluginConfig.target_exe = 'testenv/program/' + $programFileName }
-            } elseif ($property.Name -eq 'stpcompare' -and $PSBoundParameters.ContainsKey('ConverterExe')) {
-                $pluginConfig.program_exe = 'testenv/program/' + $programFileName
+            } elseif ($property.Name -eq 'stpcompare') {
+                if ($PSBoundParameters.ContainsKey('BaselineConverterExe')) {
+                    $pluginConfig.programs.baseline.executable = 'testenv/program/baseline/' + $baselineFileName
+                }
+                if ($PSBoundParameters.ContainsKey('CandidateConverterExe')) {
+                    $pluginConfig.programs.candidate.executable = 'testenv/program/candidate/' + $candidateFileName
+                }
             }
         }
     }

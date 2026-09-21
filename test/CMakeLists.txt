@@ -11,6 +11,11 @@ add_executable(test_coverage_client test_coverage_client.cpp)
 target_link_libraries(test_coverage_client PRIVATE coverage_core)
 add_test(NAME test_coverage_client COMMAND test_coverage_client)
 
+# Prefer the portable analysis runtime when present; it includes the database
+# driver required by the integration tests and also travels into the intranet.
+if(NOT Python3_EXECUTABLE AND EXISTS "${CMAKE_SOURCE_DIR}/runtime/python/python.exe")
+    set(Python3_EXECUTABLE "${CMAKE_SOURCE_DIR}/runtime/python/python.exe")
+endif()
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
     add_test(NAME test_scheduler_logging COMMAND ${Python3_EXECUTABLE}
@@ -26,12 +31,19 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME test_plugin_views COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/test_plugin_views.py -v)
     set_tests_properties(test_plugin_views PROPERTIES TIMEOUT 30)
-    foreach(name dsh_proxy reports analysis_catalog python_analysis_dependencies ai_providers management management_http)
+    foreach(name dsh_proxy reports analysis_catalog python_analysis_dependencies ai_providers management management_http artifacts deployments program_bindings server_plugins)
         add_test(NAME test_${name} COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/test_${name}.py -v)
         set_tests_properties(test_${name} PROPERTIES TIMEOUT 90)
     endforeach()
     if(WIN32)
+        add_test(NAME test_client_deployment_integration COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_client_deployment_integration.py
+            --bin-dir $<TARGET_FILE_DIR:client> -v)
+        set_tests_properties(test_client_deployment_integration PROPERTIES TIMEOUT 120)
+        add_test(NAME test_client_update COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_client_update.py -v)
+        set_tests_properties(test_client_update PROPERTIES TIMEOUT 150)
         add_test(NAME test_package_portability COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/test_package_portability.py -v)
         set_tests_properties(test_package_portability PROPERTIES TIMEOUT 90)
@@ -55,9 +67,9 @@ target_include_directories(test_client_protocol PRIVATE ../client/inc)
 target_link_libraries(test_client_protocol PRIVATE common)
 add_library(client_retry_probe SHARED client_retry_probe_plugin.cpp)
 target_link_libraries(client_retry_probe PRIVATE common)
-add_dependencies(test_client_protocol demo client_retry_probe)
+add_dependencies(test_client_protocol demo client_retry_probe client)
 add_test(NAME test_client_protocol COMMAND test_client_protocol)
-set_tests_properties(test_client_protocol PROPERTIES TIMEOUT 20)
+set_tests_properties(test_client_protocol PROPERTIES TIMEOUT 90)
 add_library(scheduler_probe SHARED scheduler_probe_plugin.cpp)
 target_link_libraries(scheduler_probe PRIVATE common)
 add_executable(test_scheduler_protocol test_scheduler_protocol.cpp)

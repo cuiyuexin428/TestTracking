@@ -6,6 +6,8 @@ python test/test_reports.py --pg-bin third_party/pgsql/bin \
 from __future__ import annotations
 
 import argparse
+from base64 import b64decode
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -26,6 +28,14 @@ from result_service.app.reports import ReportError, ReportStore
 OPTIONS = None
 
 
+def load_coverage_report():
+    spec = importlib.util.spec_from_file_location(
+        "testtracking_coverage_report", ROOT / "plugins/coverage/result_report.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class ReportStoreTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="report store ")
@@ -42,6 +52,20 @@ class ReportStoreTests(unittest.TestCase):
         self.assertEqual(reopened.get_script("coverage")["source"], source)
         self.assertEqual(reopened.get_script("coverage")["origin"], "runtime")
 
+    def test_script_revision_prevents_overwrite_and_records_operator_audit(self):
+        original = self.store.get_script("coverage")
+        source = 'def render(connection, context):\n    return "revision one"\n'
+        saved = self.store.save_script(
+            "coverage", source, original["revision"], "123e4567-e89b-42d3-a456-426614174000"
+        )
+        self.assertNotEqual(original["revision"], saved["revision"])
+        with self.assertRaisesRegex(ReportError, "changed after it was loaded") as conflict:
+            self.store.save_script("coverage", source.replace("one", "two"), original["revision"])
+        self.assertEqual(409, conflict.exception.status)
+        audit = json.loads((self.store.scripts_dir / "audit.jsonl").read_text(encoding="utf-8"))
+        self.assertEqual("123e4567-e89b-42d3-a456-426614174000", audit["operator_id"])
+        self.assertEqual(saved["revision"], audit["revision"])
+
     def test_template_directory_and_generic_template(self):
         templates = self.root / "templates"
         templates.mkdir()
@@ -52,6 +76,23 @@ class ReportStoreTests(unittest.TestCase):
         fallback = store.get_script("vendor-plugin")
         self.assertEqual(fallback["origin"], "generic")
         store._validate_script(fallback["source"])
+
+    def test_only_coverage_ships_a_plugin_analysis_script(self):
+        self.assertEqual(self.store.get_script("coverage")["origin"], "default")
+        self.assertEqual(self.store.get_script("stpcompare")["origin"], "generic")
+
+    def test_coverage_compact_set_prefers_smaller_file_then_path(self):
+        report = load_coverage_report()
+        pack = lambda values: b"".join(value.to_bytes(8, "little") for value in values)
+        rows = [
+            {"file": "large.stp", "size_bytes": 20, "status": "success", "point_data": pack([1, 2])},
+            {"file": "small-z.stp", "size_bytes": 10, "status": "success", "point_data": pack([1, 2])},
+            {"file": "small-a.stp", "size_bytes": 10, "status": "success", "point_data": pack([1, 2])},
+            {"file": "extra.stp", "size_bytes": 1, "status": "success", "point_data": pack([3])},
+        ]
+        selected, covered = report._select_compact_cover(rows)
+        self.assertEqual(["small-a.stp", "extra.stp"], [item["file"] for item in selected])
+        self.assertEqual({1, 2, 3}, covered)
 
     def test_worker_receives_database_privately_and_artifact_is_immutable(self):
         captured = []
@@ -132,46 +173,43 @@ class ReportDatabaseTests(unittest.TestCase):
                                      status text, dataset_version text, program_version text,
                                      created_at timestamptz DEFAULT now(), finished_at timestamptz,
                                      manifest_fingerprint text, PRIMARY KEY(run_id,plugin_type));
-            CREATE TABLE plugin_run_files(run_id text, plugin_type text, file text);
+            CREATE TABLE plugin_run_files(run_id text, plugin_type text, file text,
+                                          size_bytes bigint, content_sha256 text);
             CREATE TABLE plugin_file_outcomes(run_id text, plugin_type text, file text, status text, detail text);
             INSERT INTO plugin_runs(run_id,plugin_type,expected_files,status,dataset_version,program_version)
                 VALUES('cov','coverage',2,'finished','v1','v1'),('stp','stpcompare',2,'finished','v1','v1');
-            INSERT INTO plugin_run_files VALUES('cov','coverage','a.stp'),('cov','coverage','b.stp'),
-                                                ('stp','stpcompare','same.stp'),('stp','stpcompare','<diff>.stp');
+            INSERT INTO plugin_run_files(run_id,plugin_type,file,size_bytes,content_sha256)
+                VALUES('cov','coverage','a.stp',20,repeat('a',64)),
+                      ('cov','coverage','b.stp',10,repeat('b',64)),
+                      ('stp','stpcompare','same.stp',NULL,NULL),
+                      ('stp','stpcompare','<diff>.stp',NULL,NULL);
             INSERT INTO plugin_file_outcomes SELECT run_id,plugin_type,file,'success','' FROM plugin_run_files;
             CREATE TABLE coverage_file_points(run_id text,file text,points bytea);
-            INSERT INTO coverage_file_points VALUES('cov','a.stp',decode('0100000000000000','hex')),
-                                                  ('cov','b.stp',decode('','hex'));
+            INSERT INTO coverage_file_points VALUES('cov','a.stp',decode('01000000000000000200000000000000','hex')),
+                                                  ('cov','b.stp',decode('01000000000000000200000000000000','hex'));
             CREATE TABLE custom_stp_results(run_id text,file text,info_txt text,info_new_txt text);
             INSERT INTO custom_stp_results VALUES('stp','same.stp','a','a'),
                                                  ('stp','<diff>.stp','<script>alert(1)</script>','new');
         """)
 
-    def test_coverage_raw_and_settled_reports_need_no_scheduler_tables(self):
+    def test_coverage_report_selects_and_downloads_compact_set(self):
         first = self.store.generate("coverage", "cov", self.pg.conn)
         text = self.store.artifact_path(first["report_id"]).read_text(encoding="utf-8")
         self.assertIn("原始数据完整", text)
-        self.assertIn("尚未生成结算汇总", text)
         self.assertIn("a.stp", text)
-        self.pg.sql("""CREATE TABLE coverage_run_summary(run_id text,total_files int,selected_files int,
-                    cumulative_points bigint,covered_lines bigint,total_lines bigint,percent double precision);
-                    INSERT INTO coverage_run_summary VALUES('cov',2,1,1,1,2,50);""")
-        second = self.store.generate("coverage", "cov", self.pg.conn)
-        self.assertIn("已生成结算汇总", self.store.artifact_path(second["report_id"]).read_text(encoding="utf-8"))
-        self.assertIn("尚未生成结算汇总", self.store.artifact_path(first["report_id"]).read_text(encoding="utf-8"))
+        self.assertIn("coverage-selected-stp.txt", text)
+        self.assertIn("精简集合文件", text)
+        encoded = text.split("data:text/plain;charset=utf-8;base64,", 1)[1].split('"', 1)[0]
+        self.assertEqual("b.stp\n", b64decode(encoded).decode("utf-8"))
+        self.assertIn("b.stp", text)
 
-    def test_comparison_uses_configured_table_and_escapes_data(self):
+    def test_plugin_without_built_in_analysis_uses_generic_report(self):
         result = self.store.generate("stpcompare", "stp", self.pg.conn,
                                      options={"result_table": "custom_stp_results"})
         text = self.store.artifact_path(result["report_id"]).read_text(encoding="utf-8")
-        self.assertIn("原始数据完整", text)
+        self.assertIn("stpcompare 结果报告", text)
         self.assertIn("&lt;diff&gt;.stp", text)
-        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", text)
         self.assertNotIn("<script>alert(1)</script>", text)
-        self.pg.sql("DELETE FROM custom_stp_results WHERE file='same.stp'")
-        next_result = self.store.generate("stpcompare", "stp", self.pg.conn,
-                                          options={"result_table": "custom_stp_results"})
-        self.assertIn("原始数据尚不完整", self.store.artifact_path(next_result["report_id"]).read_text(encoding="utf-8"))
 
     def test_replacement_script_runs_fresh_and_database_is_read_only(self):
         source = 'def render(connection, context):\n    return "<h1>version1</h1>"\n'
@@ -283,7 +321,12 @@ class ReportDatabaseTests(unittest.TestCase):
                   '    value = connection.execute("SELECT count(*) AS count FROM coverage_file_points WHERE run_id=%s", '
                   '(context["run_id"],)).fetchone()["count"]\n'
                   '    return "<!doctype html><h1>HTTP live rows=" + str(value) + "</h1>"\n')
-        self.assertEqual(request("/api/plugins/coverage/report-script", {"source": source}, "PUT")[0], 200)
+        script_state = request("/api/plugins/coverage/report-script")[1]
+        status, saved_script = request("/api/plugins/coverage/report-script", {
+            "source": source, "revision": script_state["revision"],
+            "operator_id": "123e4567-e89b-42d3-a456-426614174000",
+        }, "PUT")
+        self.assertEqual(status, 200)
         status, report = request("/api/plugins/coverage/reports", {"run_id": "cov"}, "POST")
         self.assertEqual(status, 200, report)
         self.assertIn("HTTP live rows=2", request(report["url"])[1])
@@ -294,7 +337,10 @@ class ReportDatabaseTests(unittest.TestCase):
         self.assertIn("HTTP live rows=2", request(report["url"])[1])
         self.assertEqual(request("/api/plugins/coverage/reports?run_id=cov")[1]["latest"], report)
         self.assertEqual(request("/api/plugins/coverage/report-script", {
-            "source": 'def render(connection, context):\n    raise RuntimeError("report failure")\n'}, "PUT")[0], 200)
+            "source": 'def render(connection, context):\n    raise RuntimeError("report failure")\n',
+            "revision": saved_script["revision"],
+            "operator_id": "123e4567-e89b-42d3-a456-426614174000",
+        }, "PUT")[0], 200)
         self.assertEqual(request("/api/plugins/coverage/reports", {"run_id": "cov"}, "POST")[0], 422)
         self.assertIn("HTTP live rows=2", request(report["url"])[1])
         self.assertEqual(request("/api/plugins/coverage/reports?run_id=cov")[1]["latest"], report)

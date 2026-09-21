@@ -11,7 +11,6 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from result_service.app.config import ServiceConfig
-from result_service.app.providers import ProviderResult
 from result_service.app.repository import PostgresRepository, result_readiness
 from result_service.app.server import ResultService
 
@@ -115,24 +114,16 @@ class AnalysisCatalogTests(unittest.TestCase):
         self.assertEqual("archived-run", detail["run_id"])
         self.assertNotIn("analysis", detail)
 
-    def test_ai_receives_live_database_catalog_without_selected_run(self):
+    def test_native_ai_can_discover_live_database_catalog_without_selected_run(self):
         service = ResultService(ServiceConfig.defaults())
         service.repository, _ = self.repository()
-        with patch.object(service.providers["codex"], "complete", return_value=ProviderResult("codex", "ok")) as complete:
-            status, _ = service.ai_chat({"message": "哪些结果可以分析？", "context": {}})
+        status, catalog = service.payload("/api/analysis/catalog", {})
         self.assertEqual(200, status)
-        context = complete.call_args.args[1]
-        self.assertEqual("archived-run", context["analysis_catalog"]["runs"][0]["run_id"])
-        self.assertNotIn("db_conn", json.dumps(context))
-
-    def test_failed_database_does_not_block_general_ai_questions(self):
-        service = ResultService(ServiceConfig.defaults())
-        service.repository, _ = self.repository()
-        with patch.object(service.repository, "analysis_runs", side_effect=RuntimeError("offline")), \
-                patch.object(service.providers["codex"], "complete", return_value=ProviderResult("codex", "ok")) as complete:
-            status, _ = service.ai_chat({"message": "为什么没运行？"})
+        self.assertEqual("archived-run", catalog["runs"][0]["run_id"])
+        self.assertNotIn("db_conn", json.dumps(catalog))
+        status, context = service.payload("/api/plugins/coverage/ai-context", {})
         self.assertEqual(200, status)
-        self.assertEqual("database_unavailable", complete.call_args.args[1]["analysis_catalog"]["error"])
+        self.assertEqual("coverage", context["plugin"])
 
     def test_configuration_resolves_report_paths_after_move(self):
         with tempfile.TemporaryDirectory() as directory:

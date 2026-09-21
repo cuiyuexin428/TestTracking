@@ -45,11 +45,22 @@ bool TaskLedger::loadTasks(const std::vector<Task>& tasks,const std::set<std::st
 bool TaskLedger::plan(const std::string& run,const std::vector<Task>& tasks,
                       const std::vector<std::string>& files,const std::string& fingerprint,
                       const std::string& dataset_version) {
+    std::vector<ManifestEntry> entries;
+    entries.reserve(files.size());
+    for (const auto& file : files) entries.push_back({file});
+    return planManifest(run, tasks, entries, fingerprint, dataset_version);
+}
+bool TaskLedger::planManifest(const std::string& run,const std::vector<Task>& tasks,
+                              const std::vector<ManifestEntry>& files,const std::string& fingerprint,
+                              const std::string& dataset_version) {
     clear(); run_=run;
     identity_ = {expected_program_version_,
                  dataset_version.empty() ? expected_dataset_version_ : dataset_version, fingerprint};
     if (!loadTasks(tasks,{})) { clear(); return false; }
-    nlohmann::json state={{"version",4},{"run",run},{"files",files},{"fingerprint",fingerprint},
+    std::vector<std::string> paths;
+    paths.reserve(files.size());
+    for (const auto& file : files) paths.push_back(file.path);
+    nlohmann::json state={{"version",4},{"run",run},{"files",paths},{"fingerprint",fingerprint},
                            {"tasks",nlohmann::json::array()}};
     for (const auto& task : tasks) state["tasks"].push_back(Hex(task.SerializeAsString()));
     if (!store_.savePlan(run,state.dump(),files,fingerprint,tasks.size(),identity_.dataset_version)) {
@@ -107,7 +118,7 @@ bool TaskLedger::commit(const TaskResult& result) {
     if ((!result.run_id().empty() && result.run_id()!=run_) || !tasks_.count(result.task_id())) return false;
     if (!done_.count(result.task_id())) {
         if (!in_flight_.count(result.task_id()) ||
-            !store_.recordCompletion(run_,result.task_id())) return false;
+            !store_.recordCompletion(run_,result.task_id(),result.exit_code())) return false;
         done_.insert(result.task_id()); in_flight_.erase(result.task_id());
     }
     if (done_.size()==tasks_.size()) {

@@ -1,13 +1,15 @@
-# Provider Adapters
+# Native DSH Integration
 
-The result service invokes configured local provider commands. The built-in
-adapters are:
+The result service supports only the native DSH Web interface. It starts the
+configured local `dsh` command with the `web` profile and exposes an isolated
+native Web process for each browser operator through the service's same-origin
+proxy. There is no custom chat endpoint or headless chat mode in the console.
 
-- `codex`: runs `codex exec --json` with a stdin prompt. Approval and sandbox
-  policy come from the local Codex configuration.
-- `dsh`: runs the DeepSeek `headless` profile with the prompt as its task.
+DSH availability depends on the installed command, not on task execution,
+connected clients, a selected run, or database readiness. Provider credentials
+and user-level profiles stay outside the release package. Native DSH retains the
+permissions and model configuration of the server account.
 
-Provider credentials and user-level profiles stay outside the release package.
-The service sends sanitized result context and never forwards credentials or
-connection strings. The provider otherwise retains the permissions granted by
-its local CLI configuration.
+The injected context links to the result-service APIs, plugin-owned
+`AI_CONTEXT.md` descriptions, and the versioned Python report editing workflow.
+Session isolation does not isolate the shared project files or database.

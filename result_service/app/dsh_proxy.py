@@ -7,6 +7,7 @@ and EventSource requests without changing DSH's internal RPC channel names.
 from __future__ import annotations
 
 import http.client
+import json
 import logging
 import re
 import select
@@ -38,7 +39,7 @@ def http_origin(value: str, *, referer: bool = False) -> tuple[str, str, int] | 
 # Keep the bridge in the iframe only: the parent application's /api is untouched.
 _BROWSER_BRIDGE = r"""<script>
 (() => {
-  const prefix = "/ai/dsh";
+  const prefix = __DSH_PROXY_PREFIX__;
   // HTTP LAN origins lack randomUUID, but retain cryptographic random bytes.
   // DSH uses UUIDs for its RPC and message identifiers.
   if (!crypto.randomUUID) crypto.randomUUID = () => {
@@ -80,17 +81,21 @@ _BROWSER_BRIDGE = r"""<script>
 </script>"""
 
 
-def _rebase_html(body: bytes) -> bytes:
+def _rebase_html(body: bytes, proxy_path: str = DSH_PROXY_PATH) -> bytes:
+    if not proxy_path.startswith(DSH_PROXY_PATH) or not proxy_path.endswith("/"):
+        raise ValueError("invalid DSH proxy path")
+    prefix = proxy_path.rstrip("/")
     html = body.decode("utf-8")
     # Static entry resources and the module graph injected as __DSH_BOOT__.
     html = re.sub(r'((?:src|href)\s*=\s*[\"\x27])/(?!/)',
-                  lambda match: match[1] + DSH_PROXY_PATH, html,
+                  lambda match: match[1] + proxy_path, html,
                   flags=re.IGNORECASE)
     html = re.sub(r'("url"\s*:\s*")/(?!/)',
-                  lambda match: match[1] + DSH_PROXY_PATH, html)
+                  lambda match: match[1] + proxy_path, html)
     opening_head = re.search(r"<head(?:\s[^>]*)?>", html, flags=re.IGNORECASE)
     at = opening_head.end() if opening_head else 0
-    return (html[:at] + _BROWSER_BRIDGE + html[at:]).encode("utf-8")
+    bridge = _BROWSER_BRIDGE.replace("__DSH_PROXY_PREFIX__", json.dumps(prefix))
+    return (html[:at] + bridge + html[at:]).encode("utf-8")
 
 
 def _upstream_headers(handler: BaseHTTPRequestHandler, authority: str,
@@ -117,23 +122,28 @@ def _upstream_headers(handler: BaseHTTPRequestHandler, authority: str,
     return headers
 
 
-def _location(value: str, authority: str) -> str:
+def _location(value: str, authority: str, proxy_path: str = DSH_PROXY_PATH) -> str:
     parsed = urlsplit(value)
     if value.startswith("/") and not value.startswith("//"):
-        return DSH_PROXY_PATH.rstrip("/") + value
+        return proxy_path.rstrip("/") + value
     if parsed.netloc == authority:
-        return DSH_PROXY_PATH.rstrip("/") + parsed.path + (
+        return proxy_path.rstrip("/") + parsed.path + (
             f"?{parsed.query}" if parsed.query else ""
         ) + (f"#{parsed.fragment}" if parsed.fragment else "")
     return value
 
 
-def proxy_request(handler: BaseHTTPRequestHandler, upstream_url: str) -> None:
+def proxy_request(handler: BaseHTTPRequestHandler, upstream_url: str,
+                  proxy_path: str = DSH_PROXY_PATH) -> None:
     """Relay one namespaced request to the managed loopback DSH process."""
+    if not proxy_path.startswith(DSH_PROXY_PATH) or not proxy_path.endswith("/"):
+        raise ValueError("invalid DSH proxy path")
     upstream = urlsplit(upstream_url)
     if upstream.hostname != "127.0.0.1" or upstream.scheme != "http":
         raise ValueError("DSH proxy requires the managed loopback HTTP endpoint")
-    path = "/" + handler.path[len(DSH_PROXY_PATH):]
+    if not handler.path.startswith(proxy_path):
+        raise ValueError("request is outside the DSH operator namespace")
+    path = "/" + handler.path[len(proxy_path):]
     headers = _upstream_headers(handler, upstream.netloc,
                                 websocket=handler.headers.get("Upgrade", "").lower() == "websocket")
     if handler.headers.get("Upgrade", "").lower() == "websocket":
@@ -157,7 +167,7 @@ def proxy_request(handler: BaseHTTPRequestHandler, upstream_url: str) -> None:
         response = connection.getresponse()
         content_type = response.getheader("Content-Type", "")
         is_html = content_type.split(";", 1)[0].strip() == "text/html"
-        body = _rebase_html(response.read()) if is_html and handler.command != "HEAD" else None
+        body = _rebase_html(response.read(), proxy_path) if is_html and handler.command != "HEAD" else None
         handler.send_response(response.status, response.reason)
         for name, value in response.getheaders():
             lower = name.lower()
@@ -166,9 +176,9 @@ def proxy_request(handler: BaseHTTPRequestHandler, upstream_url: str) -> None:
             if is_html and lower in {"content-length", "etag", "content-encoding"}:
                 continue
             if lower == "location":
-                value = _location(value, upstream.netloc)
+                value = _location(value, upstream.netloc, proxy_path)
             if lower == "set-cookie":
-                value = re.sub(r"(?i)(;\s*Path=)/", r"\g<1>" + DSH_PROXY_PATH, value)
+                value = re.sub(r"(?i)(;\s*Path=)/", r"\g<1>" + proxy_path, value)
             handler.send_header(name, value)
         if body is not None:
             handler.send_header("Content-Length", str(len(body)))

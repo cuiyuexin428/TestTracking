@@ -9,6 +9,7 @@ public:
     std::string pluginType() const override;
     bool init(const std::string& config) override;
     bool validateClient(const common::ClientInfo&,const std::string&,common::ValidationResult&) override;
+    bool validateRunParameters(const std::string&, std::string&) const override;
     bool plan(const common::RunRequest&,const std::vector<common::ClientInfo>&) override;
     bool requestTask(const common::ClientInfo&,const std::string&,common::Task&) override;
     bool processResult(const common::TaskResult&) override;

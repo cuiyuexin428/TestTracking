@@ -33,6 +33,10 @@ class ConcurrentSchemaStartupTests(unittest.TestCase):
                          'store_type': 'postgres', 'db_conn': pg.conn, 'stp_manifest': str(manifest),
                          'stp_root': str(root), 'program_dir': str(root), 'dry_run': True}
                    for name in ('coverage', 'stpcompare')}
+        plugins['stpcompare']['programs'] = {
+            role: {'executable': str(OPTIONS.bin_dir / 'client.exe'), 'version': 'schema-test',
+                   'arguments': ['--input', '{stp}', '--output-dir', '{outdir}']}
+            for role in ('baseline', 'candidate')}
         scheduler_config = root / 'scheduler.json'
         scheduler_config.write_text(json.dumps({'server': {'router_endpoint': endpoint,
             'management_endpoint': management, 'db_conn': pg.conn}, 'plugins': plugins}), encoding='utf-8')

@@ -1,6 +1,7 @@
 #include "coverage/SchedulerPlugin.h"
 #include "common/Manifest.h"
 #include "common/Logger.h"
+#include "common/Util.h"
 #include "coverage.pb.h"
 #include <algorithm>
 #include <unordered_set>
@@ -29,7 +30,14 @@ bool SchedulerPlugin::validateClient(const common::ClientInfo&,const std::string
     result.reason=result.accepted?"ok":"invalid client information or version mismatch";
     return true;
 }
+bool SchedulerPlugin::validateRunParameters(const std::string& parameters, std::string& reason) const {
+    if (common::NormalizeRunParameters(parameters).empty()) return true;
+    reason = "coverage does not support run parameters; leave params empty";
+    return false;
+}
 bool SchedulerPlugin::plan(const common::RunRequest& request,const std::vector<common::ClientInfo>&) {
+    std::string reason;
+    if (!validateRunParameters(request.params, reason)) { LOG_ERROR(reason); return false; }
     if (!request.dataset_version.empty() && !expected_dataset_version_.empty() &&
         request.dataset_version != expected_dataset_version_) {
         LOG_ERROR("coverage: requested dataset version differs from configured dataset");
@@ -48,7 +56,7 @@ bool SchedulerPlugin::plan(const common::RunRequest& request,const std::vector<c
         task.set_task_id(request.run_id+"-t"+std::to_string(tasks.size()));
         payload.SerializeToString(task.mutable_payload()); tasks.push_back(task);
     }
-    return ledger_.plan(request.run_id,tasks,files,fingerprint,request.dataset_version);
+    return ledger_.planManifest(request.run_id,tasks,manifest,fingerprint,request.dataset_version);
 }
 bool SchedulerPlugin::requestTask(const common::ClientInfo& client,const std::string&,common::Task& task) {
     coverage::CoverageClientInfo info;

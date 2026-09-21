@@ -1,4 +1,5 @@
 #include "common/DynamicLibrary.h"
+#include <filesystem>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -10,7 +11,14 @@ namespace common {
 
 std::unique_ptr<DynamicLibrary> DynamicLibrary::load(const std::string& path) {
 #ifdef _WIN32
-    HMODULE handle = LoadLibraryA(path.c_str());
+    // Uploaded plugin bundles may carry private DLL dependencies beside the
+    // plugin; resolve their directory while retaining executable-directory fallback.
+    const auto input_path = std::filesystem::u8path(path);
+    const auto full_path = std::filesystem::absolute(input_path);
+    std::error_code error;
+    HMODULE handle = input_path.has_parent_path() || std::filesystem::exists(full_path, error)
+        ? LoadLibraryExW(full_path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH)
+        : LoadLibraryW(input_path.c_str());
 #else
     void* handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
 #endif

@@ -13,19 +13,15 @@
   },
   "plugin_views_dir": "",
   "plugin_adapters_dir": "",
+  "plugin_ai_contexts_dir": "",
   "analysis_scripts_dir": "../runtime/result_service/analysis_scripts",
   "analysis_reports_dir": "../runtime/result_service/reports",
   "report_templates_dir": "",
+  "artifact_store_dir": "../runtime/result_service/artifacts",
+  "artifact_import_roots": ["../runtime/artifact_import"],
   "providers": {
-    "codex": {
-      "command": "codex",
-      "args": ["exec", "--json", "--skip-git-repo-check", "-"],
-      "timeout_seconds": 120
-    },
     "dsh": {
       "command": "dsh",
-      "args": ["--profile", "headless"],
-      "prompt_mode": "argument",
       "timeout_seconds": 120
     }
   }

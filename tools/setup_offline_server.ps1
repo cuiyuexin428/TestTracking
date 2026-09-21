@@ -11,7 +11,7 @@ The script, in order:
   2. installs/initializes/starts the bundled PostgreSQL server and creates the database
   3. stages the stp dataset and regenerates the dataset manifest
   4. writes scheduler and web console configs (db, management, logs, analysis)
-  5. builds the full client package (client.exe + plugins + StepTest + dataset + OpenCppCoverage)
+  5. builds the full client package (client.exe + selected plugin + business programs + dataset)
   6. installs the bundled Python analysis dependencies without using the network
   7. opens LAN firewall ports and generates startup scripts
 
@@ -42,10 +42,13 @@ param(
     [string]$DatasetVersion = '',
     [string]$StepTestExe = '',
     [ValidateSet('', 'coverage', 'stpcompare')][string]$Plugin = '',
-    [string]$ConverterExe = '',
+    [string]$BaselineConverterExe = '',
+    [string]$CandidateConverterExe = '',
     [string]$EngineSrcDir = '',
     [string]$OpenCppCoverageDir = '',
     [string]$ProgramVersion = '',
+    [string]$BaselineProgramVersion = '',
+    [string]$CandidateProgramVersion = '',
     [string]$OutDir = '',
     [string]$WorkerId = '',
     [switch]$SkipBuild,
@@ -136,10 +139,13 @@ if ($rawDlls) { $engineDlls = @($rawDlls) }
 $stepTestExe = if ($StepTestExe) { $StepTestExe } else { [string](Get-DeployValue 'step_test_exe' '') }
 $plugin = if ($Plugin) { $Plugin } else { [string](Get-DeployValue 'plugin' 'coverage') }
 if ($plugin -notin @('coverage', 'stpcompare')) { throw 'plugin must be coverage or stpcompare' }
-$converterExe = if ($ConverterExe) { $ConverterExe } else { [string](Get-DeployValue 'converter_exe' '') }
+$baselineConverterExe = if ($BaselineConverterExe) { $BaselineConverterExe } else { [string](Get-DeployValue 'baseline_converter_exe' '') }
+$candidateConverterExe = if ($CandidateConverterExe) { $CandidateConverterExe } else { [string](Get-DeployValue 'candidate_converter_exe' '') }
 $engineSrcDir = if ($EngineSrcDir) { $EngineSrcDir } else { [string](Get-DeployValue 'engine_src_dir' '') }
 $opencppcoverageDir = if ($OpenCppCoverageDir) { $OpenCppCoverageDir } else { [string](Get-DeployValue 'opencppcoverage_dir' '') }
 $programVersion = if ($ProgramVersion) { $ProgramVersion } else { [string](Get-DeployValue 'program_version' '1.0') }
+$baselineProgramVersion = if ($BaselineProgramVersion) { $BaselineProgramVersion } else { [string](Get-DeployValue 'baseline_program_version' '1.0') }
+$candidateProgramVersion = if ($CandidateProgramVersion) { $CandidateProgramVersion } else { [string](Get-DeployValue 'candidate_program_version' '1.0') }
 $outDirRaw = if ($OutDir) { $OutDir } else { [string](Get-DeployValue 'package_out_dir' 'dist\client_package') }
 $workerId = if ($WorkerId) { $WorkerId } else { [string](Get-DeployValue 'worker_id' 'worker-1') }
 $taskThreads = [int](Get-DeployValue 'task_threads' 2)
@@ -152,7 +158,8 @@ $BuildDir = if ($BuildDir) { Resolve-ProjectPath $BuildDir } else { '' }
 $PgData = if ($PgData) { Resolve-ProjectPath $PgData } else { '' }
 $datasetDir = if ($datasetDir) { Resolve-ProjectPath $datasetDir } else { '' }
 $stepTestExe = if ($stepTestExe) { Resolve-ProjectPath $stepTestExe } else { '' }
-$converterExe = if ($converterExe) { Resolve-ProjectPath $converterExe } else { '' }
+$baselineConverterExe = if ($baselineConverterExe) { Resolve-ProjectPath $baselineConverterExe } else { '' }
+$candidateConverterExe = if ($candidateConverterExe) { Resolve-ProjectPath $candidateConverterExe } else { '' }
 $engineSrcDir = if ($engineSrcDir) { Resolve-ProjectPath $engineSrcDir } else { '' }
 $opencppcoverageDir = if ($opencppcoverageDir) { Resolve-ProjectPath $opencppcoverageDir } else { '' }
 
@@ -281,8 +288,14 @@ foreach ($pluginName in @('coverage', 'stpcompare')) {
     $pluginConfig.db_conn = $localConn
     $pluginConfig.stp_manifest = ($datasetStage + '/manifest.txt').Replace('\', '/')
     $pluginConfig.task_size = $taskSize
-    $pluginConfig | Add-Member -NotePropertyName expected_program_version -NotePropertyValue ([string]$programVersion) -Force
     $pluginConfig | Add-Member -NotePropertyName expected_dataset_version -NotePropertyValue ([string]$datasetVersion) -Force
+    if ($pluginName -eq 'coverage') {
+        $pluginConfig | Add-Member -NotePropertyName expected_program_version -NotePropertyValue ([string]$programVersion) -Force
+    } else {
+        $pluginConfig.PSObject.Properties.Remove('expected_program_version')
+        $pluginConfig | Add-Member -NotePropertyName expected_baseline_program_version -NotePropertyValue ([string]$baselineProgramVersion) -Force
+        $pluginConfig | Add-Member -NotePropertyName expected_candidate_program_version -NotePropertyValue ([string]$candidateProgramVersion) -Force
+    }
 }
 # The CMake ALL target refreshes bin/config from the source template on every
 # build. Keep deployment settings outside build output so later Release
@@ -300,15 +313,17 @@ if (-not $SkipPackage) {
         -OutDir $outDir `
         -BinDir $binDir `
         -Config $buildConfig `
-        -Plugin $plugin -ConverterExe $converterExe `
+        -Plugin $plugin -BaselineConverterExe $baselineConverterExe -CandidateConverterExe $candidateConverterExe `
         -Endpoint $endpoint `
+        -DeploymentEndpoint "http://${serverIp}:$resultPort" `
         -ServerIp $serverIp `
         -ServerPort $serverPort `
         -DbPort $dbPort -DbName $dbName -DbUser $dbUser -DbPassword $dbPassword `
         -WorkerId $workerId `
         -TaskThreads $taskThreads `
         -StoreCov:$storeCov `
-        -ProgramVersion $programVersion -DatasetVersion $datasetVersion `
+        -ProgramVersion $programVersion -BaselineProgramVersion $baselineProgramVersion `
+        -CandidateProgramVersion $candidateProgramVersion -DatasetVersion $datasetVersion `
         -StepTestExe $stepTestExe -EngineSrcDir $engineSrcDir -EngineDlls $engineDlls `
         -DatasetDir $datasetStage -OpenCppCoverageDir $opencppcoverageDir
 } else {
@@ -317,7 +332,7 @@ if (-not $SkipPackage) {
 
 Write-Host ''
 Write-Host '=== 6. result service and offline Python analysis ==='
-New-Item -ItemType Directory -Force -Path $runtimeDir, (Join-Path $runtimeDir 'logs') | Out-Null
+New-Item -ItemType Directory -Force -Path $runtimeDir, (Join-Path $runtimeDir 'logs'), (Join-Path $runtimeDir 'artifact_import') | Out-Null
 $resultTemplate = Join-Path $ProjectRoot 'result_service\config.example.json'
 if (-not (Test-Path -LiteralPath $resultTemplate -PathType Leaf)) {
     throw "Result service template not found: $resultTemplate"
@@ -331,9 +346,12 @@ foreach ($entry in @{
     static_dir = '../result_service/web'
     plugin_views_dir = ''
     plugin_adapters_dir = ''
+    plugin_ai_contexts_dir = ''
     analysis_scripts_dir = 'result_service/analysis_scripts'
     analysis_reports_dir = 'result_service/reports'
     report_templates_dir = ''
+    artifact_store_dir = 'result_service/artifacts'
+    artifact_import_roots = @('artifact_import')
     scheduler_management_url = "http://127.0.0.1:$managementPort"
     scheduler_config_path = $outCfg
     logs_dir = 'logs'
@@ -351,6 +369,10 @@ if ($SkipPackage -or -not (Test-Path -LiteralPath $clientConfig -PathType Leaf))
     foreach ($property in $clientTemplate.plugins.PSObject.Properties) {
         if ($property.Value.PSObject.Properties.Name -contains 'db_conn') { $property.Value.db_conn = $remoteConn }
         if ($property.Value.PSObject.Properties.Name -contains 'dry_run') { $property.Value.dry_run = $false }
+    }
+    if ($clientTemplate.plugins.stpcompare.programs) {
+        $clientTemplate.plugins.stpcompare.programs.baseline.version = [string]$baselineProgramVersion
+        $clientTemplate.plugins.stpcompare.programs.candidate.version = [string]$candidateProgramVersion
     }
     $clientConfig = Join-Path $runtimeDir 'client.template.json'
     Write-AtomicText $clientConfig ($clientTemplate | ConvertTo-Json -Depth 20)

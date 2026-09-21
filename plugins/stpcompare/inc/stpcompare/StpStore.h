@@ -1,9 +1,21 @@
 #pragma once
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 namespace stpcompare {
+struct RawOutput {
+    std::string program_role;
+    std::string export_stage;
+    std::string program_version;
+    std::string original_filename;
+    std::string content;
+    std::string content_sha256;
+    std::uint64_t content_size=0;
+};
 struct FileResult {
-    std::string run_id,file,attempt_id,detail,info_txt,info_new_txt;
+    std::string run_id,file,attempt_id,detail;
+    std::vector<RawOutput> outputs;
     bool successful=false;
 };
 class StpResultStore {

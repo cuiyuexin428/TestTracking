@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -22,9 +24,23 @@ _COMMON_WIDGET_KEYS = {"id", "type", "title", "description"}
 class PluginViewError(ValueError):
     """A plugin view definition does not satisfy the declarative contract."""
 
+    def __init__(self, message: str, status: int = 400, *, current_revision: str | None = None):
+        super().__init__(message)
+        self.status = status
+        self.current_revision = current_revision
+
+
+def view_revision(definition: dict[str, Any]) -> str:
+    canonical = json.dumps(definition, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
 
 class PluginViewStore:
     """Load and persist validated, data-only plugin result views."""
+
+    # Shared across store instances: HTTP requests and plugin bundles can hold
+    # different stores referring to the same files in this service process.
+    lock = threading.RLock()
 
     def __init__(self, directory: str | Path | None = None):
         self.directory = Path(directory).resolve() if directory else None
@@ -47,27 +63,29 @@ class PluginViewStore:
         return names
 
     def load(self, plugin: str) -> dict[str, Any]:
-        path = self._path(plugin)
-        if not path.is_file():
-            raise PluginViewError(f"plugin view definition not found: {plugin}")
-        definition = self._read_json(path)
-        validate_plugin_view(definition, expected_plugin=plugin)
-        return definition
+        with self.lock:
+            path = self._path(plugin)
+            if not path.is_file():
+                raise PluginViewError(f"plugin view definition not found: {plugin}")
+            definition = self._read_json(path)
+            validate_plugin_view(definition, expected_plugin=plugin)
+            return definition
 
     def save(self, plugin: str, definition: Any) -> dict[str, Any]:
         validate_plugin_view(definition, expected_plugin=plugin)
-        target = self._path(plugin)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
-        try:
-            temporary.write_text(
-                json.dumps(definition, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            os.replace(temporary, target)
-        finally:
-            temporary.unlink(missing_ok=True)
-        return self.load(plugin)
+        with self.lock:
+            target = self._path(plugin)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
+            try:
+                with temporary.open("w", encoding="utf-8", newline="\n") as output:
+                    output.write(json.dumps(definition, ensure_ascii=False, indent=2) + "\n")
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+            return self.load(plugin)
 
     def _path(self, plugin: str) -> Path:
         if not _PLUGIN_NAME.fullmatch(plugin):

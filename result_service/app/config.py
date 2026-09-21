@@ -43,9 +43,12 @@ class ServiceConfig:
     static_dir: str | None = None
     plugin_views_dir: str | None = None
     plugin_adapters_dir: str | None = None
+    plugin_ai_contexts_dir: str | None = None
     analysis_scripts_dir: str | None = None
     analysis_reports_dir: str | None = None
     report_templates_dir: str | None = None
+    artifact_store_dir: str | None = None
+    artifact_import_roots: tuple[str, ...] = ()
     scheduler_management_url: str = "http://127.0.0.1:5556"
     scheduler_config_path: str | None = None
     client_config_path: str | None = None
@@ -58,19 +61,9 @@ class ServiceConfig:
     def defaults(cls) -> "ServiceConfig":
         return cls(
             providers={
-                "codex": ProviderConfig(
-                    name="codex",
-                    command="codex",
-                    # Keep the invocation compatible with the local Codex CLI,
-                    # while leaving approval and sandbox policy to the user's
-                    # own Codex configuration.
-                    args=("exec", "--json", "--skip-git-repo-check", "-"),
-                ),
                 "dsh": ProviderConfig(
                     name="dsh",
                     command="dsh",
-                    args=("--profile", "headless"),
-                    prompt_mode="argument",
                 ),
             }
         )
@@ -93,9 +86,15 @@ class ServiceConfig:
                 workspace=resolved(config.workspace), static_dir=resolved(config.static_dir),
                 plugin_views_dir=resolved(config.plugin_views_dir),
                 plugin_adapters_dir=resolved(config.plugin_adapters_dir),
+                plugin_ai_contexts_dir=resolved(config.plugin_ai_contexts_dir),
                 analysis_scripts_dir=resolved(config.analysis_scripts_dir),
                 analysis_reports_dir=resolved(config.analysis_reports_dir),
                 report_templates_dir=resolved(config.report_templates_dir),
+                artifact_store_dir=resolved(config.artifact_store_dir),
+                artifact_import_roots=tuple(
+                    str((config_path.parent / value).resolve())
+                    for value in config.artifact_import_roots
+                ),
                 scheduler_management_url=config.scheduler_management_url,
                 scheduler_config_path=resolved(config.scheduler_config_path),
                 client_config_path=resolved(config.client_config_path),
@@ -119,14 +118,20 @@ class ServiceConfig:
         plugin_adapters_dir = env.get(
             "RESULT_SERVICE_PLUGIN_ADAPTERS", config.plugin_adapters_dir or ""
         ) or None
+        plugin_ai_contexts_dir = env.get(
+            "RESULT_SERVICE_PLUGIN_AI_CONTEXTS", config.plugin_ai_contexts_dir or ""
+        ) or None
         return cls(host=host, port=port, db_conn=db_conn,
                    stp_result_table=config.stp_result_table,
                    workspace=workspace, static_dir=config.static_dir,
                    plugin_views_dir=plugin_views_dir,
                    plugin_adapters_dir=plugin_adapters_dir,
+                   plugin_ai_contexts_dir=plugin_ai_contexts_dir,
                    analysis_scripts_dir=config.analysis_scripts_dir,
                    analysis_reports_dir=config.analysis_reports_dir,
                    report_templates_dir=config.report_templates_dir,
+                   artifact_store_dir=config.artifact_store_dir,
+                   artifact_import_roots=config.artifact_import_roots,
                    scheduler_management_url=config.scheduler_management_url,
                    scheduler_config_path=config.scheduler_config_path,
                    client_config_path=config.client_config_path,
@@ -151,6 +156,10 @@ class ServiceConfig:
                 isinstance(name, str) and isinstance(value, dict)
                 for name, value in plugin_options.items()):
             raise ValueError("plugin_options must map plugin names to objects")
+        import_roots = raw.get("artifact_import_roots", base.artifact_import_roots)
+        if (not isinstance(import_roots, (list, tuple))
+                or not all(isinstance(value, str) and value.strip() for value in import_roots)):
+            raise ValueError("artifact_import_roots must be an array of nonempty paths")
         return ServiceConfig(
             host=str(raw.get("host", base.host)),
             port=int(raw.get("port", base.port)),
@@ -160,9 +169,14 @@ class ServiceConfig:
             static_dir=raw.get("static_dir", base.static_dir),
             plugin_views_dir=raw.get("plugin_views_dir", base.plugin_views_dir),
             plugin_adapters_dir=raw.get("plugin_adapters_dir", base.plugin_adapters_dir),
+            plugin_ai_contexts_dir=raw.get(
+                "plugin_ai_contexts_dir", base.plugin_ai_contexts_dir
+            ),
             analysis_scripts_dir=raw.get("analysis_scripts_dir", base.analysis_scripts_dir),
             analysis_reports_dir=raw.get("analysis_reports_dir", base.analysis_reports_dir),
             report_templates_dir=raw.get("report_templates_dir", base.report_templates_dir),
+            artifact_store_dir=raw.get("artifact_store_dir", base.artifact_store_dir),
+            artifact_import_roots=tuple(import_roots),
             scheduler_management_url=raw.get("scheduler_management_url", base.scheduler_management_url),
             scheduler_config_path=raw.get("scheduler_config_path", base.scheduler_config_path),
             client_config_path=raw.get("client_config_path", base.client_config_path),

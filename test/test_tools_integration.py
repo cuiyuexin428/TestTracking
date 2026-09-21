@@ -1,5 +1,6 @@
 """Exercise deployment/analysis scripts against private paths and PostgreSQL."""
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -66,6 +67,22 @@ class ToolIntegrationTests(unittest.TestCase):
 
     def database_args(self):
         return ['-DbConn', self.conn, '-Psql', self.pg.program('psql')]
+
+    def test_dataset_manifest_records_size_and_sha256(self):
+        dataset = self.root / 'dataset'
+        nested = dataset / 'nested'
+        nested.mkdir(parents=True)
+        content = b'STP fixture\r\n'
+        (nested / 'part.stp').write_bytes(content)
+        (dataset / 'ignored.txt').write_text('not a task')
+        manifest = self.root / 'manifest.txt'
+        self.script('build_dataset_manifest.ps1', '-DatasetDir', dataset, '-OutFile', manifest)
+        rows = [json.loads(line) for line in manifest.read_text(encoding='utf-8').splitlines()]
+        self.assertEqual([{
+            'path': 'nested/part.stp',
+            'size_bytes': len(content),
+            'content_sha256': hashlib.sha256(content).hexdigest(),
+        }], rows)
 
     def test_postgres_replaces_legacy_remote_rules_and_is_idempotent(self):
         # auto.conf keeps this private server on loopback; matching the main
@@ -190,25 +207,26 @@ class ToolIntegrationTests(unittest.TestCase):
         self.script('export_selected.ps1', '-RunId', run, '-OutFile', output, *self.database_args(), succeeds=False)
         self.assertEqual(output.read_text(), expected)
 
-    def test_compare_reports_missing_files_and_replaces_previous_report(self):
+    def test_stp_raw_result_check_reports_missing_files_and_replaces_previous_report(self):
         self.sql("CREATE TABLE plugin_runs(run_id text,plugin_type text,expected_files int,status text,finished_at timestamptz);"
                  "CREATE TABLE plugin_run_files(run_id text,plugin_type text,file text);"
                  "CREATE TABLE plugin_file_outcomes(run_id text,plugin_type text,file text,status text,detail text);"
-                 "CREATE TABLE stp_compare_old(run_id text,file text,info_txt text,info_new_txt text);"
+                 "CREATE TABLE stp_compare_old(run_id text,file text,program_role text,export_stage text,"
+                 "content bytea,content_sha256 text,content_size bigint);"
                  "INSERT INTO plugin_runs VALUES('run','stpcompare',2,'finished',now());"
                  "INSERT INTO plugin_run_files VALUES('run','stpcompare','one.stp'),('run','stpcompare','two.stp');"
                  "INSERT INTO plugin_file_outcomes VALUES('run','stpcompare','one.stp','success','');"
-                 "INSERT INTO stp_compare_old VALUES('run','one.stp','old','new');")
+                 "INSERT INTO stp_compare_old SELECT 'run','one.stp',role,stage,decode('01','hex'),repeat('a',64),1 "
+                 "FROM (VALUES('baseline'),('candidate')) p(role) CROSS JOIN (VALUES('first'),('second')) s(stage);")
         output = self.root / 'compare.txt'
         self.script('settle_stpcompare.ps1', '-RunId', 'run', '-OutFile', output, *self.database_args(), succeeds=False)
         self.assertIn('incomplete\ttwo.stp', output.read_text())
-        self.assertIn('different\tone.stp', output.read_text())
         self.sql("INSERT INTO plugin_file_outcomes VALUES('run','stpcompare','two.stp','success','');"
-                 "INSERT INTO stp_compare_old VALUES('run','two.stp','same','same');"
-                 "UPDATE stp_compare_old SET info_new_txt=info_txt;")
+                 "INSERT INTO stp_compare_old SELECT 'run','two.stp',role,stage,decode('02','hex'),repeat('b',64),1 "
+                 "FROM (VALUES('baseline'),('candidate')) p(role) CROSS JOIN (VALUES('first'),('second')) s(stage);")
         self.script('settle_stpcompare.ps1', '-RunId', 'run', '-OutFile', output, *self.database_args())
-        self.assertIn('different=0', output.read_text())
-        self.assertNotIn('different\tone.stp', output.read_text())
+        self.assertIn('complete=2', output.read_text())
+        self.assertNotIn('incomplete\t', output.read_text())
 
     def test_deploy_relative_paths_from_non_project_working_directory(self):
         project_name = 'project with spaces 源码'
@@ -238,6 +256,8 @@ class ToolIntegrationTests(unittest.TestCase):
         deploy.write_text(json.dumps({'build_config':'Release','server_ip':'192.0.2.17','server_port':6123,'db_port':6543,
                                       'management_port':6124,'result_port':web_port,'plugin':'stpcompare',
                                       'db_name':'test_db','db_user':'test_user','program_version':'p17',
+                                      'baseline_program_version':'old-p17',
+                                      'candidate_program_version':'new-p17',
                                       'dataset_version':'d17'}))
         # Invoke from the parent directory while every deployment path is
         # relative to the project root. This catches accidental resolution
@@ -256,6 +276,9 @@ class ToolIntegrationTests(unittest.TestCase):
         self.assertEqual(web_port, result['port'])
         self.assertEqual('0.0.0.0', result['host'])
         self.assertEqual('logs', result['logs_dir'])
+        self.assertEqual('result_service/artifacts', result['artifact_store_dir'])
+        self.assertEqual(['artifact_import'], result['artifact_import_roots'])
+        self.assertTrue((project / 'runtime/artifact_import').is_dir())
         self.assertFalse(result['plugin_views_dir'])
         self.assertFalse(result['plugin_adapters_dir'])
         self.assertFalse(result['report_templates_dir'])
@@ -265,6 +288,8 @@ class ToolIntegrationTests(unittest.TestCase):
         self.assertEqual('tcp://192.0.2.17:6123', template['scheduler']['endpoint'])
         self.assertEqual(['stpcompare'], [key for key, value in template['plugins'].items() if value['enabled']])
         self.assertIn('port=6543', template['plugins']['stpcompare']['db_conn'])
+        self.assertEqual('old-p17', template['plugins']['stpcompare']['programs']['baseline']['version'])
+        self.assertEqual('new-p17', template['plugins']['stpcompare']['programs']['candidate']['version'])
         for name in ('start_server', 'start_scheduler', 'start_result_service', 'stop_result_service'):
             batch = (project / 'runtime' / (name + '.bat')).read_text(encoding='ascii')
             self.assertIn('%~dp0..\\tools\\source_services.ps1', batch)
@@ -292,7 +317,9 @@ class ToolIntegrationTests(unittest.TestCase):
                 target = project / 'plugins' / name
                 target.mkdir(parents=True)
                 for artifact in ('result_adapter.py', 'result_view.json', 'result_report.py'):
-                    shutil.copyfile(ROOT / 'plugins' / name / artifact, target / artifact)
+                    source = ROOT / 'plugins' / name / artifact
+                    if source.is_file():
+                        shutil.copyfile(source, target / artifact)
             local_python = project / 'runtime/python'
             local_python.mkdir()
             for source in portable.iterdir():
@@ -328,7 +355,10 @@ class ToolIntegrationTests(unittest.TestCase):
         for name in ('coverage', 'stpcompare'):
             self.assertIn('port=6543', config['plugins'][name]['db_conn'])
             self.assertEqual(config['plugins'][name]['stp_manifest'], str(project / 'runtime/dataset/manifest.txt').replace('\\','/'))
-            self.assertEqual(config['plugins'][name]['expected_program_version'], 'p17')
+        self.assertEqual(config['plugins']['coverage']['expected_program_version'], 'p17')
+        self.assertEqual(config['plugins']['stpcompare']['expected_baseline_program_version'], 'old-p17')
+        self.assertEqual(config['plugins']['stpcompare']['expected_candidate_program_version'], 'new-p17')
+        self.assertNotIn('expected_program_version', config['plugins']['stpcompare'])
         for name in ('coverage', 'stpcompare'):
             output = self.root / ('package ' + name)
             self.script('build_package.ps1', '-OutDir', output, '-BinDir', binaries, '-OnlyClient',

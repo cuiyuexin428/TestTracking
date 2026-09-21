@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import re
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Mapping, Protocol
 
-from .views import PluginViewStore
+from .views import PluginViewError, PluginViewStore, validate_plugin_view, view_revision
 
 
 class QueryConnection(Protocol):
@@ -33,6 +34,32 @@ class ResultPlugin(Protocol):
     def view_definition(self) -> dict[str, Any]: ...
 
     def save_view_definition(self, value: Any) -> dict[str, Any]: ...
+
+
+def versioned_plugin_view(plugin: ResultPlugin) -> dict[str, Any]:
+    """Add API concurrency metadata without changing the plugin-owned schema."""
+    with PluginViewStore.lock:
+        definition = plugin.view_definition()
+        return {**definition, "revision": view_revision(definition)}
+
+
+def save_versioned_plugin_view(plugin: ResultPlugin, value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise PluginViewError("plugin view definition must be an object")
+    definition = {key: item for key, item in value.items() if key != "revision"}
+    validate_plugin_view(definition, expected_plugin=plugin.name)
+    expected = value.get("revision")
+    if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise PluginViewError("revision is required; reload the plugin view before saving")
+    with PluginViewStore.lock:
+        current = view_revision(plugin.view_definition())
+        if expected != current:
+            raise PluginViewError(
+                "展示已被其他使用者修改。当前草稿已保留，请读取最新版本后合并修改。",
+                409, current_revision=current,
+            )
+        saved = plugin.save_view_definition(definition)
+        return {**saved, "revision": view_revision(saved)}
 
 
 class ViewOnlyResultAdapter:
@@ -115,7 +142,45 @@ class PluginAdapterStore:
         return module
 
 
+class PluginAIContextStore:
+    """Load immutable, plugin-owned background material for DSH."""
+
+    MAX_BYTES = 64 * 1024
+
+    def __init__(self, directory: str | Path | None = None):
+        self.directory = Path(directory).resolve() if directory else None
+        self.plugin_source_root = Path(__file__).resolve().parents[2] / "plugins"
+
+    def _path(self, plugin: str) -> Path:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", plugin):
+            raise ResultPluginError(f"invalid plugin name: {plugin}")
+        if self.directory:
+            return self.directory / f"{plugin}.md"
+        return self.plugin_source_root / plugin / "AI_CONTEXT.md"
+
+    def load(self, plugin: str) -> dict[str, Any]:
+        path = self._path(plugin)
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise ResultPluginError(f"plugin AI context not found: {plugin}") from exc
+        if not raw or len(raw) > self.MAX_BYTES:
+            raise ResultPluginError(f"plugin AI context has invalid size: {plugin}")
+        try:
+            content = raw.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ResultPluginError(f"plugin AI context must be UTF-8: {plugin}") from exc
+        if not content.strip():
+            raise ResultPluginError(f"plugin AI context is empty: {plugin}")
+        return {
+            "plugin": plugin,
+            "content": content,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+
+
 def _validate_packaged_resources(views: PluginViewStore, adapters: PluginAdapterStore,
+                                 contexts: PluginAIContextStore,
                                  report_templates_dir: str | None) -> None:
     # Source discovery and external view-only plugins need no installation
     # registry. A built package declares the resources it actually ships so a
@@ -135,7 +200,8 @@ def _validate_packaged_resources(views: PluginViewStore, adapters: PluginAdapter
     for plugin, resources in definition["plugins"].items():
         if (not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", plugin)
                 or not isinstance(resources, list) or "view" not in resources
-                or any(item not in ("view", "adapter", "report_template") for item in resources)):
+                or any(item not in ("view", "adapter", "report_template", "ai_context")
+                       for item in resources)):
             raise ResultPluginError(f"invalid resource declaration for plugin {plugin}: {manifest}")
         paths = {
             "view": views._path(plugin),
@@ -143,6 +209,7 @@ def _validate_packaged_resources(views: PluginViewStore, adapters: PluginAdapter
             "report_template": (Path(report_templates_dir) / f"{plugin}.py"
                                 if report_templates_dir else
                                 views.plugin_source_root / plugin / "result_report.py"),
+            "ai_context": contexts._path(plugin),
         }
         for resource in resources:
             if not paths[resource].is_file():
@@ -154,10 +221,12 @@ def _validate_packaged_resources(views: PluginViewStore, adapters: PluginAdapter
 def default_plugins(plugin_options: Mapping[str, Mapping[str, Any]] | None = None,
                     views_dir: str | None = None,
                     adapters_dir: str | None = None,
-                    report_templates_dir: str | None = None) -> dict[str, ResultPlugin]:
+                    report_templates_dir: str | None = None,
+                    ai_contexts_dir: str | None = None) -> dict[str, ResultPlugin]:
     views = PluginViewStore(views_dir)
     adapters = PluginAdapterStore(adapters_dir)
-    _validate_packaged_resources(views, adapters, report_templates_dir)
+    contexts = PluginAIContextStore(ai_contexts_dir)
+    _validate_packaged_resources(views, adapters, contexts, report_templates_dir)
     options = plugin_options or {}
     plugins = {
         name: PluginBundle(name, adapters.load(name, options.get(name, {})), views)

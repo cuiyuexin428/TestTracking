@@ -1,6 +1,7 @@
 #include "common/Config.h"
 
 #include <fstream>
+#include <filesystem>
 #include <stdexcept>
 
 namespace common {
@@ -11,7 +12,19 @@ Config& Config::instance() {
 }
 
 void Config::load(const std::string& path) {
-    std::ifstream in(path);
+    std::ifstream in;
+    try {
+        in.open(std::filesystem::u8path(path));
+    } catch (const std::filesystem::filesystem_error&) {
+        // Older entry points still receive Windows ANSI argv. New callers
+        // (including the process Agent) consistently pass UTF-8 paths.
+    }
+#ifdef _WIN32
+    if (!in.is_open()) {
+        in.clear();
+        in.open(path);
+    }
+#endif
     if (!in.is_open()) {
         throw std::runtime_error("Config: cannot open file: " + path);
     }

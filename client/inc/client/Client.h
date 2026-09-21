@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -27,7 +28,10 @@ struct ClientPluginDeleter {
 // publish completion events. Pausing execution never pauses session maintenance.
 class Client {
    public:
-    explicit Client(common::Config& config, std::shared_ptr<std::atomic<bool>> stop_signal = {});
+    explicit Client(common::Config& config, std::shared_ptr<std::atomic<bool>> stop_signal = {},
+                    std::string selected_plugin = {}, bool qualify_worker_id = false,
+                    std::shared_ptr<std::atomic<bool>> drain_signal = {},
+                    std::function<void()> on_registered = {});
     ~Client();
     Client(const Client&) = delete;
     Client& operator=(const Client&) = delete;
@@ -63,6 +67,7 @@ class Client {
     void RetryReports(std::chrono::steady_clock::time_point now);
     void CancelExecution();
     void PollExecutor();
+    bool ExecutionWindowOpen() const;
 
     common::Config& config_;
     common::ZmqDealer dealer_;
@@ -70,6 +75,8 @@ class Client {
     common::WorkerPlugin* plugin_ = nullptr;
     TaskExecutor executor_;
     std::shared_ptr<std::atomic<bool>> stop_requested_;
+    std::shared_ptr<std::atomic<bool>> drain_requested_;
+    std::function<void()> on_registered_;
     bool silent_ = false;
     bool draining_executor_ = false;
     bool executor_started_ = false;
@@ -91,6 +98,7 @@ class Client {
     std::chrono::steady_clock::time_point request_sent_at_;
     std::chrono::milliseconds backoff_;
     std::string worker_id_;
+    std::string selected_plugin_;
     std::string registration_id_;
     std::string session_id_;
     std::string ip_;

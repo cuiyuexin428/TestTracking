@@ -10,9 +10,10 @@ import socket
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -22,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from result_service.app.config import ServiceConfig
 from result_service.app.dsh_proxy import _BROWSER_BRIDGE
 from result_service.app.providers import DshWebManager
+from result_service.app.reports import ReportStore
 from result_service.app.server import Handler, ResultHTTPServer, ResultService
 
 
@@ -113,6 +115,9 @@ def _serve(server):
 
 
 class DshProxyTests(unittest.TestCase):
+    operator_id = "123e4567-e89b-42d3-a456-426614174001"
+    mount = f"/ai/dsh/{operator_id}/"
+
     @classmethod
     def setUpClass(cls):
         cls.upstream = ThreadingHTTPServer(("127.0.0.1", 0), _DshFixture)
@@ -122,7 +127,9 @@ class DshProxyTests(unittest.TestCase):
         cls.upstream_port = cls.upstream_context.__enter__()
         cls.service = ResultService(ServiceConfig.defaults())
         cls.service.dsh_web = MagicMock()
-        cls.service.dsh_web.start.return_value = f"http://127.0.0.1:{cls.upstream_port}/"
+        cls.service.dsh_web.acquire.side_effect = lambda operator: nullcontext(
+            f"http://127.0.0.1:{cls.upstream_port}/"
+        )
         handler = type("TestHandler", (Handler,), {"service": cls.service})
         cls.server = ResultHTTPServer(("127.0.0.1", 0), handler)
         cls.server_context = _serve(cls.server)
@@ -133,6 +140,9 @@ class DshProxyTests(unittest.TestCase):
         cls.upstream.finish_stream.set()
         cls.server_context.__exit__(None, None, None)
         cls.upstream_context.__exit__(None, None, None)
+
+    def setUp(self):
+        self.service.dsh_web.acquire.reset_mock()
 
     def request(self, method, path, body=None, headers=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=2)
@@ -148,21 +158,29 @@ class DshProxyTests(unittest.TestCase):
         return response, data
 
     def test_remote_entry_rebases_assets_and_boot_graph_before_dsh_scripts(self):
-        response, data = self.request("GET", "/ai/dsh/")
+        response, data = self.request("GET", self.mount)
         self.assertEqual(200, response.status)
-        self.assertIn(b'src="/ai/dsh/assets/app.js"', data)
-        self.assertIn(b'"url":"/ai/dsh/plugins/connection/client.js"', data)
+        self.assertIn(f'src="{self.mount}assets/app.js"'.encode(), data)
+        self.assertIn(f'"url":"{self.mount}plugins/connection/client.js"'.encode(), data)
         self.assertLess(data.index(b"window.fetch ="), data.index(b"window.__DSH_BOOT__"))
         self.assertEqual(len(data), int(response.getheader("Content-Length")))
-        response, data = self.request("GET", "/ai/dsh/assets/app.js")
+        self.service.dsh_web.acquire.assert_called_with(self.operator_id)
+        response, data = self.request("GET", self.mount + "assets/app.js")
         self.assertEqual(200, response.status)
         self.assertEqual(b"window.assetLoaded = true;", data)
+
+    def test_missing_or_invalid_operator_namespace_is_rejected(self):
+        for path in ("/ai/dsh/", "/ai/dsh/not-an-operator/"):
+            with self.subTest(path=path):
+                response, data = self.request("GET", path)
+                self.assertEqual(400, response.status, data)
+        self.service.dsh_web.acquire.assert_not_called()
 
     def test_http_methods_preserve_body_query_and_translate_same_origin(self):
         for method in ("POST", "PUT", "PATCH", "DELETE"):
             with self.subTest(method=method):
                 body = '{"message":"你好"}'.encode()
-                response, data = self.request(method, "/ai/dsh/api/session?run=1", body)
+                response, data = self.request(method, self.mount + "api/session?run=1", body)
                 result = json.loads(data)
                 self.assertEqual(200, response.status)
                 self.assertEqual("/api/session?run=1", result["path"])
@@ -172,15 +190,15 @@ class DshProxyTests(unittest.TestCase):
                 self.assertEqual("same-origin", result["fetch_site"])
 
     def test_redirect_stays_inside_dsh_mount(self):
-        response, _ = self.request("GET", "/ai/dsh/redirect")
+        response, _ = self.request("GET", self.mount + "redirect")
         self.assertEqual(302, response.status)
-        self.assertEqual("/ai/dsh/session?one=1", response.getheader("Location"))
+        self.assertEqual(self.mount + "session?one=1", response.getheader("Location"))
 
     def test_equivalent_host_spelling_is_translated_for_dsh(self):
         for host, origin in [("tracking-server:80", "http://tracking-server"),
                              ("Tracking-Server:56330", "http://tracking-server:56330")]:
             with self.subTest(host=host):
-                response, data = self.request("POST", "/ai/dsh/api/session", b"native payload",
+                response, data = self.request("POST", self.mount + "api/session", b"native payload",
                     {"Host": host, "Origin": origin, "Content-Type": "text/plain"})
                 self.assertEqual(200, response.status)
                 result = json.loads(data)
@@ -189,27 +207,27 @@ class DshProxyTests(unittest.TestCase):
 
     def test_foreign_origin_cannot_start_or_reach_dsh_including_websocket(self):
         for method, path, extra in (
-            ('GET', '/ai/dsh/', {}),
-            ('POST', '/ai/dsh/api/session', {}),
-            ('PATCH', '/ai/dsh/api/session', {}),
-            ('DELETE', '/ai/dsh/api/session', {}),
-            ('GET', '/ai/dsh/api/events.host', {'Connection': 'Upgrade', 'Upgrade': 'websocket'}),
+            ('GET', self.mount, {}),
+            ('POST', self.mount + 'api/session', {}),
+            ('PATCH', self.mount + 'api/session', {}),
+            ('DELETE', self.mount + 'api/session', {}),
+            ('GET', self.mount + 'api/events.host', {'Connection': 'Upgrade', 'Upgrade': 'websocket'}),
         ):
-            with self.subTest(method=method, path=path), patch.object(self.service.dsh_web, 'start') as start:
+            with self.subTest(method=method, path=path), patch.object(self.service.dsh_web, 'acquire') as acquire:
                 connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=2)
                 try:
                     connection.request(method, path, headers={'Origin': 'http://unrelated.invalid', **extra})
                     response = connection.getresponse()
                     self.assertEqual(403, response.status, response.read())
                     response.read()
-                    start.assert_not_called()
+                    acquire.assert_not_called()
                 finally:
                     connection.close()
 
     def test_sse_is_flushed_before_upstream_completes(self):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=2)
         try:
-            connection.request("GET", "/ai/dsh/plugins/events")
+            connection.request("GET", self.mount + "plugins/events")
             response = connection.getresponse()
             self.assertEqual("text/event-stream", response.getheader("Content-Type"))
             self.assertEqual(b"data: ready\n", response.readline())
@@ -222,7 +240,7 @@ class DshProxyTests(unittest.TestCase):
     def test_websocket_upgrade_and_frames_work_with_remote_origin(self):
         with socket.create_connection(("127.0.0.1", self.port), timeout=2) as client:
             authority = "Tracking-Server:80"
-            client.sendall(("GET /ai/dsh/api/events.host HTTP/1.1\r\n"
+            client.sendall((f"GET {self.mount}api/events.host HTTP/1.1\r\n"
                             f"Host: {authority}\r\nOrigin: http://tracking-server\r\n"
                             "Connection: Upgrade\r\nUpgrade: websocket\r\n"
                             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
@@ -251,10 +269,12 @@ class DshBrowserBridgeTests(unittest.TestCase):
         # Execute the injected bridge against browser API stand-ins. Unlike
         # source-string checks this verifies URL objects, Request bodies,
         # WebSocket constants and inherited DOM property setters.
+        mount = "/ai/dsh/123e4567-e89b-42d3-a456-426614174001"
+        bridge = _BROWSER_BRIDGE.replace("__DSH_PROXY_PREFIX__", json.dumps(mount))
         script = r"""
 const assert = require('node:assert/strict');
 globalThis.window = globalThis;
-globalThis.location = new URL('http://192.168.100.83:56330/ai/dsh/');
+globalThis.location = new URL('http://192.168.100.83:56330/ai/dsh/123e4567-e89b-42d3-a456-426614174001/');
 globalThis.crypto = {getRandomValues: require('node:crypto').webcrypto.getRandomValues.bind(require('node:crypto').webcrypto)};
 const requests = [];
 globalThis.fetch = async (input, init) => { requests.push([input, init]); };
@@ -267,23 +287,23 @@ for (const [name, property] of [['HTMLScriptElement','src'],['HTMLLinkElement','
     configurable: true, get() {return this.value;}, set(value) {this.value=value;}
   });
 }
-""" + _BROWSER_BRIDGE.removeprefix("<script>").removesuffix("</script>") + r"""
+""" + bridge.removeprefix("<script>").removesuffix("</script>") + r"""
 (async () => {
   await fetch(new URL('/api/session.list', location.origin));
-  assert.equal(requests[0][0], location.origin + '/ai/dsh/api/session.list');
+  assert.equal(requests[0][0], location.origin + '/ai/dsh/123e4567-e89b-42d3-a456-426614174001/api/session.list');
   await fetch(new Request(location.origin + '/api/session.prompt', {method:'POST', body:'hello'}));
-  assert.equal(requests[1][0].url, location.origin + '/ai/dsh/api/session.prompt');
+  assert.equal(requests[1][0].url, location.origin + '/ai/dsh/123e4567-e89b-42d3-a456-426614174001/api/session.prompt');
   assert.equal(requests[1][0].method, 'POST');
   assert.equal(await requests[1][0].text(), 'hello');
   assert.equal(new WebSocket('ws://192.168.100.83:56330/api/events.host').url,
-    'ws://192.168.100.83:56330/ai/dsh/api/events.host');
+    'ws://192.168.100.83:56330/ai/dsh/123e4567-e89b-42d3-a456-426614174001/api/events.host');
   assert.equal(WebSocket.OPEN, 1);
-  assert.equal(new EventSource('/plugins/events').url, location.origin + '/ai/dsh/plugins/events');
+  assert.equal(new EventSource('/plugins/events').url, location.origin + '/ai/dsh/123e4567-e89b-42d3-a456-426614174001/plugins/events');
   const link = new HTMLLinkElement();
   link.href = '/assets/langs/sql.js';
-  assert.equal(link.href, location.origin + '/ai/dsh/assets/langs/sql.js');
-  link.href = '/ai/dsh/assets/langs/sql.js';
-  assert.equal(link.href, location.origin + '/ai/dsh/assets/langs/sql.js');
+  assert.equal(link.href, location.origin + '/ai/dsh/123e4567-e89b-42d3-a456-426614174001/assets/langs/sql.js');
+  link.href = '/ai/dsh/123e4567-e89b-42d3-a456-426614174001/assets/langs/sql.js';
+  assert.equal(link.href, location.origin + '/ai/dsh/123e4567-e89b-42d3-a456-426614174001/assets/langs/sql.js');
   link.href = 'https://example.org/help';
   assert.equal(link.href, 'https://example.org/help');
   const report = new HTMLAnchorElement();
@@ -315,7 +335,8 @@ class DshReadinessTests(unittest.TestCase):
                 patch("result_service.app.providers.subprocess.Popen", return_value=process) as popen, \
                 patch("result_service.app.providers.urlopen", return_value=response), \
                 patch.object(manager, "_api_ready", return_value=True):
-            manager.start()
+            operator = "123e4567-e89b-42d3-a456-426614174001"
+            manager.start(operator)
         argv = popen.call_args.args[0]
         overlays = [Path(argv[index + 1]) for index, arg in enumerate(argv) if arg == "--patch"]
         self.assertEqual(2, len(overlays))
@@ -323,6 +344,7 @@ class DshReadinessTests(unittest.TestCase):
         self.assertEqual("testtracking-result-context", context[0]["insert"][0]["id"])
         self.assertTrue(context[0]["insert"][0]["name"].startswith("file:///"))
         self.assertEqual(manager.service_url, popen.call_args.kwargs["env"]["RESULT_SERVICE_URL"])
+        self.assertEqual(operator, popen.call_args.kwargs["env"]["TESTTRACKING_OPERATOR_ID"])
         with patch.object(manager, "_stop_process"):
             manager.close()
         self.assertFalse(overlays[1].exists())
@@ -356,12 +378,41 @@ assert.ok(sections[0].text.includes(process.env.RESULT_SERVICE_URL + '/api/analy
 assert.ok(sections[0].text.includes('read-only psycopg connection'));
 assert.ok(sections[0].text.includes('render(connection, context)'));
 assert.ok(sections[0].text.includes('/api/plugins/<plugin>/report-script'));
+const workflow = sections[0].text;
+assert.ok(workflow.indexOf('First GET ') < workflow.indexOf('PUT '));
+const request = JSON.parse(workflow.match(/PUT \S+ with JSON (\{[^\n]+?\})/)[1]);
+assert.deepEqual(Object.keys(request).sort(), ['operator_id', 'revision', 'source']);
+assert.equal(request.operator_id, process.env.TESTTRACKING_OPERATOR_ID);
+assert.ok(workflow.includes('HTTP 409'));
+assert.ok(workflow.includes('preserve the draft'));
+assert.ok(workflow.includes('merge the changes before saving'));
+assert.ok(workflow.includes('Do not blindly retry'));
 assert.equal(environments[0].resolve().DSH_RESULT_SERVICE_URL, process.env.RESULT_SERVICE_URL);
+assert.equal(environments[0].resolve().TESTTRACKING_OPERATOR_ID, process.env.TESTTRACKING_OPERATOR_ID);
+console.log(JSON.stringify(request));
 """
+        operator = "123e4567-e89b-42d3-a456-426614174001"
         completed = subprocess.run([shutil.which("node"), "--input-type=module", "-"],
                                    input=script, text=True, encoding="utf-8", capture_output=True,
-                                   timeout=10, env={**os.environ, "RESULT_SERVICE_URL": "http://127.0.0.1:54321"})
+                                   timeout=10, env={**os.environ, "RESULT_SERVICE_URL": "http://127.0.0.1:54321",
+                                                    "TESTTRACKING_OPERATOR_ID": operator})
         self.assertEqual(0, completed.returncode, completed.stderr)
+        # Follow the generated request example against the actual API contract.
+        request = json.loads(completed.stdout)
+        with tempfile.TemporaryDirectory(prefix="dsh report contract ") as directory:
+            service = ResultService(ServiceConfig.defaults())
+            self.addCleanup(service.close)
+            service.reports = ReportStore(Path(directory) / "scripts", Path(directory) / "reports")
+            status, original = service.payload("/api/plugins/coverage/report-script", {})
+            self.assertEqual(200, status)
+            request["revision"] = original["revision"]
+            request["source"] = 'def render(connection, context):\n    return "Saved by DSH"\n'
+            status, saved = service.update_report_script("coverage", request)
+            self.assertEqual(200, status, saved)
+            request["source"] = request["source"].replace("Saved", "Stale")
+            status, conflict = service.update_report_script("coverage", request)
+            self.assertEqual(409, status, conflict)
+            self.assertEqual(saved["source"], service.reports.get_script("coverage")["source"])
 
 
 if __name__ == "__main__":

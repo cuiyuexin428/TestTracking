@@ -1,4 +1,4 @@
-<#
+﻿<#
 Build a relocatable server distribution from an existing CMake output.
 
 The package is intentionally self-contained and is always run with its root as
@@ -32,6 +32,8 @@ param(
     [string]$DatasetDir = '',
     [string]$DatasetVersion = '',
     [string]$ProgramVersion = '',
+    [string]$BaselineProgramVersion = '',
+    [string]$CandidateProgramVersion = '',
     [string]$PackageVersion = '0.1.0',
     [switch]$SkipDataset,
     [switch]$IncludeSymbols,
@@ -87,7 +89,7 @@ function Copy-DirectoryContents([string]$Source, [string]$Destination) {
     }
 }
 
-function Rewrite-SchedulerConfig([string]$Template, [string]$Destination, [string]$Connection, [int]$Port, [string]$ManifestPath, [string]$ProgramVer, [string]$DatasetVer) {
+function Rewrite-SchedulerConfig([string]$Template, [string]$Destination, [string]$Connection, [int]$Port, [string]$ManifestPath, [string]$ProgramVer, [string]$BaselineProgramVer, [string]$CandidateProgramVer, [string]$DatasetVer) {
     if (-not (Test-Path -LiteralPath $Template -PathType Leaf)) { throw "scheduler template not found: $Template" }
     $config = Get-Content -LiteralPath $Template -Raw | ConvertFrom-Json
     if (-not $config.server) { $config | Add-Member -NotePropertyName server -NotePropertyValue ([pscustomobject]@{}) }
@@ -101,7 +103,13 @@ function Rewrite-SchedulerConfig([string]$Template, [string]$Destination, [strin
         if ($plugin.dll) { $plugin.dll = ('bin/' + [System.IO.Path]::GetFileName([string]$plugin.dll)) }
         $plugin.stp_manifest = $ManifestPath
         $plugin.db_conn = $Connection
-        if ($ProgramVer) { $plugin | Add-Member -NotePropertyName expected_program_version -NotePropertyValue $ProgramVer -Force }
+        if ($pluginName -eq 'coverage' -and $ProgramVer) {
+            $plugin | Add-Member -NotePropertyName expected_program_version -NotePropertyValue $ProgramVer -Force
+        } elseif ($pluginName -eq 'stpcompare') {
+            $plugin.PSObject.Properties.Remove('expected_program_version')
+            if ($BaselineProgramVer) { $plugin | Add-Member -NotePropertyName expected_baseline_program_version -NotePropertyValue $BaselineProgramVer -Force }
+            if ($CandidateProgramVer) { $plugin | Add-Member -NotePropertyName expected_candidate_program_version -NotePropertyValue $CandidateProgramVer -Force }
+        }
         if ($DatasetVer) { $plugin | Add-Member -NotePropertyName expected_dataset_version -NotePropertyValue $DatasetVer -Force }
     }
     if ($config.plugins) {
@@ -182,8 +190,12 @@ $toolsOut = Join-Path $OutDir 'tools'
 $scriptsOut = Join-Path $OutDir 'scripts'
 $dataOut = Join-Path $OutDir 'data'
 $resultOut = Join-Path $OutDir 'result_service'
-foreach ($dir in @($binOut, $cfgOut, $toolsOut, $scriptsOut, $resultOut, (Join-Path $dataOut 'dataset'), (Join-Path $dataOut 'artifacts'), (Join-Path $dataOut 'reports'), (Join-Path $dataOut 'logs'))) {
+$docsOut = Join-Path $OutDir 'docs'
+foreach ($dir in @($binOut, $cfgOut, $toolsOut, $scriptsOut, $resultOut, (Join-Path $dataOut 'dataset'), (Join-Path $dataOut 'artifacts'), (Join-Path $dataOut 'artifact_import'), (Join-Path $dataOut 'reports'), (Join-Path $dataOut 'logs'))) {
     Ensure-Directory $dir
+}
+foreach ($name in @('自动部署使用指南.md', '服务端插件包格式.md', '已知限制.md')) {
+    Copy-FileChecked (Join-Path $ProjectRoot ('docs/' + $name)) (Join-Path $docsOut $name)
 }
 
 # All scheduler/plugin and third-party DLLs are built into one directory by
@@ -225,10 +237,17 @@ if (-not $SkipDataset) {
 }
 
 $template = Join-Path $ProjectRoot 'scheduler\scheduler.json'
-Rewrite-SchedulerConfig -Template $template -Destination (Join-Path $cfgOut 'scheduler.json') -Connection $DbConn -Port $ServerPort -ManifestPath $manifestRelative -ProgramVer $ProgramVersion -DatasetVer $DatasetVersion
+Rewrite-SchedulerConfig -Template $template -Destination (Join-Path $cfgOut 'scheduler.json') `
+    -Connection $DbConn -Port $ServerPort -ManifestPath $manifestRelative `
+    -ProgramVer $ProgramVersion -BaselineProgramVer $BaselineProgramVersion `
+    -CandidateProgramVer $CandidateProgramVersion -DatasetVer $DatasetVersion
 # Editable deployment template only; changing it cannot modify remote clients.
 $clientTemplate = Get-Content -LiteralPath (Join-Path $ProjectRoot 'client\client.json') -Raw | ConvertFrom-Json
 $clientTemplate.scheduler.endpoint = "tcp://127.0.0.1:$ServerPort"
+if ($clientTemplate.plugins.stpcompare.programs) {
+    if ($BaselineProgramVersion) { $clientTemplate.plugins.stpcompare.programs.baseline.version = $BaselineProgramVersion }
+    if ($CandidateProgramVersion) { $clientTemplate.plugins.stpcompare.programs.candidate.version = $CandidateProgramVersion }
+}
 foreach ($property in $clientTemplate.plugins.PSObject.Properties) {
     if ($property.Value.PSObject.Properties.Name -contains 'db_conn') { $property.Value.db_conn = $DbConn }
     if ($property.Value.PSObject.Properties.Name -contains 'dry_run') { $property.Value.dry_run = $false }
@@ -237,7 +256,7 @@ Write-TextFile (Join-Path $cfgOut 'client.template.json') ($clientTemplate | Con
 
 # Settlement and maintenance scripts are part of the server package. The
 # package-local ToolSupport is required by all three scripts.
-foreach ($name in @('ToolSupport.ps1', 'settle_coverage.ps1', 'settle_stpcompare.ps1', 'prune_old_runs.ps1')) {
+foreach ($name in @('ToolSupport.ps1', 'settle_coverage.ps1', 'settle_stpcompare.ps1', 'prune_old_runs.ps1', 'build_plugin_bundle.py')) {
     Copy-FileChecked (Join-Path $PSScriptRoot $name) (Join-Path $toolsOut $name)
 }
 if (Test-Path (Join-Path $binOut 'coverage_settle.exe')) {
@@ -305,6 +324,7 @@ if (Test-Path -LiteralPath (Join-Path $resultSource 'launcher.py')) {
     Copy-DirectoryContents $resultSource $resultOut
     $resultViewsOut = Join-Path $dataOut 'result_views'
     $resultAdaptersOut = Join-Path $resultOut 'plugin_adapters'
+    $pluginAiContextsOut = Join-Path $resultOut 'plugin_ai_contexts'
     $pluginResources = [ordered]@{}
     foreach ($pluginDir in Get-ChildItem -LiteralPath (Join-Path $ProjectRoot 'plugins') -Directory) {
         $viewDefinition = Join-Path $pluginDir.FullName 'result_view.json'
@@ -313,6 +333,12 @@ if (Test-Path -LiteralPath (Join-Path $resultSource 'launcher.py')) {
         if (-not (Test-Path -LiteralPath $viewDefinition -PathType Leaf)) { continue }
         Copy-FileChecked $viewDefinition (Join-Path $resultViewsOut ($pluginDir.Name + '.json'))
         $resources = @('view')
+        $aiContext = Join-Path $pluginDir.FullName 'AI_CONTEXT.md'
+        if (-not (Test-Path -LiteralPath $aiContext -PathType Leaf)) {
+            throw "Result plugin $($pluginDir.Name) is missing AI_CONTEXT.md"
+        }
+        Copy-FileChecked $aiContext (Join-Path $pluginAiContextsOut ($pluginDir.Name + '.md'))
+        $resources += 'ai_context'
         $resultAdapter = Join-Path $pluginDir.FullName 'result_adapter.py'
         if (Test-Path -LiteralPath $resultAdapter -PathType Leaf) {
             Copy-FileChecked $resultAdapter (Join-Path $resultAdaptersOut ($pluginDir.Name + '.py'))
@@ -357,13 +383,15 @@ if (Test-Path -LiteralPath (Join-Path $resultSource 'launcher.py')) {
         static_dir = '../result_service/web'
         plugin_views_dir = '../data/result_views'
         plugin_adapters_dir = '../result_service/plugin_adapters'
+        plugin_ai_contexts_dir = '../result_service/plugin_ai_contexts'
         analysis_scripts_dir = '../data/analysis_scripts'
         analysis_reports_dir = '../data/reports'
         report_templates_dir = '../result_service/report_templates'
+        artifact_store_dir = '../data/artifacts'
+        artifact_import_roots = @('../data/artifact_import')
         workspace = '..'
         providers = [ordered]@{
-            codex = [ordered]@{ command = 'codex'; args = @('exec', '--json', '--skip-git-repo-check', '-'); timeout_seconds = 120 }
-            dsh = [ordered]@{ command = 'dsh'; args = @('--profile', 'headless'); prompt_mode = 'argument'; timeout_seconds = 120 }
+            dsh = [ordered]@{ command = 'dsh'; timeout_seconds = 120 }
         }
     }
     Write-TextFile (Join-Path $cfgOut 'result_service.json') ($resultConfig | ConvertTo-Json -Depth 8)
@@ -602,6 +630,32 @@ Templates use dry_run=false: configure the real business executables and the ful
 dataset before starting a client. Use dry_run=true only for an explicit trial.
 Analysis and saved reports remain available when the scheduler is offline.
 
+The client deployment wizard selects uploaded plugin, program and dataset
+artifacts, previews the final configuration and publishes to one client at a time.
+Set client.deployment_endpoint=http://<server-LAN-IP>:56330 in the client base
+configuration and give each client a unique worker_id. The client Agent pulls
+artifacts over HTTP, checks SHA-256, then activates an immutable configuration
+after current tasks finish and the update window permits it. Execution and update
+windows are independent. Each client currently enables exactly one plugin.
+For built-in program artifacts, preview derives program identities from their
+content and execution settings. Save the matching scheduler configuration and
+restart the scheduler before submitting tasks with the new identities.
+Uploading a dataset does not update the server manifest or expected dataset
+version; keep these consistent with the complete local data on each client.
+
+Server plugin ZIPs containing server_plugin.json can be previewed and installed
+with their analysis resources and AI_CONTEXT.md. Installation uses independent
+directories and recoverable configuration writes. New plugins start disabled;
+configure and enable them explicitly, then restart the scheduler and result
+service. Finish or recover unfinished runs using the original deployment before
+upgrading. Installation does not update framework EXEs or install Python packages.
+Use compatible builds for the framework and all plugin DLLs.
+
+Package-local instructions:
+- [Deployment guide](docs/自动部署使用指南.md)
+- [Server plugin package format](docs/服务端插件包格式.md)
+- [Known limitations](docs/已知限制.md)
+
 Before starting:
 - Set database connections in config/scheduler.json and config/result_service.json.
   Use a reader database role for the result service. Its DB connection is not sent to AI.
@@ -611,7 +665,7 @@ Before starting:
 
 LAN clients use the scheduler port (default TCP 5555) for tasks and the database
 port (default TCP 5432) for direct result writes. Browsers use the result service
-port (default TCP 56330) for the UI, Codex/DSH chat and the proxied DSH Web UI.
+port (default TCP 56330) for the UI, DSH chat and the proxied DSH Web UI.
 Allow the configured ports from the client LAN in Windows Firewall. Run
 tools/open_result_service_firewall.ps1 once as administrator for the UI port.
 It allows LocalSubnet by default; for a routed trusted LAN, pass its CIDR with
@@ -626,11 +680,11 @@ scripts/stop_result_service.ps1. To run only the UI/AI, use
 scripts/start_result_service.ps1. AI works without a database or a selected run.
 Scheduler logs append to data/logs/scheduler.log via server.log_file while its
 console and stdin commands remain available. Result-service logs share data/logs.
-Install/login to Codex or DSH as the account running this service. Local CLI
-settings and permissions apply; provider commands/cwd are configurable. Codex
-conversations resume across page refreshes and service restarts. The DSH native
+Install and configure DSH as the account running this service. Local CLI settings
+and permissions apply; the provider command/cwd is configurable. DSH conversations
+resume across page refreshes and service restarts. The DSH native
 tab starts and embeds the installed DSH Web UI on demand through the main service.
-Remote browsers use the SERVER account's Codex/DSH installation and settings. With
+Remote browsers use isolated sessions backed by the server account's DSH installation. With
 -UseSystemPython, the target machine must provide Python 3.10+ x64 and
 psycopg[binary] on its import path.
 
@@ -650,7 +704,9 @@ does not test model inference.
 Each client package currently carries the complete local dataset under
 testenv/dataset. The server needs the matching manifest to plan tasks. Dataset
 and program versions must agree across packages; assign a unique worker_id to
-each client. No shared directory or automatic dataset transfer is required.
+each client. Initial data can be copied with the client package; dataset artifacts
+can later be delivered through the deployment wizard. Clients execute against
+their local data, so no shared directory is required.
 
 Result analysis runs replaceable Python scripts against durable database results.
 Default scripts: result_service/report_templates. Saved scripts: data/analysis_scripts.

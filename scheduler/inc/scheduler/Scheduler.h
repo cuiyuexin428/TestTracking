@@ -8,6 +8,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "common/BlockingQueue.h"
 #include "common/Config.h"
@@ -65,6 +66,20 @@ class Scheduler {
     struct RunContext {
         std::string run_id, plugin_type;
         bool stopping = false;
+        std::vector<std::string> worker_ids;
+    };
+    struct RunDefinition {
+        std::string run_id, plugin_type, dataset_version, params, work_fingerprint;
+        bool force_rerun = false;
+        std::string force_rerun_reason, rerun_of;
+        std::vector<std::string> worker_ids;
+        std::string execution_fingerprint, blocked_reason;
+        Clock::time_point next_configuration_check{};
+    };
+    struct RunState {
+        std::string plugin_type, work_fingerprint, status;
+        bool all_tasks_succeeded = true;
+        bool has_task_reports = false;
     };
     struct LoadedPlugin {
         std::unique_ptr<common::DynamicLibrary> library;
@@ -77,6 +92,9 @@ class Scheduler {
         std::shared_ptr<std::promise<nlohmann::json>> completion;
         std::string run_id;
         Clock::time_point deadline = Clock::time_point::max();
+        bool force_rerun = false;
+        std::string force_rerun_reason;
+        std::vector<std::string> worker_ids;
     };
     struct AcceptedReport {
         std::string identity, session_id, plugin_type, task_id, run_id, attempt_id;
@@ -90,8 +108,15 @@ class Scheduler {
     void RestoreRuns();
     void RunProcessing();
     nlohmann::json HandleCommand(const ControlCommand&);
-    bool HandleCreateRun(const ControlCommand&);
+    nlohmann::json HandleCreateRun(const ControlCommand&);
     bool HandleStopRun(const std::string&);
+    bool StartNextRun(common::TaskPlugin*);
+    bool CancelQueuedRun(common::TaskPlugin*, const std::string&);
+    std::string WorkFingerprint(const ControlCommand&) const;
+    std::string ExecutionFingerprint(const std::string& plugin_type,
+                                     const std::string& work_fingerprint) const;
+    bool ConfigurationMatches(const RunDefinition&) const;
+    void SetRunStatus(const std::string&, const std::string&);
     bool CommitStop(common::TaskPlugin*);
     bool CommitFinished(common::TaskPlugin*);
     void SendWake(const std::string&);
@@ -121,6 +146,10 @@ class Scheduler {
     Storage storage_;
     std::vector<LoadedPlugin> plugins_;
     std::unordered_map<std::string, common::TaskPlugin*> plugins_by_type_;
+    std::unordered_map<std::string, std::string> deployment_identities_;
+    std::unordered_map<std::string, std::string> configuration_identities_;
+    std::unordered_map<std::string, std::string> manifest_paths_;
+    std::unordered_map<std::string, bool> duplicate_protection_enabled_;
     std::atomic<bool> running_{false}, accepting_{false};
     std::atomic<size_t> active_run_count_{0}, in_flight_count_{0};
     std::thread processing_;
@@ -133,7 +162,11 @@ class Scheduler {
     std::unordered_map<std::string, ClientEntry> clients_;
     std::unordered_map<std::string, InFlight> in_flight_;
     std::unordered_map<common::TaskPlugin*, RunContext> active_runs_;
+    std::unordered_map<common::TaskPlugin*, std::deque<RunDefinition>> queued_runs_;
+    std::unordered_map<std::string, RunState> run_states_;
+    std::vector<std::string> run_order_;
     std::deque<AcceptedReport> accepted_reports_;
+    bool shutting_down_ = false;
     common::BlockingQueue<ControlCommand> commands_;
 };
 }  // namespace scheduler

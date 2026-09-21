@@ -9,6 +9,15 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <set>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <tlhelp32.h>
+#endif
 
 #include "client/Client.h"
 #include "common/Config.h"
@@ -331,15 +340,404 @@ void TestInitialRegistrationRetryLimit(const std::filesystem::path& binary_direc
         throw;
     }
 }
+
+void TestDeploymentDrain(const std::filesystem::path& binary_directory) {
+    Peer peer;
+    const auto config_file = std::filesystem::temp_directory_path() /
+        ("drain-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".json");
+#ifdef _WIN32
+    const auto plugin = binary_directory / "demo.dll";
+#else
+    const auto plugin = binary_directory / "libdemo.so";
+#endif
+    std::ofstream(config_file) << nlohmann::json({
+        {"scheduler", {{"endpoint", peer.endpoint}, {"poll_timeout_ms", 5}}},
+        {"client", {{"heartbeat_interval_ms", 40}, {"request_timeout_ms", 500}, {"report_retry_ms", 60}}},
+        {"plugins", {{"demo", {{"enabled", true}, {"dll", plugin.u8string()}, {"task_sleep_ms", 300}}}}}
+    }).dump();
+    auto& config = common::Config::instance();
+    config.load(config_file.u8string());
+    auto stop = std::make_shared<std::atomic<bool>>(false);
+    auto drain = std::make_shared<std::atomic<bool>>(false);
+    std::atomic<bool> ready{false};
+    auto running = std::async(std::launch::async, [&] {
+        client::Client client(config, stop, {}, false, drain, [&] { ready.store(true); });
+        client.start();
+    });
+    try {
+        const auto registration = peer.Wait(common::REGISTER);
+        Require(!ready.load(), "worker signaled ready before registration was accepted");
+        peer.Register(registration, "drain-session");
+        peer.Wait(common::REQUEST_TASK);
+        Require(ready.load(), "worker did not signal registration readiness");
+        peer.Task("drain-run", "active");
+        peer.Wait(common::TASK_ACK);
+        drain->store(true);
+        peer.Task("drain-run", "late");
+        peer.Wait(common::TASK_REJECT);
+        peer.Wait(common::TASK_REPORT);
+        Require(peer.last_report.attempt_id() == "active", "draining cancelled active execution");
+        const auto heartbeats = peer.heartbeats;
+        const auto requests = peer.requests;
+        peer.Pump(200ms);
+        Require(peer.heartbeats > heartbeats, "drain stopped heartbeats before report acknowledgement");
+        Require(peer.requests == requests, "drain requested additional tasks");
+        Require(running.wait_for(0ms) != std::future_status::ready, "drain discarded unacknowledged reports");
+        peer.Ack("active", true, false);
+        Require(running.wait_for(1s) == std::future_status::ready, "drain did not finish after report acknowledgement");
+        running.get();
+    } catch (...) { stop->store(true); if (running.valid()) running.wait(); throw; }
+}
+
+#ifdef _WIN32
+class AgentProcess {
+public:
+    AgentProcess(const std::filesystem::path& directory, const std::filesystem::path& config) {
+        SECURITY_ATTRIBUTES attributes{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+        HANDLE input_read = nullptr;
+        Require(CreatePipe(&input_read, &input_, &attributes, 0), "cannot create test agent input pipe");
+        SetHandleInformation(input_, HANDLE_FLAG_INHERIT, 0);
+        output_ = CreateFileW((directory / L"agent.log").c_str(), GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, &attributes, CREATE_ALWAYS, 0, nullptr);
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        startup.dwFlags = STARTF_USESTDHANDLES;
+        startup.hStdInput = input_read;
+        startup.hStdOutput = output_;
+        startup.hStdError = output_;
+        const auto executable = directory / "client.exe";
+        auto command = L"\"" + executable.wstring() + L"\" \"" + config.wstring() + L"\"";
+        const bool started = CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, TRUE,
+            CREATE_NO_WINDOW, nullptr, directory.c_str(), &startup, &process_);
+        CloseHandle(input_read);
+        Require(started, "cannot start test agent");
+        CloseHandle(process_.hThread);
+    }
+    ~AgentProcess() {
+        if (process_.hProcess) { TerminateProcess(process_.hProcess, 9); WaitForSingleObject(process_.hProcess, 2000); CloseHandle(process_.hProcess); }
+        if (input_) CloseHandle(input_);
+        if (output_ && output_ != INVALID_HANDLE_VALUE) CloseHandle(output_);
+    }
+    void Kill() { Require(TerminateProcess(process_.hProcess, 9), "cannot kill test agent"); WaitForSingleObject(process_.hProcess, 2000); }
+    void Quit() {
+        DWORD written = 0;
+        Require(WriteFile(input_, "quit\n", 5, &written, nullptr), "cannot request agent quit");
+        Require(WaitForSingleObject(process_.hProcess, 3000) == WAIT_OBJECT_0, "agent quit did not finish");
+        DWORD code = 1;
+        GetExitCodeProcess(process_.hProcess, &code);
+        Require(code == 0, "agent quit returned a failure");
+    }
+    std::vector<HANDLE> Workers() const {
+        std::vector<HANDLE> handles;
+        const auto snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        PROCESSENTRY32W entry{};
+        entry.dwSize = sizeof(entry);
+        if (Process32FirstW(snapshot, &entry)) {
+            do {
+                if (entry.th32ParentProcessID == process_.dwProcessId && std::wstring(entry.szExeFile) == L"client.exe") {
+                    auto handle = OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, entry.th32ProcessID);
+                    if (handle) handles.push_back(handle);
+                }
+            } while (Process32NextW(snapshot, &entry));
+        }
+        CloseHandle(snapshot);
+        return handles;
+    }
+private:
+    PROCESS_INFORMATION process_{};
+    HANDLE input_ = nullptr, output_ = nullptr;
+};
+
+void CopyAgentPackage(const std::filesystem::path& source, const std::filesystem::path& directory) {
+    std::filesystem::create_directories(directory / "tools");
+    for (const auto& file : std::filesystem::directory_iterator(source)) {
+        if (file.path().extension() == L".dll" || file.path().filename() == L"client.exe") {
+            std::error_code error;
+            std::filesystem::create_hard_link(file.path(), directory / file.path().filename(), error);
+            if (error) std::filesystem::copy_file(file.path(), directory / file.path().filename());
+        }
+    }
+    // The staging script is tested separately against a real HTTP artifact server.
+    // This fixture controls when a prepared generation reaches the Agent.
+    std::ofstream(directory / "tools/client_update.ps1") << R"PS(
+param($ClientRoot, $ConfigPath, $ResultPath, $ReportPath, $EffectiveConfigPath, $CurrentRevision = '', $PreparedRevision = '')
+$ErrorActionPreference = 'Stop'
+$inbox = Join-Path $ClientRoot 'inbox.json'
+$value = if (Test-Path -LiteralPath $inbox) { [IO.File]::ReadAllText($inbox) } else { '{"status":"current"}' }
+$result = $value | ConvertFrom-Json
+if ($result.test_late_status) {
+    $marker = Join-Path $ClientRoot $result.test_token
+    if ($CurrentRevision -ceq $result.revision) {
+        $result.status = 'current'
+        [IO.File]::WriteAllText(($marker + '.current.json'), $value)
+    } elseif ($PreparedRevision -ceq $result.revision) {
+        $captured = @{ current = $CurrentRevision; prepared = $PreparedRevision } | ConvertTo-Json
+        [IO.File]::WriteAllText(($marker + '.started.json'), $captured)
+        $deadline = [DateTime]::UtcNow.AddSeconds(20)
+        while (-not [IO.File]::Exists($marker + '.release')) {
+            if ([DateTime]::UtcNow -ge $deadline) { throw 'Timed out waiting for late updater result release' }
+            Start-Sleep -Milliseconds 10
+        }
+        $result.status = $result.test_late_status
+    }
+    $value = $result | ConvertTo-Json -Depth 20
+}
+[IO.File]::WriteAllText($ResultPath, $value, (New-Object Text.UTF8Encoding($false)))
+if ($result.status -eq 'failed') { exit 1 }
+)PS";
+}
+
+void TestAgentProcesses(const std::filesystem::path& binaries) {
+    Peer peer("client-retry-probe");
+    const auto directory = std::filesystem::temp_directory_path() /
+        (L"agent-processes-测试-" + std::to_wstring(std::chrono::steady_clock::now().time_since_epoch().count()));
+    CopyAgentPackage(binaries, directory);
+    const auto path = directory / L"配置.json";
+    const nlohmann::json config = {
+        {"scheduler", {{"endpoint", peer.endpoint}, {"poll_timeout_ms", 5}}},
+        {"client", {{"worker_id", "agent"}, {"heartbeat_interval_ms", 40}, {"request_timeout_ms", 500}}},
+        {"plugins", {{"demo", {{"enabled", true}, {"dll", "client_retry_probe.dll"}, {"process_probe", true}}}}}};
+    std::ofstream(path) << config.dump();
+    AgentProcess agent(directory, path.filename());
+    std::vector<HANDLE> business_processes;
+    auto registration = peer.Wait(common::REGISTER);
+    const auto child = OpenProcess(SYNCHRONIZE, FALSE, std::stoul(registration.register_().payload()));
+    Require(child, "worker did not start its business subprocess");
+    business_processes.push_back(child);
+    peer.Register(registration, "agent-test-session");
+    Require(peer.identity == "agent", "single-plugin worker changed its identity");
+    peer.Pump(100ms);
+    auto workers = agent.Workers();
+    Require(workers.size() == 1, "Agent must start exactly one isolated worker");
+    Require(TerminateProcess(workers.front(), 8), "cannot crash test worker");
+    Require(WaitForSingleObject(workers.front(), 2000) == WAIT_OBJECT_0, "test worker did not exit");
+    registration = peer.Wait(common::REGISTER, 4s);
+    Require(peer.identity == "agent", "restarted worker lost its identity");
+    peer.Register(registration, "agent-test-session");
+    Require(WaitForSingleObject(business_processes.front(), 0) == WAIT_OBJECT_0,
+            "worker crash left its business process tree running");
+    const auto replacement_child = OpenProcess(SYNCHRONIZE, FALSE, std::stoul(registration.register_().payload()));
+    Require(replacement_child, "restarted worker did not start its business subprocess");
+    business_processes.push_back(replacement_child);
+    peer.Pump(100ms);
+    for (const auto handle : workers) CloseHandle(handle);
+    workers = agent.Workers();
+    Require(workers.size() == 1, "worker crash was not recovered");
+    agent.Kill();
+    for (const auto handle : workers) {
+        Require(WaitForSingleObject(handle, 2000) == WAIT_OBJECT_0, "killing Agent left a worker alive (job handle leaked)");
+        CloseHandle(handle);
+    }
+    for (const auto handle : business_processes) {
+        Require(WaitForSingleObject(handle, 2000) == WAIT_OBJECT_0, "killing Agent left a business subprocess alive");
+        CloseHandle(handle);
+    }
+}
+
+void TestAgentDeployment(const std::filesystem::path& binaries) {
+    Peer peer;
+    const auto directory = std::filesystem::temp_directory_path() /
+        (L"agent-deployment-测试-" + std::to_wstring(std::chrono::steady_clock::now().time_since_epoch().count()));
+    CopyAgentPackage(binaries, directory);
+    const auto path = directory / "client.json";
+    nlohmann::json config = {
+        {"scheduler", {{"endpoint", peer.endpoint}, {"poll_timeout_ms", 5}}},
+        {"client", {{"worker_id", "agent"}, {"heartbeat_interval_ms", 40}, {"request_timeout_ms", 500},
+                    {"deployment_endpoint", "http://fixture"}, {"deployment_poll_seconds", 1}}},
+        {"plugins", {{"demo", {{"enabled", true}, {"dll", "demo.dll"}, {"task_sleep_ms", 1200}}}}}};
+    std::ofstream(path) << config.dump();
+    const auto staged_path = directory / L"新版本.json";
+    std::ofstream(staged_path) << config.dump();
+    const auto bad_path = directory / "bad.json";
+    auto broken = config;
+    broken["plugins"]["demo"]["dll"] = "missing-plugin.dll";
+    std::ofstream(bad_path) << broken.dump();
+    const auto multi_path = directory / "multiple-plugins.json";
+    auto multiple = config;
+    multiple["plugins"]["second"] = config["plugins"]["demo"];
+    std::ofstream(multi_path) << multiple.dump();
+    const auto active_file = directory / "deployments/active.json";
+    const auto await_file = [&](const std::filesystem::path& file, const std::string& revision) {
+        const auto deadline = std::chrono::steady_clock::now() + 6s;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (std::filesystem::exists(file)) {
+                try { std::ifstream input(file); if (nlohmann::json::parse(input).value("revision", std::string()) == revision) return; }
+                catch (const std::exception&) {}
+            }
+            peer.Pump(30ms);
+        }
+        throw std::runtime_error("Agent did not publish expected deployment state: " + file.u8string());
+    };
+    const auto offer = [&](char generation, const std::filesystem::path& target) {
+        std::ofstream(directory / "inbox.json") << nlohmann::json({{"status", "staged"},
+            {"revision", std::string(64, generation)}, {"config_path", target.u8string()},
+            {"components", nlohmann::json::array()}}).dump();
+    };
+    {
+        AgentProcess agent(directory, path.filename());
+        peer.Register(peer.Wait(common::REGISTER), "deployment-session");
+        Require(peer.identity == "agent", "single worker changed its compatible identity");
+        peer.Wait(common::REQUEST_TASK);
+        peer.Task("agent-run", "active");
+        peer.Wait(common::TASK_ACK);
+        offer('a', staged_path);
+        peer.Wait(common::TASK_REPORT, 4s);
+        peer.Pump(300ms);
+        Require(!std::filesystem::exists(active_file), "Agent activated before task reports were acknowledged");
+        peer.Ack("active", true, false);
+        auto registration = peer.Wait(common::REGISTER, 5s);
+        Require(!std::filesystem::exists(active_file), "Agent promoted a release before worker registration");
+        peer.Register(registration, "deployment-session");
+        await_file(active_file, std::string(64, 'a'));
+        // An unsupported prepared release must be rejected before draining or
+        // replacing the healthy single-plugin worker, even if a helper stages it.
+        offer('b', multi_path);
+        await_file(directory / "deployments/failed.json", std::string(64, 'b'));
+        await_file(active_file, std::string(64, 'a'));
+        const auto changed = peer.Receive([](const common::Envelope& envelope) {
+            return envelope.type() == common::REGISTER;
+        }, 200ms);
+        Require(changed.type() != common::REGISTER, "multi-plugin release replaced the healthy worker");
+        offer('c', bad_path);
+        registration = peer.Wait(common::REGISTER, 6s);
+        peer.Register(registration, "deployment-session");
+        await_file(directory / "deployments/failed.json", std::string(64, 'c'));
+        await_file(active_file, std::string(64, 'a'));
+        const auto repeated = peer.Receive([](const common::Envelope& envelope) { return envelope.type() == common::REGISTER; }, 2200ms);
+        Require(repeated.type() != common::REGISTER, "failed generation was repeatedly retried");
+        agent.Quit();
+    }
+    // Restart must select the committed active config rather than the now-invalid base.
+    std::ofstream(path) << broken.dump();
+    AgentProcess restarted(directory, path.filename());
+    peer.Register(peer.Wait(common::REGISTER, 4s), "deployment-session");
+    peer.Wait(common::REQUEST_TASK);
+    peer.Pump(100ms);
+    {
+        std::ifstream input(directory / "deployments/agent_report.json");
+        const auto report = nlohmann::json::parse(input);
+        Require(report.value("state", std::string()) == "failed" &&
+                    report.value("desired_revision", std::string()) == std::string(64, 'c'),
+                "Agent restart discarded the failed deployment report awaiting delivery");
+    }
+    restarted.Quit();
+}
+
+void TestAgentLateUpdaterResults(const std::filesystem::path& binaries) {
+    Peer peer;
+    const auto directory = std::filesystem::temp_directory_path() /
+        (L"agent-late-updater-" + std::to_wstring(std::chrono::steady_clock::now().time_since_epoch().count()));
+    CopyAgentPackage(binaries, directory);
+    const auto config_path = directory / "client.json";
+    const nlohmann::json config = {
+        {"scheduler", {{"endpoint", peer.endpoint}, {"poll_timeout_ms", 5}}},
+        {"client", {{"worker_id", "agent"}, {"heartbeat_interval_ms", 40}, {"request_timeout_ms", 500},
+                    {"deployment_endpoint", "http://fixture"}, {"deployment_poll_seconds", 1}}},
+        {"plugins", {{"demo", {{"enabled", true}, {"dll", "demo.dll"}}}}}};
+    std::ofstream(config_path) << config.dump();
+    const auto active_file = directory / "deployments/active.json";
+    const auto report_file = directory / "deployments/agent_report.json";
+    const auto wait_json = [&](const std::filesystem::path& file,
+                               const std::function<bool(const nlohmann::json&)>& matches) {
+        const auto deadline = std::chrono::steady_clock::now() + 8s;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (std::filesystem::exists(file)) {
+                try {
+                    std::ifstream input(file);
+                    const auto value = nlohmann::json::parse(input);
+                    if (matches(value)) return value;
+                } catch (const std::exception&) {}
+            }
+            peer.Pump(20ms);
+        }
+        throw std::runtime_error("Agent did not reach updater test boundary: " + file.u8string());
+    };
+    const auto publish = [&](const nlohmann::json& result) {
+        const auto temporary = directory / "inbox.tmp";
+        std::ofstream(temporary) << result.dump();
+        Require(MoveFileExW(temporary.c_str(), (directory / "inbox.json").c_str(),
+                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH), "cannot publish updater fixture");
+    };
+    AgentProcess agent(directory, config_path.filename());
+    peer.Register(peer.Wait(common::REGISTER), "late-updater-session");
+    peer.Pump(50ms);
+    std::string previous;
+    char generation = 'a';
+    for (const std::string late_status : {"waiting_window", "failed", "staged"}) {
+        const auto revision = std::string(64, generation++);
+        const auto token = "late-" + late_status;
+        publish({{"status", "staged"}, {"revision", revision}, {"config_path", config_path.u8string()},
+                 {"components", nlohmann::json::array({{{"slot", "plugin.demo"},
+                     {"artifact_id", std::string(32, 'a')}, {"state", "staged"}}})},
+                 {"message", "delayed preparation result"}, {"test_late_status", late_status}, {"test_token", token}});
+        const auto registration = peer.Wait(common::REGISTER, 6s);
+        // Hold registration until a helper has captured the not-yet-active
+        // generation, then let activation finish before its result can return.
+        wait_json(directory / (token + ".started.json"), [&](const nlohmann::json& value) {
+            return value.value("current", std::string()) == previous &&
+                   value.value("prepared", std::string()) == revision;
+        });
+        peer.Register(registration, "late-updater-session");
+        wait_json(active_file, [&](const nlohmann::json& value) {
+            return value.value("revision", std::string()) == revision;
+        });
+        const auto ready = wait_json(report_file, [&](const nlohmann::json& value) {
+            return value.value("desired_revision", std::string()) == revision &&
+                   value.value("state", std::string()) == "ready";
+        });
+        Require(ready.at("components").at(0).at("state") == "active", "ready report lost active component state");
+        std::ofstream(directory / (token + ".release")) << "release";
+        // Starting the next helper proves that the Agent consumed the delayed
+        // result. Its current shortcut must not be needed to repair a downgrade.
+        wait_json(directory / (token + ".current.json"), [&](const nlohmann::json& value) {
+            return value.value("revision", std::string()) == revision;
+        });
+        std::ifstream input(report_file);
+        Require(nlohmann::json::parse(input) == ready, "late updater result downgraded an active deployment report");
+        Require(!std::filesystem::exists(directory / "deployments/failed.json"),
+                "late preparation failure rejected the already active deployment");
+        previous = revision;
+    }
+    // Reports for a genuinely different desired generation must still be visible.
+    const auto next_revision = std::string(64, 'd');
+    for (const std::string status : {"waiting_window", "failed"}) {
+        publish({{"status", status}, {"revision", next_revision}, {"message", "next deployment preparation"},
+                 {"components", nlohmann::json::array()}});
+        wait_json(report_file, [&](const nlohmann::json& value) {
+            return value.value("desired_revision", std::string()) == next_revision &&
+                   value.value("state", std::string()) == status;
+        });
+        std::ifstream input(active_file);
+        Require(nlohmann::json::parse(input).at("revision") == previous,
+                "unactivated desired generation replaced the running deployment");
+    }
+    agent.Quit();
+}
+#endif
 }  // namespace
 
 int main(int argc, char** argv) {
     try {
         const auto binary_directory = std::filesystem::absolute(argv[0]).parent_path();
+        // Protobuf's generated descriptor registry outlives plugin unloads.
+        // Hold the demo DLL across the in-process protocol cases; production
+        // updates instead replace the entire worker process.
+#ifdef _WIN32
+        const auto demo_guard = common::DynamicLibrary::load((binary_directory / "demo.dll").u8string());
+#else
+        const auto demo_guard = common::DynamicLibrary::load((binary_directory / "libdemo.so").u8string());
+#endif
         TestClient(binary_directory);
         TestInitialRegistrationRetryLimit(binary_directory);
+        TestDeploymentDrain(binary_directory);
+#ifdef _WIN32
+        TestAgentProcesses(binary_directory);
+        TestAgentDeployment(binary_directory);
+        TestAgentLateUpdaterResults(binary_directory);
+#endif
         std::cout << "PASS: report retries, stale ACK, STOP heartbeat, re-registration, protocol "
-                     "rejection and registration retry limit\n";
+                     "rejection, registration retry limit, graceful deployment drain, Agent process "
+                     "isolation/restart/cleanup, readiness-gated activation, late updater reports and rollback\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

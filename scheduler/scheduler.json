@@ -28,7 +28,10 @@
       "stp_manifest": "C:/Shared/dataset/manifest.txt",
       "store_type": "postgres",
       "db_conn": "host=127.0.0.1 port=5432 dbname=testtracking user=postgres",
-      "task_size": 25
+      "task_size": 25,
+      "expected_baseline_program_version": "1.0",
+      "expected_candidate_program_version": "1.0",
+      "expected_dataset_version": "d1"
     }
   }
 }

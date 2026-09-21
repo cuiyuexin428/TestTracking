@@ -2,11 +2,13 @@
 #include "scheduler/ManagementServer.h"
 
 #include <algorithm>
+#include <cctype>
 #include <stdexcept>
 #include <unordered_set>
 #include <utility>
 
 #include "common/Logger.h"
+#include "common/Util.h"
 
 namespace scheduler {
 namespace {
@@ -60,7 +62,8 @@ void Scheduler::start() {
 
 void Scheduler::RestoreRuns() {
     std::vector<Storage::RunRecord> runs;
-    if (!storage_.LoadUnfinishedRuns(runs)) {
+    std::vector<Storage::RunRecord> queued;
+    if (!storage_.LoadUnfinishedRuns(runs, queued)) {
         throw std::runtime_error("Scheduler: failed to load unfinished runs");
     }
     const auto abort_recovery = [this](const std::string& message) -> void {
@@ -92,6 +95,15 @@ void Scheduler::RestoreRuns() {
             continue;
         }
         if (restored.count(run.plugin_type) != 0) continue;
+        const RunDefinition definition{
+            run.run_id, run.plugin_type, run.dataset_version, run.params, run.work_fingerprint,
+            run.force_rerun, run.force_rerun_reason, run.rerun_of, run.worker_ids,
+            run.execution_fingerprint};
+        if (!ConfigurationMatches(definition)) {
+            abort_recovery("Scheduler: recovery blocked; original progress retained: "
+                           "plugin configuration or manifest differs from saved run " + run.run_id +
+                           "; restore its original deployment before restarting");
+        }
         bool plugin_restored = false;
         try {
             plugin_restored = plugin->second->restore(run.run_id);
@@ -116,11 +128,30 @@ void Scheduler::RestoreRuns() {
             CancelAfterRecoveryFailure(plugin->second, run.run_id);
             abort_recovery("Scheduler: cannot persist recovered state for run " + run.run_id);
         }
-        active_runs_[plugin->second] = {run.run_id, run.plugin_type, false};
+        active_runs_[plugin->second] = {run.run_id, run.plugin_type, false, run.worker_ids};
+        run_states_[run.run_id] = {run.plugin_type, run.work_fingerprint, "running"};
+        run_order_.push_back(run.run_id);
         restored.insert(run.plugin_type);
         LOG_INFO("run restored: " << run.run_id << " plugin_type=" << run.plugin_type);
     }
+    for (const auto& run : queued) {
+        const auto plugin = plugins_by_type_.find(run.plugin_type);
+        if (plugin == plugins_by_type_.end()) {
+            LOG_WARN("recovery: queued run retained for disabled plugin " << run.run_id
+                                                                           << " plugin_type="
+                                                                           << run.plugin_type);
+            continue;
+        }
+        queued_runs_[plugin->second].push_back(
+            {run.run_id, run.plugin_type, run.dataset_version, run.params,
+             run.work_fingerprint, run.force_rerun, run.force_rerun_reason, run.rerun_of,
+             run.worker_ids, run.execution_fingerprint});
+        run_states_[run.run_id] = {run.plugin_type, run.work_fingerprint, "queued"};
+        run_order_.push_back(run.run_id);
+    }
     active_run_count_.store(active_runs_.size());
+    for (const auto& plugin : plugins_by_type_)
+        if (!active_runs_.count(plugin.second)) StartNextRun(plugin.second);
 }
 
 bool Scheduler::Submit(ControlCommand command) {
@@ -234,25 +265,28 @@ nlohmann::json Scheduler::HandleCommand(const ControlCommand& command) {
     switch (command.kind) {
         case ControlCommand::Kind::Run: {
             auto* plugin = plugins_by_type_.at(command.plugin_type);
-            if (active_runs_.count(plugin) && !CommitFinished(plugin))
-                return reject("plugin already has an active run");
-            if (!HandleCreateRun(command))
-                return reject("run could not be created; check scheduler logs and plugin configuration");
-            return {{"ok", true}, {"run_id", active_runs_.at(plugin).run_id}};
+            if (active_runs_.count(plugin)) CommitFinished(plugin);
+            return HandleCreateRun(command);
         }
         case ControlCommand::Kind::Stop: {
-            const auto run = active_runs_.find(plugins_by_type_.at(command.plugin_type));
-            if (!command.run_id.empty() && (run == active_runs_.end() || run->second.run_id != command.run_id))
-                return reject("run is no longer active; refresh before stopping");
+            auto* plugin = plugins_by_type_.at(command.plugin_type);
+            const auto run = active_runs_.find(plugin);
+            if (!command.run_id.empty() &&
+                (run == active_runs_.end() || run->second.run_id != command.run_id)) {
+                if (!CancelQueuedRun(plugin, command.run_id))
+                    return reject("run is no longer active or queued; refresh before stopping");
+                return {{"ok", true}, {"run_id", command.run_id}, {"status", "cancelled"}};
+            }
             const std::string run_id = run == active_runs_.end() ? std::string() : run->second.run_id;
             if (!HandleStopRun(command.plugin_type))
                 return reject("stop requested but persistence is still pending; inspect current status and scheduler logs");
-            return {{"ok", true}, {"run_id", run_id}};
+            return {{"ok", true}, {"run_id", run_id}, {"status", "stopped"}};
         }
         case ControlCommand::Kind::Wake:
             SendWake(command.plugin_type);
             return {{"ok", true}};
         case ControlCommand::Kind::Shutdown: {
+            shutting_down_ = true;
             bool ok = true;
             for (const auto& type : pluginTypes()) {
                 if (active_runs_.count(plugins_by_type_.at(type))) ok = HandleStopRun(type) && ok;
@@ -264,75 +298,243 @@ nlohmann::json Scheduler::HandleCommand(const ControlCommand& command) {
     return reject("unknown command");
 }
 
-bool Scheduler::HandleCreateRun(const ControlCommand& command) {
+nlohmann::json Scheduler::HandleCreateRun(const ControlCommand& request) {
+    auto command = request;
+    command.params = common::NormalizeRunParameters(command.params);
+    const auto reject = [](const std::string& error) -> nlohmann::json {
+        return {{"ok", false}, {"error", error}, {"http_status", 409}};
+    };
     const auto found = plugins_by_type_.find(command.plugin_type);
     if (found == plugins_by_type_.end()) {
         LOG_ERROR("createRun: no plugin for plugin_type " << command.plugin_type);
-        return false;
+        return reject("plugin is not enabled: " + command.plugin_type);
     }
     auto* plugin = found->second;
-    if (active_runs_.count(plugin) && !CommitFinished(plugin)) {
-        LOG_ERROR("createRun: run already active for plugin_type " << command.plugin_type);
-        return false;
-    }
-    common::RunRequest request{GenerateRunId(), command.dataset_version, command.params};
-    // Persist the recovery index before creating plugin state or dispatching.
-    if (storage_.enabled() && !storage_.SaveRun(request.run_id, command.plugin_type,
-                                                request.dataset_version, request.params)) {
-        LOG_ERROR("createRun: SaveRun failed; no task dispatched");
-        return false;
-    }
-    bool planned = false;
-    try {
-        planned = plugin->plan(request, clients());
-    } catch (const std::exception& e) {
-        LOG_ERROR("createRun: plan threw for " << command.plugin_type << ": " << e.what());
-    } catch (...) {
-        LOG_ERROR("createRun: plan threw for " << command.plugin_type << ": unknown exception");
-    }
-    if (!planned) {
-        // Leave a terminal status so recovery never retries a run whose plan was
-        // never persisted; the recovery path closes any row this write misses.
-        if (storage_.enabled() && !storage_.FinishRun(request.run_id, "failed")) {
-            LOG_ERROR("createRun: cannot mark run " << request.run_id
-                                                    << " failed; recovery will close it as "
-                                                       "interrupted on the next start");
+    std::string parameter_error;
+    if (!plugin->validateRunParameters(command.params, parameter_error))
+        return {{"ok", false}, {"error", parameter_error.empty() ? "unsupported run parameters" : parameter_error},
+                {"http_status", 400}};
+    RunDefinition run{GenerateRunId(), command.plugin_type, command.dataset_version,
+                      command.params, {}, command.force_rerun, command.force_rerun_reason, {},
+                      command.worker_ids};
+    run.work_fingerprint = WorkFingerprint(command);
+    run.execution_fingerprint = ExecutionFingerprint(command.plugin_type, run.work_fingerprint);
+    if (!duplicate_protection_enabled_.at(command.plugin_type))
+        run.work_fingerprint = common::Sha256Hex(run.work_fingerprint + "\n" + run.run_id);
+
+    if (storage_.enabled()) {
+        Storage::RunRecord record{run.run_id, run.plugin_type, run.dataset_version, run.params,
+                                  run.work_fingerprint, run.force_rerun,
+                                  run.force_rerun_reason, {}, "queued", run.worker_ids,
+                                  run.execution_fingerprint};
+        const auto enqueued = storage_.EnqueueRun(record);
+        if (enqueued.outcome == Storage::EnqueueResult::Outcome::Error) {
+            LOG_ERROR("createRun: enqueue failed; no task dispatched");
+            return reject("run could not be queued; check scheduler logs and database");
         }
+        if (enqueued.outcome == Storage::EnqueueResult::Outcome::Duplicate) {
+            return {{"ok", false},
+                    {"error", "equivalent work already exists"},
+                    {"duplicate", true},
+                    {"run_id", enqueued.run_id},
+                    {"status", enqueued.status},
+                    {"force_rerun_available", true},
+                    {"http_status", 409}};
+        }
+        if (enqueued.outcome == Storage::EnqueueResult::Outcome::ForceTargetMissing)
+            return reject("force rerun requires an existing equivalent run");
+        run.rerun_of = enqueued.rerun_of;
+    } else {
+        std::string duplicate_id, duplicate_status;
+        for (auto it = run_order_.rbegin(); it != run_order_.rend(); ++it) {
+            const auto state = run_states_.find(*it);
+            if (state != run_states_.end() && state->second.work_fingerprint == run.work_fingerprint &&
+                (state->second.status == "queued" || state->second.status == "planning" ||
+                 state->second.status == "running" || state->second.status == "stopped" ||
+                 (state->second.status == "finished" &&
+                  (run.force_rerun || (state->second.has_task_reports &&
+                                       state->second.all_tasks_succeeded))))) {
+                duplicate_id = *it;
+                duplicate_status = state->second.status;
+                break;
+            }
+        }
+        if (!duplicate_id.empty() && !run.force_rerun) {
+            return {{"ok", false},
+                    {"error", "equivalent work already exists"},
+                    {"duplicate", true},
+                    {"run_id", duplicate_id},
+                    {"status", duplicate_status},
+                    {"force_rerun_available", true},
+                    {"http_status", 409}};
+        }
+        if (run.force_rerun && duplicate_id.empty())
+            return reject("force rerun requires an existing equivalent run");
+        if (run.force_rerun) run.rerun_of = duplicate_id;
+    }
+
+    queued_runs_[plugin].push_back(run);
+    run_states_[run.run_id] = {run.plugin_type, run.work_fingerprint, "queued"};
+    run_order_.push_back(run.run_id);
+    if (!active_runs_.count(plugin)) StartNextRun(plugin);
+
+    const auto state = run_states_.find(run.run_id);
+    if (state == run_states_.end() || state->second.status == "failed")
+        return reject("run could not be created; check scheduler logs and plugin configuration");
+    return {{"ok", true},
+            {"run_id", run.run_id},
+            {"status", state->second.status},
+            {"rerun_of", run.rerun_of},
+            {"worker_ids", run.worker_ids}};
+}
+
+std::string Scheduler::WorkFingerprint(const ControlCommand& command) const {
+    std::string manifest_sha256;
+    const auto manifest = manifest_paths_.find(command.plugin_type);
+    if (manifest != manifest_paths_.end() && !manifest->second.empty() &&
+        !common::FileSha256Hex(manifest->second, &manifest_sha256))
+        manifest_sha256 = "unreadable";
+    nlohmann::json identity = {
+        {"plugin_type", command.plugin_type},
+        {"deployment_identity", deployment_identities_.at(command.plugin_type)},
+        {"manifest_sha256", manifest_sha256},
+        {"dataset_version", command.dataset_version},
+        {"params_text", command.params}};
+    return common::Sha256Hex(identity.dump());
+}
+
+std::string Scheduler::ExecutionFingerprint(const std::string& plugin_type,
+                                             const std::string& work_fingerprint) const {
+    const nlohmann::json identity = {
+        {"work_identity", work_fingerprint},
+        {"plugin_configuration", configuration_identities_.at(plugin_type)}};
+    return common::Sha256Hex(identity.dump());
+}
+
+bool Scheduler::ConfigurationMatches(const RunDefinition& run) const {
+    ControlCommand command{};
+    command.plugin_type = run.plugin_type;
+    command.dataset_version = run.dataset_version;
+    command.params = run.params;
+    if (!run.execution_fingerprint.empty())
+        return run.execution_fingerprint == ExecutionFingerprint(run.plugin_type, WorkFingerprint(command));
+    // Older records predate the complete configuration snapshot. Retain their
+    // existing work identity check, including intentionally non-deduplicated runs.
+    if (run.work_fingerprint.empty()) return true;
+    const auto current = WorkFingerprint(command);
+    return run.work_fingerprint == current ||
+           run.work_fingerprint == common::Sha256Hex(current + "\n" + run.run_id);
+}
+
+void Scheduler::SetRunStatus(const std::string& run_id, const std::string& status) {
+    const auto found = run_states_.find(run_id);
+    if (found != run_states_.end()) found->second.status = status;
+}
+
+bool Scheduler::StartNextRun(common::TaskPlugin* plugin) {
+    if (shutting_down_ || active_runs_.count(plugin)) return true;
+    auto& queue = queued_runs_[plugin];
+    while (!queue.empty() && !shutting_down_) {
+        auto& next = queue.front();
+        if (Clock::now() < next.next_configuration_check) return false;
+        if (!ConfigurationMatches(next)) {
+            const std::string reason = "plugin configuration or manifest changed since this run was queued; "
+                                       "restore the original deployment or cancel this queued run";
+            if (next.blocked_reason != reason)
+                LOG_WARN("queued run blocked: " << next.run_id << ": " << reason);
+            next.blocked_reason = reason;
+            next.next_configuration_check = Clock::now() + std::chrono::seconds(2);
+            return false;
+        }
+        next.blocked_reason.clear();
+        const RunDefinition run = queue.front();
+        if (storage_.enabled() && !storage_.BeginPlanning(run.run_id, run.plugin_type)) {
+            LOG_ERROR("createRun: cannot begin planning queued run " << run.run_id);
+            return false;
+        }
+        SetRunStatus(run.run_id, "planning");
+
+        bool planned = false;
         try {
-            plugin->cancel();
-        } catch (const std::exception& e) {
-            LOG_ERROR("createRun: cancel after plan failure threw for " << command.plugin_type
-                                                                        << ": " << e.what());
+            auto selected_clients = clients();
+            if (!run.worker_ids.empty()) {
+                selected_clients.erase(std::remove_if(selected_clients.begin(), selected_clients.end(),
+                    [&run](const common::ClientInfo& client) {
+                        return std::find(run.worker_ids.begin(), run.worker_ids.end(), client.identity)
+                               == run.worker_ids.end();
+                    }), selected_clients.end());
+            }
+            planned = plugin->plan({run.run_id, run.dataset_version, run.params}, selected_clients);
+        } catch (const std::exception& error) {
+            LOG_ERROR("createRun: plan threw for " << run.plugin_type << ": " << error.what());
         } catch (...) {
-            LOG_ERROR("createRun: cancel after plan failure threw for " << command.plugin_type
-                                                                        << ": unknown exception");
+            LOG_ERROR("createRun: plan threw for " << run.plugin_type << ": unknown exception");
         }
-        LOG_ERROR("createRun: plan failed for " << command.plugin_type);
-        return false;
+        if (!planned) {
+            if (storage_.enabled() && !storage_.FinishRun(run.run_id, "failed"))
+                LOG_ERROR("createRun: cannot mark failed run " << run.run_id
+                                                                << "; startup recovery will close it");
+            SetRunStatus(run.run_id, "failed");
+            try {
+                plugin->cancel();
+            } catch (const std::exception& error) {
+                LOG_ERROR("createRun: cancel after plan failure threw for " << run.plugin_type
+                                                                            << ": " << error.what());
+            } catch (...) {
+                LOG_ERROR("createRun: cancel after plan failure threw for " << run.plugin_type
+                                                                            << ": unknown exception");
+            }
+            queue.pop_front();
+            LOG_ERROR("createRun: plan failed for " << run.plugin_type);
+            continue;
+        }
+
+        if (storage_.enabled() && !storage_.ActivateRun(run.run_id, run.plugin_type)) {
+            LOG_ERROR("createRun: cannot activate run " << run.run_id << "; no task dispatched");
+            if (!storage_.FinishRun(run.run_id, "failed"))
+                LOG_ERROR("createRun: cannot mark unactivated run " << run.run_id << " failed");
+            SetRunStatus(run.run_id, "failed");
+            try {
+                plugin->cancel();
+            } catch (const std::exception& error) {
+                LOG_ERROR("createRun: cancel after activation failure threw for " << run.plugin_type
+                                                                                  << ": " << error.what());
+            } catch (...) {
+                LOG_ERROR("createRun: cancel after activation failure threw for " << run.plugin_type
+                                                                                  << ": unknown exception");
+            }
+            queue.pop_front();
+            continue;
+        }
+
+        if (!storage_.enabled()) {
+            for (auto& state : run_states_)
+                if (state.second.plugin_type == run.plugin_type && state.second.status == "stopped")
+                    state.second.status = "cancelled";
+        }
+        queue.pop_front();
+        active_runs_[plugin] = {run.run_id, run.plugin_type, false, run.worker_ids};
+        SetRunStatus(run.run_id, "running");
+        active_run_count_.store(active_runs_.size());
+        LOG_INFO("run started: " << run.run_id << " plugin_type=" << run.plugin_type);
+        SendWake(run.plugin_type);
+        return true;
     }
-    if (storage_.enabled() && !storage_.ActivateRun(request.run_id, command.plugin_type)) {
-        LOG_ERROR("createRun: cannot activate run " << request.run_id << "; no task dispatched");
-        if (!storage_.FinishRun(request.run_id, "failed")) {
-            LOG_ERROR("createRun: cannot mark unactivated run " << request.run_id
-                                                                << " failed; recovery will close "
-                                                                   "a planning row on the next "
-                                                                   "start");
-        }
-        try {
-            plugin->cancel();
-        } catch (const std::exception& e) {
-            LOG_ERROR("createRun: cancel after activation failure threw for "
-                      << command.plugin_type << ": " << e.what());
-        } catch (...) {
-            LOG_ERROR("createRun: cancel after activation failure threw for "
-                      << command.plugin_type << ": unknown exception");
-        }
-        return false;
-    }
-    active_runs_[plugin] = {request.run_id, command.plugin_type, false};
-    active_run_count_.store(active_runs_.size());
-    LOG_INFO("run started: " << request.run_id << " plugin_type=" << command.plugin_type);
-    SendWake(command.plugin_type);
+    return true;
+}
+
+bool Scheduler::CancelQueuedRun(common::TaskPlugin* plugin, const std::string& run_id) {
+    auto found_queue = queued_runs_.find(plugin);
+    if (found_queue == queued_runs_.end()) return false;
+    auto& queue = found_queue->second;
+    const auto found = std::find_if(queue.begin(), queue.end(), [&](const RunDefinition& run) {
+        return run.run_id == run_id;
+    });
+    if (found == queue.end()) return false;
+    if (storage_.enabled() && !storage_.CancelQueuedRun(run_id, found->plugin_type)) return false;
+    queue.erase(found);
+    SetRunStatus(run_id, "cancelled");
+    if (!active_runs_.count(plugin)) StartNextRun(plugin);
     return true;
 }
 
@@ -391,8 +593,10 @@ bool Scheduler::CommitStop(common::TaskPlugin* plugin) {
     if (storage_.enabled() && !storage_.FinishRun(run->second.run_id, "stopped")) return false;
     plugin->cancel();
     LOG_INFO("run stopped: " << run->second.run_id << " plugin_type=" << run->second.plugin_type);
+    SetRunStatus(run->second.run_id, "stopped");
     active_runs_.erase(run);
     active_run_count_.store(active_runs_.size());
+    StartNextRun(plugin);
     return true;
 }
 
@@ -408,8 +612,10 @@ bool Scheduler::CommitFinished(common::TaskPlugin* plugin) {
         return false;
     if (storage_.enabled() && !storage_.FinishRun(run->second.run_id, "finished")) return false;
     LOG_INFO("run finished: " << run->second.run_id << " plugin_type=" << run->second.plugin_type);
+    SetRunStatus(run->second.run_id, "finished");
     active_runs_.erase(run);
     active_run_count_.store(active_runs_.size());
+    StartNextRun(plugin);
     return true;
 }
 
@@ -483,6 +689,9 @@ void Scheduler::RunTimeoutChecks() {
         else
             CommitFinished(plugin);
     }
+    for (const auto& plugin : plugins_by_type_)
+        if (!active_runs_.count(plugin.second) && !queued_runs_[plugin.second].empty())
+            StartNextRun(plugin.second);
 }
 
 bool Scheduler::LoadPlugins() {
@@ -553,6 +762,42 @@ bool Scheduler::LoadPlugins() {
             destroy(plugin);
             return false;
         }
+
+        std::string plugin_sha256;
+        if (!common::FileSha256Hex(dll_path, &plugin_sha256)) {
+            LOG_ERROR("plugin " << name << ": cannot hash loaded binary " << dll_path);
+            destroy(plugin);
+            return false;
+        }
+        std::string manifest_sha256;
+        const std::string manifest_path = entry.value("stp_manifest", std::string());
+        if (!manifest_path.empty() && !common::FileSha256Hex(manifest_path, &manifest_sha256))
+            LOG_WARN("plugin " << name << ": manifest is not readable for deployment identity: "
+                               << manifest_path);
+        nlohmann::json versions = nlohmann::json::object();
+        for (const auto* key : {"expected_program_version", "expected_baseline_program_version",
+                                "expected_candidate_program_version"})
+            if (entry.contains(key) && entry[key].is_string()) versions[key] = entry[key];
+        const nlohmann::json deployment = {
+            {"plugin_type", plugin_type},
+            {"plugin_binary_sha256", plugin_sha256},
+            {"expected_program_versions", versions}};
+        deployment_identities_[plugin_type] = common::Sha256Hex(deployment.dump());
+        configuration_identities_[plugin_type] = common::Sha256Hex(entry.dump());
+        manifest_paths_[plugin_type] = manifest_path;
+        bool duplicate_protection = true;
+        if (plugin_type == "coverage")
+            duplicate_protection = versions.contains("expected_program_version") &&
+                                   !versions["expected_program_version"].get<std::string>().empty();
+        else if (plugin_type == "stpcompare")
+            duplicate_protection = versions.contains("expected_baseline_program_version") &&
+                                   versions.contains("expected_candidate_program_version") &&
+                                   !versions["expected_baseline_program_version"].get<std::string>().empty() &&
+                                   !versions["expected_candidate_program_version"].get<std::string>().empty();
+        duplicate_protection_enabled_[plugin_type] = duplicate_protection;
+        if (!duplicate_protection)
+            LOG_WARN("plugin " << name << ": duplicate protection is disabled because expected "
+                               << "program version fields are incomplete");
         plugins_by_type_[plugin_type] = plugin;
 
         plugins_.push_back({std::move(library), std::unique_ptr<common::TaskPlugin, PluginDeleter>(

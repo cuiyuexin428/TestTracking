@@ -124,13 +124,22 @@ bool EnsurePluginResultSchema(PGconn* connection) {
         "CREATE TABLE IF NOT EXISTS plugin_run_files("
         "run_id text NOT NULL, plugin_type text NOT NULL, file text NOT NULL,"
         "PRIMARY KEY(run_id,plugin_type,file));"
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_attribute "
+        "WHERE attrelid='plugin_run_files'::regclass AND attname='size_bytes' AND NOT attisdropped) THEN "
+        "ALTER TABLE plugin_run_files ADD COLUMN size_bytes bigint; END IF; END $$;"
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_attribute "
+        "WHERE attrelid='plugin_run_files'::regclass AND attname='content_sha256' AND NOT attisdropped) THEN "
+        "ALTER TABLE plugin_run_files ADD COLUMN content_sha256 text; END IF; END $$;"
         "CREATE TABLE IF NOT EXISTS plugin_file_outcomes("
         "run_id text NOT NULL, plugin_type text NOT NULL, file text NOT NULL,"
         "attempt_id text NOT NULL DEFAULT '', status text NOT NULL, detail text,"
         "finished_at timestamptz DEFAULT now(), PRIMARY KEY(run_id,plugin_type,file));"
         "CREATE TABLE IF NOT EXISTS plugin_task_completions("
         "run_id text NOT NULL, plugin_type text NOT NULL, task_id text NOT NULL,"
-        "completed_at timestamptz DEFAULT now(), PRIMARY KEY(run_id,plugin_type,task_id));";
+        "exit_code int, completed_at timestamptz DEFAULT now(), PRIMARY KEY(run_id,plugin_type,task_id));"
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_attribute "
+        "WHERE attrelid='plugin_task_completions'::regclass AND attname='exit_code' AND NOT attisdropped) THEN "
+        "ALTER TABLE plugin_task_completions ADD COLUMN exit_code int; END IF; END $$;";
     return PgInitializeSchema(connection, ddl);
 }
 

@@ -18,6 +18,8 @@ EXCLUDED_DIRECTORIES = {
     "runtime/logs",
     "runtime/pgdata",
     "runtime/result_service",
+    # Browser deployment review uses private fixtures, not release resources.
+    "runtime/deployment_ui_review",
     "third_party_src/build",
     "third_party_src/src",
     # PostgreSQL's optional GUI is not used by deployment or compilation and

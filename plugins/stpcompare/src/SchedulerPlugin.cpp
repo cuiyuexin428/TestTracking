@@ -1,6 +1,7 @@
 #include "stpcompare/SchedulerPlugin.h"
 #include "common/Manifest.h"
 #include "common/Logger.h"
+#include "common/Util.h"
 #include "stpcompare.pb.h"
 #include <algorithm>
 #include <unordered_set>
@@ -8,28 +9,53 @@
 namespace stpcompare {
 namespace {
 constexpr const char* kCheckpointTable = "stp_compare_checkpoints";
+std::string CompositeProgramVersion(const std::string& baseline,const std::string& candidate) {
+    return "baseline="+baseline+";candidate="+candidate;
+}
+std::string ClientProgramIdentity(const stpcompare::StpCompareClientInfo& info) {
+    if(!info.baseline_program_version().empty() || !info.candidate_program_version().empty())
+        return CompositeProgramVersion(info.baseline_program_version(),info.candidate_program_version());
+    return info.program_version();
+}
 }
 std::string SchedulerPlugin::pluginType() const { return "stpcompare"; }
 bool SchedulerPlugin::init(const std::string& config) {
-    const auto cfg=nlohmann::json::parse(config);
+    auto cfg=nlohmann::json::parse(config);
     manifest_path_=cfg.value("stp_manifest",std::string());
-    expected_program_version_=cfg.value("expected_program_version",std::string());
+    expected_baseline_program_version_=cfg.value("expected_baseline_program_version",std::string());
+    expected_candidate_program_version_=cfg.value("expected_candidate_program_version",std::string());
+    const auto legacy=cfg.value("expected_program_version",std::string());
+    expected_program_identity_=(expected_baseline_program_version_.empty() &&
+        expected_candidate_program_version_.empty()) ? legacy :
+        CompositeProgramVersion(expected_baseline_program_version_,expected_candidate_program_version_);
+    cfg["expected_program_version"]=expected_program_identity_;
     expected_dataset_version_=cfg.value("expected_dataset_version",std::string());
     task_size_=cfg.value("task_size",25);
     return !manifest_path_.empty() && task_size_>0 &&
-           ledger_.init(config,pluginType(),kCheckpointTable);
+           ledger_.init(cfg.dump(),pluginType(),kCheckpointTable);
 }
 bool SchedulerPlugin::validateClient(const common::ClientInfo&,const std::string& bytes,common::ValidationResult& result) {
     stpcompare::StpCompareClientInfo info;
     const auto& dataset = ledger_.hasRun() && !ledger_.finished()
         ? ledger_.datasetVersion() : expected_dataset_version_;
     result.accepted=info.ParseFromString(bytes) &&
-        (expected_program_version_.empty() || expected_program_version_==info.program_version()) &&
+        (expected_program_identity_.empty() || expected_program_identity_==ClientProgramIdentity(info)) &&
+        (expected_baseline_program_version_.empty() ||
+            expected_baseline_program_version_==info.baseline_program_version()) &&
+        (expected_candidate_program_version_.empty() ||
+            expected_candidate_program_version_==info.candidate_program_version()) &&
         (dataset.empty() || dataset==info.dataset_version());
     result.reason=result.accepted?"ok":"invalid client information or version mismatch";
     return true;
 }
+bool SchedulerPlugin::validateRunParameters(const std::string& parameters, std::string& reason) const {
+    if (common::NormalizeRunParameters(parameters).empty()) return true;
+    reason = "stpcompare does not support run parameters; leave params empty";
+    return false;
+}
 bool SchedulerPlugin::plan(const common::RunRequest& request,const std::vector<common::ClientInfo>&) {
+    std::string reason;
+    if (!validateRunParameters(request.params, reason)) { LOG_ERROR(reason); return false; }
     if (!request.dataset_version.empty() && !expected_dataset_version_.empty() &&
         request.dataset_version != expected_dataset_version_) {
         LOG_ERROR("stpcompare: requested dataset version differs from configured dataset");
@@ -53,7 +79,7 @@ bool SchedulerPlugin::plan(const common::RunRequest& request,const std::vector<c
 bool SchedulerPlugin::requestTask(const common::ClientInfo& client,const std::string&,common::Task& task) {
     stpcompare::StpCompareClientInfo info;
     if (!info.ParseFromString(client.registration_payload) ||
-        (!ledger_.programVersion().empty() && ledger_.programVersion()!=info.program_version()) ||
+        (!ledger_.programVersion().empty() && ledger_.programVersion()!=ClientProgramIdentity(info)) ||
         (!ledger_.datasetVersion().empty() && ledger_.datasetVersion()!=info.dataset_version()))
         return false;
     return ledger_.request(&task);

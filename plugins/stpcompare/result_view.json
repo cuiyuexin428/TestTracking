@@ -1,25 +1,25 @@
 {
   "schema_version": 1,
   "plugin": "stpcompare",
-  "title": "STP 文本比较",
-  "description": "按文件展示转换前后文本的一致性统计。",
+  "title": "STP 原始结果",
+  "description": "展示新旧程序四份 info 原始结果的入库完整性。",
   "primary_metric": {
-    "label": "存在差异",
-    "value": "analysis.different",
+    "label": "完整入库",
+    "value": "analysis.complete",
     "format": "integer",
     "suffix": " 个文件",
-    "tone": "warning",
+    "tone": "success",
     "empty": "--"
   },
   "widgets": [
     {
-      "id": "comparison_summary",
+      "id": "ingestion_summary",
       "type": "metrics",
-      "title": "比较结论",
+      "title": "原始数据",
       "items": [
-        {"label": "相同", "value": "analysis.same", "format": "integer", "tone": "success"},
-        {"label": "不同", "value": "analysis.different", "format": "integer", "tone": "warning"},
-        {"label": "不完整", "value": "analysis.incomplete", "format": "integer", "tone": "danger"}
+        {"label": "完整文件", "value": "analysis.complete", "format": "integer", "tone": "success"},
+        {"label": "不完整文件", "value": "analysis.incomplete", "format": "integer", "tone": "danger"},
+        {"label": "原始输出", "value": "analysis.raw_outputs", "format": "integer", "tone": "neutral"}
       ]
     }
   ],

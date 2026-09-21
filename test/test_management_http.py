@@ -3,6 +3,7 @@ import json
 import sys
 import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -54,6 +55,38 @@ class ManagementHTTPTests(unittest.TestCase):
             self.assertEqual(200, self.request('/api/logs?file=scheduler.log&limit=20')[0])
             logs.assert_called_once_with({'file': ['scheduler.log'], 'limit': ['20']})
 
+    def test_duplicate_metadata_survives_scheduler_proxy_and_public_http(self):
+        class SchedulerHandler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                response = {'error': 'equivalent work already exists', 'duplicate': True,
+                            'run_id': 'previous-run', 'status': request['dataset_version'],
+                            'force_rerun_available': True, 'internal_detail': 'private'}
+                payload = json.dumps(response).encode()
+                self.send_response(409)
+                self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        scheduler = ThreadingHTTPServer(('127.0.0.1', 0), SchedulerHandler)
+        thread = threading.Thread(target=scheduler.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with patch.object(self.service.management, '_url', f'http://127.0.0.1:{scheduler.server_port}'):
+                for status in ('finished', 'running', 'queued'):
+                    with self.subTest(status=status):
+                        self.assertEqual((409, {'error': 'equivalent work already exists',
+                            'duplicate': True, 'run_id': 'previous-run', 'status': status,
+                            'force_rerun_available': True}), self.request('/api/scheduler/commands', 'POST',
+                            {'action': 'run', 'plugin_type': 'coverage', 'dataset_version': status}))
+        finally:
+            scheduler.shutdown()
+            thread.join(5)
+            scheduler.server_close()
+
     def test_config_conflict_keeps_http_status_and_bad_body_rejected(self):
         with patch.object(self.service.management, 'get_config', return_value={'available': True}) as read:
             self.assertEqual(200, self.request('/api/config/scheduler')[0])
@@ -84,6 +117,10 @@ class ManagementHTTPTests(unittest.TestCase):
             self.assertEqual(200, self.request('/api/scheduler/commands', 'POST', {'action': 'wakeup'})[0])
             self.assertEqual(4, execute.call_count)
 
+    def test_custom_chat_endpoint_is_removed(self):
+        self.assertEqual((404, {"error": "not found"}),
+                         self.request('/api/ai/chat', 'POST', {'message': 'hello'}))
+
     def test_cross_origin_actions_are_rejected_before_any_side_effect(self):
         cases = [
             {'Origin': 'http://unrelated.invalid'},
@@ -95,16 +132,15 @@ class ManagementHTTPTests(unittest.TestCase):
         ]
         with patch.object(self.service.management, 'command') as command, \
                 patch.object(self.service.management, 'save_config') as save, \
-                patch.object(self.service, 'ai_chat') as chat, \
                 patch.object(self.service, 'generate_report') as report, \
                 patch.object(self.service, 'start_dsh_web') as start:
             for headers in cases:
                 for method, path in [('POST', '/api/scheduler/commands'), ('PUT', '/api/config/scheduler'),
-                                     ('POST', '/api/ai/chat'), ('POST', '/api/plugins/coverage/reports'),
+                                     ('POST', '/api/plugins/coverage/reports'),
                                      ('POST', '/api/ai/dsh-web')]:
                     with self.subTest(headers=headers, path=path):
                         self.assertEqual(403, self.request(path, method, {}, headers)[0])
-            for operation in (command, save, chat, report, start):
+            for operation in (command, save, report, start):
                 operation.assert_not_called()
 
     def test_same_origin_referer_is_accepted_but_plain_text_json_cannot_execute(self):
@@ -121,11 +157,14 @@ class ManagementHTTPTests(unittest.TestCase):
                                              {'Content-Type': 'text/plain'})[0])
             save.assert_not_called()
 
-    def test_empty_same_origin_dsh_start_is_supported_and_preflight_is_not_enabled(self):
-        with patch.object(self.service, 'start_dsh_web', return_value=(200, {'url': '/ai/dsh/'})) as start:
-            self.assertEqual(200, self.request('/api/ai/dsh-web', 'POST', headers={
-                'Origin': self.base, 'Content-Type': ''})[0])
-            start.assert_called_once()
+    def test_same_origin_dsh_start_requires_operator_identity_and_preflight_is_not_enabled(self):
+        operator = '123e4567-e89b-42d3-a456-426614174001'
+        with patch.object(self.service, 'start_dsh_web', return_value=(
+                200, {'url': f'/ai/dsh/{operator}/'})) as start:
+            self.assertEqual(200, self.request('/api/ai/dsh-web', 'POST',
+                                             {'operator_id': operator},
+                                             {'Origin': self.base})[0])
+            start.assert_called_once_with(operator)
         self.assertEqual(404, self.request('/api/config/scheduler', 'OPTIONS', headers={
             'Origin': 'http://unrelated.invalid', 'Access-Control-Request-Method': 'PUT',
             'Access-Control-Request-Headers': 'content-type'})[0])

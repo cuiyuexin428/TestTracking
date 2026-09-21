@@ -1,4 +1,5 @@
 #pragma once
+#include "common/Manifest.h"
 #include "common/RunStore.h"
 #include "common/TaskPlugin.h"
 #include <deque>
@@ -15,6 +16,9 @@ public:
     bool plan(const std::string& run, const std::vector<Task>& tasks,
               const std::vector<std::string>& files, const std::string& fingerprint,
               const std::string& dataset_version = {});
+    bool planManifest(const std::string& run, const std::vector<Task>& tasks,
+                      const std::vector<ManifestEntry>& files, const std::string& fingerprint,
+                      const std::string& dataset_version = {});
     bool restore(const std::string& run, const std::string& manifest_fingerprint = {});
     bool loadLegacy(const std::string& run, std::string* bytes);
     bool request(Task* task);

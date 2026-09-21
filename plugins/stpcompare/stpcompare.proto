@@ -11,9 +11,9 @@ message StpCompareTask {
   int32 retry_count = 3;
 }
 
-// Per-file outcome. The two txt outputs themselves are written directly into
-// the configured table by the client's StpResultStore; only status travels on
-// the wire so the scheduler can track completion and surface failures.
+// Per-file outcome. The four raw outputs (two programs x two stages) are
+// written directly into the configured table by the client's StpResultStore;
+// only status travels on the wire.
 message FileOutcome {
   string file = 1;
   bool ok = 2;
@@ -27,8 +27,11 @@ message StpCompareResult {
 // Registration validation payload: component versions of the client package.
 // The framework does not parse it; the stpcompare server plugin interprets it.
 message StpCompareClientInfo {
+  // Composite value retained for durable framework run identity.
   string program_version = 1;
   string dataset_version = 2;
+  string baseline_program_version = 3;
+  string candidate_program_version = 4;
 }
 
 // Run checkpoint for resume after STOP/crash. The run is a flat task pool; at

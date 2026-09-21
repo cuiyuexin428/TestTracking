@@ -7,7 +7,9 @@ import sys
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from unittest.mock import patch
 
@@ -15,7 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from result_service.app.config import ServiceConfig
-from result_service.app.plugins import ResultPluginError, default_plugins
+from result_service.app.plugins import (ResultPluginError, default_plugins,
+                                        save_versioned_plugin_view, versioned_plugin_view)
 from result_service.app.server import Handler, ResultHTTPServer, ResultService
 from result_service.app.views import PluginViewError, PluginViewStore, validate_plugin_view
 
@@ -31,7 +34,7 @@ class PluginViewContractTests(unittest.TestCase):
         self.assertEqual("analysis.percent", coverage["primary_metric"]["value"])
         self.assertTrue((ROOT / "plugins" / "coverage" / "result_view.json").is_file())
         self.assertEqual("stpcompare", stpcompare["plugin"])
-        self.assertEqual("analysis.different", stpcompare["primary_metric"]["value"])
+        self.assertEqual("analysis.complete", stpcompare["primary_metric"]["value"])
         self.assertTrue((ROOT / "plugins" / "stpcompare" / "result_view.json").is_file())
 
     def test_runtime_view_is_persisted_and_reloaded(self) -> None:
@@ -148,7 +151,8 @@ class PluginViewContractTests(unittest.TestCase):
                 json.dumps(stpcompare), encoding="utf-8"
             )
             service = ResultService(ServiceConfig(plugin_views_dir=temp_dir))
-            changed = copy.deepcopy(definition)
+            _, changed = service.payload("/api/plugins/coverage/view", {})
+            original_revision = changed["revision"]
             changed["title"] = "AI 生成的覆盖率视图"
 
             status, saved = service.update_plugin_view(
@@ -160,9 +164,79 @@ class PluginViewContractTests(unittest.TestCase):
             self.assertEqual(200, status)
             self.assertEqual(200, get_status)
             self.assertEqual(saved, loaded)
+            self.assertNotEqual(original_revision, saved["revision"])
+            self.assertNotIn("revision", json.loads((view_dir / "coverage.json").read_text(encoding="utf-8")))
             coverage = next(item for item in plugins if item["name"] == "coverage")
             self.assertTrue(coverage["view_editable"])
             self.assertEqual("AI 生成的覆盖率视图", coverage["view"]["title"])
+
+    def test_valid_update_requires_revision_and_keeps_existing_definition(self) -> None:
+        service = ResultService(ServiceConfig.defaults())
+        self.addCleanup(service.close)
+        _, original = service.payload("/api/plugins/coverage/view", {})
+        changed = {key: value for key, value in original.items() if key != "revision"}
+        changed["title"] = "Missing revision"
+
+        status, payload = service.update_plugin_view("/api/plugins/coverage/view", changed)
+
+        self.assertEqual(400, status)
+        self.assertIn("revision is required", payload["error"])
+        self.assertEqual((200, original), service.payload("/api/plugins/coverage/view", {}))
+
+    def test_concurrent_service_instances_only_accept_one_save_from_same_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = PluginViewStore(temp_dir)
+            store.save("coverage", PluginViewStore().load("coverage"))
+            services = [ResultService(ServiceConfig(plugin_views_dir=temp_dir)) for _ in range(2)]
+            try:
+                drafts = [service.payload("/api/plugins/coverage/view", {})[1] for service in services]
+                self.assertEqual(drafts[0]["revision"], drafts[1]["revision"])
+                barrier = threading.Barrier(2)
+
+                def save(index):
+                    draft = drafts[index]
+                    draft["title"] = f"Operator {index}"
+                    barrier.wait(timeout=3)
+                    return services[index].update_plugin_view("/api/plugins/coverage/view", draft)
+
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    results = list(executor.map(save, range(2)))
+
+                self.assertEqual([200, 409], sorted(status for status, _ in results))
+                saved = next(payload for status, payload in results if status == 200)
+                conflict = next(payload for status, payload in results if status == 409)
+                self.assertEqual(saved["revision"], conflict["current_revision"])
+                self.assertIn("其他使用者", conflict["error"])
+                self.assertEqual((200, saved), services[0].payload("/api/plugins/coverage/view", {}))
+                self.assertEqual(saved["title"], store.load("coverage")["title"])
+                self.assertNotIn("revision", store.load("coverage"))
+                self.assertEqual([], list(Path(temp_dir).glob("*.tmp")))
+            finally:
+                for service in services:
+                    service.close()
+
+    def test_versioned_api_preserves_plugin_owned_single_argument_save_contract(self) -> None:
+        class CustomPlugin:
+            name = "coverage"
+
+            def __init__(self):
+                self.definition = PluginViewStore().load(self.name)
+
+            def view_definition(self):
+                return copy.deepcopy(self.definition)
+
+            def save_view_definition(self, value):
+                validate_plugin_view(value, expected_plugin=self.name)
+                self.definition = copy.deepcopy(value)
+                return self.view_definition()
+
+        plugin = CustomPlugin()
+        draft = versioned_plugin_view(plugin)
+        draft["title"] = "Custom plugin"
+        saved = save_versioned_plugin_view(plugin, draft)
+        self.assertEqual("Custom plugin", saved["title"])
+        self.assertNotEqual(draft["revision"], saved["revision"])
+        self.assertNotIn("revision", plugin.definition)
 
     def test_invalid_update_returns_clear_client_error(self) -> None:
         service = ResultService(ServiceConfig.defaults())
@@ -189,9 +263,10 @@ class PluginViewContractTests(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
-                changed = copy.deepcopy(definitions["coverage"])
-                changed["title"] = "HTTP 更新后的视图"
                 url = f"http://127.0.0.1:{server.server_address[1]}/api/plugins/coverage/view"
+                with urlopen(url, timeout=3) as response:
+                    changed = json.loads(response.read().decode("utf-8"))
+                changed["title"] = "HTTP 更新后的视图"
                 request = Request(
                     url,
                     data=json.dumps(changed).encode("utf-8"),
@@ -202,6 +277,12 @@ class PluginViewContractTests(unittest.TestCase):
                     self.assertEqual(200, response.status)
                 with urlopen(url, timeout=3) as response:
                     loaded = json.loads(response.read().decode("utf-8"))
+                with self.assertRaises(HTTPError) as rejected:
+                    urlopen(request, timeout=3)
+                self.assertEqual(409, rejected.exception.code)
+                with rejected.exception as response:
+                    conflict = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(loaded["revision"], conflict["current_revision"])
             finally:
                 server.shutdown()
                 server.server_close()
@@ -219,7 +300,8 @@ class PackagedPluginResourceTests(unittest.TestCase):
         self.views = self.root / "views"
         self.adapters = self.root / "adapters"
         self.reports = self.root / "reports"
-        for directory in (self.views, self.adapters, self.reports):
+        self.contexts = self.root / "contexts"
+        for directory in (self.views, self.adapters, self.reports, self.contexts):
             directory.mkdir()
         view = PluginViewStore().load("coverage")
         for name in ("vendor-plugin", "view-only"):
@@ -233,22 +315,26 @@ class PackagedPluginResourceTests(unittest.TestCase):
             "def create_result_adapter(options): return Adapter()\n", encoding="utf-8")
         (self.reports / "vendor-plugin.py").write_text(
             "def render(connection, context): return '<html>Vendor report</html>'\n", encoding="utf-8")
+        (self.contexts / "vendor-plugin.md").write_text(
+            "# Vendor plugin\n\nResults are stored by the vendor adapter.\n", encoding="utf-8")
         (self.views / "resources.manifest").write_text(json.dumps({
             "schema_version": 1,
-            "plugins": {"vendor-plugin": ["view", "adapter", "report_template"],
+            "plugins": {"vendor-plugin": ["view", "adapter", "report_template", "ai_context"],
                         "view-only": ["view"]},
         }), encoding="utf-8")
 
-    def load(self, adapters=None, reports=None):
+    def load(self, adapters=None, reports=None, contexts=None):
         return default_plugins(views_dir=str(self.views),
                                adapters_dir=str(adapters or self.adapters),
-                               report_templates_dir=str(reports or self.reports))
+                               report_templates_dir=str(reports or self.reports),
+                               ai_contexts_dir=str(contexts or self.contexts))
 
     def test_missing_declared_resource_names_its_plugin_and_file(self) -> None:
         for resource, path in (
             ("view", self.views / "vendor-plugin.json"),
             ("adapter", self.adapters / "vendor-plugin.py"),
             ("report_template", self.reports / "vendor-plugin.py"),
+            ("ai_context", self.contexts / "vendor-plugin.md"),
         ):
             with self.subTest(resource=resource):
                 original = path.read_bytes()
@@ -279,7 +365,10 @@ class PackagedPluginResourceTests(unittest.TestCase):
         with self.assertRaisesRegex(ResultPluginError, "missing declared report_template"):
             ResultService(ServiceConfig(plugin_views_dir=str(self.views),
                                         plugin_adapters_dir=str(self.adapters),
+                                        plugin_ai_contexts_dir=str(self.contexts),
                                         report_templates_dir=str(self.root / "wrong reports")))
+        with self.assertRaisesRegex(ResultPluginError, "missing declared ai_context"):
+            self.load(contexts=self.root / "wrong contexts")
 
 
 class PluginViewConfigTests(unittest.TestCase):
@@ -291,6 +380,7 @@ class PluginViewConfigTests(unittest.TestCase):
                 json.dumps({
                     "plugin_views_dir": "../data/result_views",
                     "plugin_adapters_dir": "../result_service/plugin_adapters",
+                    "plugin_ai_contexts_dir": "../result_service/plugin_ai_contexts",
                 }),
                 encoding="utf-8",
             )
@@ -304,6 +394,10 @@ class PluginViewConfigTests(unittest.TestCase):
             self.assertEqual(
                 str((Path(temp_dir) / "result_service" / "plugin_adapters").resolve()),
                 config.plugin_adapters_dir,
+            )
+            self.assertEqual(
+                str((Path(temp_dir) / "result_service" / "plugin_ai_contexts").resolve()),
+                config.plugin_ai_contexts_dir,
             )
 
     def test_plugin_specific_adapter_options_are_generic(self) -> None:

@@ -16,10 +16,42 @@ from test_coverage_settle import PrivatePostgres
 from test_runtime_integration import CapturedProcess, unused_port
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from result_service.app.config import ServiceConfig
+from result_service.app.management import ManagementError, ManagementService
 OPTIONS = None
 
 
 class ManagementIntegrationTests(unittest.TestCase):
+    def test_offline_deployment_guard_reads_durable_unfinished_runs(self):
+        pg = PrivatePostgres(OPTIONS.pg_bin, OPTIONS.bin_dir / 'scheduler.exe')
+        self.addCleanup(pg.close)
+        pg.start()
+        temporary = tempfile.TemporaryDirectory(prefix='deployment-guard-', dir=ROOT / 'build/test')
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        scheduler = root / 'scheduler.json'
+        scheduler.write_text(json.dumps({'server': {'db_conn': pg.conn}, 'plugins': {}}))
+        service = ManagementService(ServiceConfig(
+            scheduler_config_path=str(scheduler), scheduler_management_url=''))
+        # A first installation with no framework tables is allowed.
+        service.require_plugin_idle('coverage')
+        pg.sql("CREATE TABLE runs(run_id text PRIMARY KEY, plugin_type text, status text)")
+        for status in ('queued', 'planning', 'running', 'stopped'):
+            pg.sql("INSERT INTO runs VALUES('recoverable','coverage','" + status + "')")
+            with self.assertRaises(ManagementError) as rejected:
+                service.require_plugin_idle('coverage')
+            self.assertEqual(409, rejected.exception.status)
+            self.assertEqual(status, pg.sql("SELECT status FROM runs WHERE run_id='recoverable'"))
+            service.require_plugin_idle('stpcompare')
+            pg.sql("DELETE FROM runs")
+        pg.sql("INSERT INTO runs VALUES('complete','coverage','finished')")
+        service.require_plugin_idle('coverage')
+        pg.sql("ALTER TABLE runs RENAME COLUMN status TO unavailable_status")
+        with self.assertRaises(ManagementError) as rejected:
+            service.require_plugin_idle('coverage')
+        self.assertEqual(503, rejected.exception.status)
+
     def test_live_clients_commands_logs_config_and_independent_report(self):
         pg = PrivatePostgres(OPTIONS.pg_bin, OPTIONS.bin_dir / 'scheduler.exe')
         self.addCleanup(pg.close)

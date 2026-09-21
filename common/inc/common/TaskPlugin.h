@@ -36,8 +36,8 @@ struct ValidationResult {
     std::string reason;
 };
 
-// A valid durable run is temporarily incompatible with the deployment. Startup
-// must preserve its recovery index so restoring the original deployment can retry.
+// Durable progress is temporarily unreadable or incompatible with the deployment.
+// Preserve its recovery index so fixing storage/configuration permits a retry.
 class RecoveryBlocked : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
@@ -61,6 +61,11 @@ public:
     virtual bool validateClient(const ClientInfo& client,
                                 const std::string& client_message,
                                 ValidationResult& result) = 0;
+
+    // Validate canonical run parameters before queueing or computing identity.
+    // The plugin owns supported fields; the default retains opaque custom-plugin
+    // parameters. Rebuild scheduler plugins when changing this C++ interface.
+    virtual bool validateRunParameters(const std::string&, std::string&) const { return true; }
 
     // Persist the run plan before returning true. Business payloads remain
     // plugin-owned; the shared ledger manages pending and committed tasks.

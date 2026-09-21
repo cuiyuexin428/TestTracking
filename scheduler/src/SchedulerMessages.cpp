@@ -160,6 +160,11 @@ void Scheduler::HandleRequestTask(const IncomingMessage& msg) {
         SendNoTask(msg);
         return;
     }
+    const auto& targets = active->second.worker_ids;
+    if (!targets.empty() && std::find(targets.begin(), targets.end(), msg.identity) == targets.end()) {
+        SendNoTask(msg);
+        return;
+    }
     common::ClientInfo client;
     {
         std::lock_guard<std::mutex> lock(clients_mutex_);
@@ -273,6 +278,11 @@ bool Scheduler::CommitReport(const std::string& id) {
     if (!accepted) {
         LOG_WARN("result persistence failed; retrying task " << id);
         return false;
+    }
+    const auto run_state = run_states_.find(attempt.run_id);
+    if (run_state != run_states_.end()) {
+        run_state->second.has_task_reports = true;
+        if (attempt.result.exit_code() != 0) run_state->second.all_tasks_succeeded = false;
     }
     accepted_reports_.push_back({attempt.identity, attempt.session_id, attempt.plugin_type, id,
                                  attempt.run_id, attempt.attempt_id});

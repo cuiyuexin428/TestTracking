@@ -133,6 +133,7 @@ class DshConversationTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="dsh conversation ")
         self.addCleanup(self.temp.cleanup)
         self.config = ProviderConfig(name="dsh", command="dsh", cwd=self.temp.name)
+        self.operator = "123e4567-e89b-42d3-a456-426614174001"
         self.prompts = []
 
     def run_prompt(self, prompt, invocation):
@@ -147,18 +148,36 @@ class DshConversationTests(unittest.TestCase):
         source = (ROOT / "plugins/coverage/result_report.py").read_text(encoding="utf-8")
         context = {"current_script": source, "schema": "x" * 40000}
         with patch.object(provider, "_run_prompt", side_effect=self.run_prompt):
-            result = provider.complete('生成报告 "<html>" & 100%\n保留换行', context)
-        self.assertEqual(self.prompts[0], _build_prompt('生成报告 "<html>" & 100%\n保留换行', context))
+            result = provider.complete('生成报告 "<html>" & 100%\n保留换行', context,
+                                       operator_id=self.operator)
+        self.assertEqual(self.prompts[0], _build_prompt(
+            '生成报告 "<html>" & 100%\n保留换行', context, operator_id=self.operator
+        ))
         self.assertIsNotNone(result.conversation_id)
+
+    def test_report_apply_prompt_uses_current_operator_and_versioned_save_contract(self):
+        provider = DshProvider(self.config)
+        with patch.object(provider, "_run_prompt", side_effect=self.run_prompt):
+            provider.complete("Save the report", {}, operator_id=self.operator)
+        prompt = self.prompts[0]
+        self.assertIn(f'operator_id is "{self.operator}"', prompt)
+        self.assertLess(prompt.index("first GET"), prompt.index("PUT the complete source"))
+        self.assertIn("source and revision", prompt)
+        self.assertIn("that revision, and this session operator_id", prompt)
+        self.assertIn("HTTP 409", prompt)
+        self.assertIn("preserve the draft", prompt)
+        self.assertIn("merge before saving", prompt)
+        self.assertIn("do not blindly retry", prompt)
 
     def test_followup_survives_provider_restart_and_new_chats_are_independent(self):
         provider = DshProvider(self.config)
         with patch.object(provider, "_run_prompt", side_effect=self.run_prompt):
-            first = provider.complete("Remember ALPHA", {})
+            first = provider.complete("Remember ALPHA", {}, operator_id=self.operator)
         reopened = DshProvider(self.config)
         with patch.object(reopened, "_run_prompt", side_effect=self.run_prompt):
-            second = reopened.complete("Repeat my label", {}, first.conversation_id)
-            fresh = reopened.complete("Another question", {})
+            second = reopened.complete("Repeat my label", {}, first.conversation_id,
+                                       operator_id=self.operator)
+            fresh = reopened.complete("Another question", {}, operator_id=self.operator)
         self.assertEqual(first.conversation_id, second.conversation_id)
         self.assertIn("Remember ALPHA", self.prompts[1])
         self.assertIn("The remembered answer is ALPHA.", self.prompts[1])
@@ -168,35 +187,50 @@ class DshConversationTests(unittest.TestCase):
     def test_failed_followup_does_not_enter_history(self):
         provider = DshProvider(self.config)
         with patch.object(provider, "_run_prompt", side_effect=self.run_prompt):
-            first = provider.complete("Remember ALPHA", {})
+            first = provider.complete("Remember ALPHA", {}, operator_id=self.operator)
         with patch.object(provider, "_run_prompt", side_effect=ProviderError("timed out")):
             with self.assertRaises(ProviderError):
-                provider.complete("Failed question", {}, first.conversation_id)
+                provider.complete("Failed question", {}, first.conversation_id,
+                                  operator_id=self.operator)
         with patch.object(provider, "_run_prompt", side_effect=self.run_prompt):
-            provider.complete("Continue", {}, first.conversation_id)
+            provider.complete("Continue", {}, first.conversation_id, operator_id=self.operator)
         self.assertNotIn("Failed question", self.prompts[-1])
 
     def test_unknown_conversation_is_not_silently_restarted(self):
         provider = DshProvider(self.config)
         with self.assertRaisesRegex(ProviderError, "start a new conversation"):
-            provider.complete("continue", {}, "123e4567-e89b-12d3-a456-426614174000")
+            provider.complete("continue", {}, "123e4567-e89b-12d3-a456-426614174000",
+                              operator_id=self.operator)
 
     def test_concurrent_followups_save_both_turns_in_order(self):
         provider = DshProvider(self.config)
         with patch.object(provider, "_run_prompt", side_effect=self.run_prompt):
-            first = provider.complete("Remember ALPHA", {})
+            first = provider.complete("Remember ALPHA", {}, operator_id=self.operator)
             with ThreadPoolExecutor(max_workers=2) as executor:
                 results = list(executor.map(
-                    lambda message: provider.complete(message, {}, first.conversation_id),
+                    lambda message: provider.complete(
+                        message, {}, first.conversation_id, operator_id=self.operator
+                    ),
                     ["Followup one", "Followup two"],
                 ))
         self.assertTrue(all(result.conversation_id == first.conversation_id for result in results))
-        history = json.loads((provider.conversations_dir / f"{first.conversation_id}.json").read_text(encoding="utf-8"))
+        history = json.loads((provider.conversations_dir / self.operator /
+                              f"{first.conversation_id}.json").read_text(encoding="utf-8"))
         self.assertEqual(len(history), 6)
         self.assertEqual({turn["content"] for turn in history if turn["role"] == "user"},
                          {"Remember ALPHA", "Followup one", "Followup two"})
         self.assertIn("Previous conversation", self.prompts[-1])
         self.assertTrue("Followup one" in self.prompts[-1] and "Followup two" in self.prompts[-1])
+
+    def test_conversation_cannot_be_resumed_by_another_operator(self):
+        provider = DshProvider(self.config)
+        with patch.object(provider, "_run_prompt", side_effect=self.run_prompt):
+            first = provider.complete("private", {}, operator_id=self.operator)
+        with self.assertRaisesRegex(ProviderError, "start a new conversation"):
+            provider.complete(
+                "continue", {}, first.conversation_id,
+                operator_id="123e4567-e89b-42d3-a456-426614174002",
+            )
 
 
 @unittest.skipUnless(os.name == "nt", "Windows command wrappers")
@@ -228,8 +262,13 @@ class WindowsProviderTransportTests(unittest.TestCase):
         provider = DshProvider(ProviderConfig(name="dsh", command=command, cwd=self.temp.name))
         context = {"current_script": (ROOT / "plugins/coverage/result_report.py").read_text(encoding="utf-8"),
                    "schema": "schema中文" * 6000}
-        result = provider.complete('Generate "HTML" & plots', context)
-        self.assertEqual(result.text, _build_prompt('Generate "HTML" & plots', context))
+        result = provider.complete(
+            'Generate "HTML" & plots', context,
+            operator_id="123e4567-e89b-42d3-a456-426614174001",
+        )
+        self.assertEqual(result.text, _build_prompt(
+            'Generate "HTML" & plots', context, operator_id="123e4567-e89b-42d3-a456-426614174001"
+        ))
 
     def test_timeout_stops_the_wrapper_and_its_child_processes(self):
         pid_file = self.root / "child.pid"
@@ -300,14 +339,17 @@ class BundledDshTests(unittest.TestCase):
                 config = ProviderConfig(name="dsh", command=str(wrapper), cwd=directory, timeout_seconds=30)
                 context = {"current_script": (ROOT / "plugins/coverage/result_report.py").read_text(encoding="utf-8"),
                            "schema": "x" * 40000}
-                first = DshProvider(config).complete("Remember ALPHA.", context)
-                second = DshProvider(config).complete("What label did I give you?", {}, first.conversation_id)
+                operator = "123e4567-e89b-42d3-a456-426614174001"
+                first = DshProvider(config).complete("Remember ALPHA.", context, operator_id=operator)
+                second = DshProvider(config).complete(
+                    "What label did I give you?", {}, first.conversation_id, operator_id=operator
+                )
                 self.assertEqual(first.text, "Remembered ALPHA.")
                 self.assertEqual(second.text, "ALPHA is the previous label.")
                 self.assertEqual(first.conversation_id, second.conversation_id)
                 user1 = next(message for message in requests[0]["messages"]
                              if message["role"] == "user" and "User question:" in str(message["content"]))
-                self.assertEqual(user1["content"], _build_prompt("Remember ALPHA.", context))
+                self.assertEqual(user1["content"], _build_prompt("Remember ALPHA.", context, operator_id=operator))
                 user2 = next(message for message in requests[1]["messages"]
                              if message["role"] == "user" and "Previous conversation" in str(message["content"]))
                 self.assertIn("Remembered ALPHA.", user2["content"])

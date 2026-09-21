@@ -70,15 +70,15 @@ public:
         ack.mutable_task_ack()->set_task_id(task.task_id());
         ack.mutable_task_ack()->set_attempt_id(attempt); SendAs(ack, session_id);
     }
-    void Report(const common::Task& task, const std::string& attempt) {
-        ReportAs(task, attempt, session);
+    void Report(const common::Task& task, const std::string& attempt, int exit_code=0) {
+        ReportAs(task, attempt, session, exit_code);
     }
     void ReportAs(const common::Task& task, const std::string& attempt,
-                  const std::string& session_id) {
+                  const std::string& session_id, int exit_code=0) {
         common::Envelope report; report.set_type(common::TASK_REPORT);
         auto* result=report.mutable_task_report()->mutable_result();
         result->set_task_id(task.task_id()); result->set_run_id(task.run_id());
-        result->set_attempt_id(attempt); SendAs(report, session_id);
+        result->set_attempt_id(attempt); result->set_exit_code(exit_code); SendAs(report, session_id);
     }
     void Heartbeat() {
         common::Envelope message; message.set_type(common::HEARTBEAT);
@@ -186,12 +186,43 @@ void Test(const std::filesystem::path& bin) {
     peer.AckAs(next,next.attempt_id(),peer.session);
     peer.Report(next,next.attempt_id());
     Require(peer.Wait(common::TASK_REPORT_ACK).task_report_ack().accepted(),"new run did not complete");
+
+    const auto finish = [&](int exit_code) {
+        const auto assigned = peer.Request();
+        peer.AckAs(assigned,assigned.attempt_id(),peer.session);
+        peer.Report(assigned,assigned.attempt_id(),exit_code);
+        Require(peer.Wait(common::TASK_REPORT_ACK).task_report_ack().accepted(),"business outcome rejected");
+        const auto until = std::chrono::steady_clock::now()+2s;
+        while (server->activeRunCount()!=0 && std::chrono::steady_clock::now()<until)
+            std::this_thread::sleep_for(5ms);
+        Require(server->activeRunCount()==0,"business outcome did not finish the run");
+        return assigned.run_id();
+    };
+    const nlohmann::json command={{"action","run"},{"plugin_type","scheduler-probe"},
+                                  {"dataset_version","business-failure"}};
+    Require(server->managementCommand(command).value("ok",false),"failed run could not start");
+    const auto failed = finish(1);
+    auto forced = command;
+    forced["force_rerun"] = true;
+    forced["force_rerun_reason"] = "diagnose failed execution";
+    const auto forced_failure = server->managementCommand(forced);
+    Require(forced_failure.value("ok",false) && forced_failure.value("rerun_of",std::string())==failed,
+            "forced rerun lost its failed predecessor without framework storage");
+    finish(1);
+    Require(server->managementCommand(command).value("ok",false),
+            "business failure blocked ordinary retry without framework storage");
+    const auto successful = finish(0);
+    Require(server->managementCommand(forced).value("ok",false),"forced verification could not start");
+    finish(1);
+    const auto duplicate = server->managementCommand(command);
+    Require(duplicate.value("duplicate",false) && duplicate.value("run_id",std::string())==successful,
+            "latest failed run hid an earlier complete success without framework storage");
     server->stop();
 }
 }
 int main(int argc,char** argv) {
     try { Test(std::filesystem::absolute(argv[0]).parent_path());
-        std::cout<<"PASS: session takeover, durable report identity, command barrier, independent heartbeat\n";
+        std::cout<<"PASS: session takeover, durable report identity, command barrier, independent heartbeat, business outcome deduplication\n";
         return 0;
     } catch(const std::exception& e) { std::cerr<<e.what()<<'\n';return 1; }
 }

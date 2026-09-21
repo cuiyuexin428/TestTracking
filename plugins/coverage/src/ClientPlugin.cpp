@@ -132,7 +132,11 @@ bool ClientPlugin::init(const std::string& config) {
         engine_dlls_.push_back(dll.get<std::string>());
     }
 
-    program_version_ = ReadVersionFile(program_dir_ + "/version.txt");
+    // Managed releases inject a version derived from the verified program
+    // artifact SHA. Existing manually deployed programs keep version.txt.
+    program_version_ = cfg.value("program_version", std::string());
+    if (program_version_.empty())
+        program_version_ = ReadVersionFile(program_dir_ + "/version.txt");
     dataset_version_ = ReadVersionFile(stp_root_ + "/version.txt");
     if (!dry_run_) {
         if (target_exe_.empty() || stp_root_.empty()) {

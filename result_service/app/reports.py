@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -53,6 +54,10 @@ def render(connection, context):
 class ReportError(ValueError):
     """A report script could not be saved, executed, or found."""
 
+    def __init__(self, message: str, status: int = 400):
+        super().__init__(message)
+        self.status = status
+
 
 class ReportStore:
     """Editable Python scripts and immutable, database-derived HTML reports."""
@@ -67,6 +72,7 @@ class ReportStore:
         self.plugin_source_root = Path(__file__).resolve().parents[2] / "plugins"
         self.python_executable = str(python_executable or sys.executable)
         self.timeout_seconds = timeout_seconds
+        self._script_lock = threading.RLock()
 
     @staticmethod
     def _plugin_name(plugin: str) -> str:
@@ -89,20 +95,41 @@ class ReportStore:
             origin = "generic"
         except OSError as exc:
             raise ReportError(f"cannot read report script for plugin: {plugin}") from exc
-        return {"plugin": plugin, "source": source, "origin": origin, "path": str(path)}
+        return {"plugin": plugin, "source": source, "origin": origin, "path": str(path),
+                "revision": hashlib.sha256(source.encode("utf-8")).hexdigest()}
 
-    def save_script(self, plugin: str, source: str) -> dict[str, Any]:
+    def save_script(self, plugin: str, source: str, expected_revision: str | None = None,
+                    operator_id: str | None = None) -> dict[str, Any]:
         plugin = self._plugin_name(plugin)
         self._validate_script(source)
-        self.scripts_dir.mkdir(parents=True, exist_ok=True)
-        target = self.scripts_dir / f"{plugin}.py"
-        temporary = self.scripts_dir / f".{plugin}.{uuid4().hex}.tmp"
-        try:
-            temporary.write_text(source, encoding="utf-8")
-            os.replace(temporary, target)
-        finally:
-            temporary.unlink(missing_ok=True)
-        return self.get_script(plugin)
+        with self._script_lock:
+            before = self.get_script(plugin)
+            if expected_revision is not None and expected_revision != before["revision"]:
+                raise ReportError(
+                    "report script changed after it was loaded; reload the latest script before saving",
+                    status=409,
+                )
+            self.scripts_dir.mkdir(parents=True, exist_ok=True)
+            target = self.scripts_dir / f"{plugin}.py"
+            temporary = self.scripts_dir / f".{plugin}.{uuid4().hex}.tmp"
+            try:
+                temporary.write_text(source, encoding="utf-8")
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+            saved = self.get_script(plugin)
+            audit = {
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "plugin": plugin,
+                "operator_id": operator_id,
+                "previous_revision": before["revision"],
+                "revision": saved["revision"],
+            }
+            with (self.scripts_dir / "audit.jsonl").open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(json.dumps(audit, ensure_ascii=False, separators=(",", ":")) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            return saved
 
     @staticmethod
     def _validate_script(source: str) -> None:

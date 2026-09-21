@@ -1,15 +1,8 @@
-const AI_CONVERSATIONS_KEY = 'testtracking.ai.conversations.v1';
+const AI_OPERATOR_KEY = 'testtracking.ai.operator-id.v1';
 const AI_PANEL_WIDTH_KEY = 'testtracking.ai.panel-width.v1';
 const UI_SCALE_KEY = 'testtracking.ui.scale.v1';
 const PANEL_MIN_WIDTH = 360;
 const HISTORY_PAGE_SIZE = 50;
-
-function readStoredJson(key, fallback) {
-  try {
-    if (typeof localStorage === 'undefined') return fallback;
-    return JSON.parse(localStorage.getItem(key) || '') || fallback;
-  } catch (_) { return fallback; }
-}
 
 function readStoredNumber(key, fallback) {
   try {
@@ -19,26 +12,54 @@ function readStoredNumber(key, fallback) {
   } catch (_) { return fallback; }
 }
 
+function createUuid() {
+  const bytes = new Uint8Array(16);
+  if (globalThis.crypto?.getRandomValues) globalThis.crypto.getRandomValues(bytes);
+  else for (let index = 0; index < bytes.length; index += 1) bytes[index] = Math.floor(Math.random() * 256);
+  bytes[6] = (bytes[6] & 15) | 64;
+  bytes[8] = (bytes[8] & 63) | 128;
+  const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function readOperatorId() {
+  try {
+    const stored = typeof localStorage === 'undefined' ? '' : (localStorage.getItem(AI_OPERATOR_KEY) || '');
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(stored)) return stored.toLowerCase();
+    const generated = createUuid();
+    if (typeof localStorage !== 'undefined') localStorage.setItem(AI_OPERATOR_KEY, generated);
+    return generated;
+  } catch (_) { return createUuid(); }
+}
+
 const storedPanelWidth = readStoredNumber(AI_PANEL_WIDTH_KEY, 400);
 const state = {
   runs: [], plugins: [], pluginViews: {}, pluginViewSchema: null,
   selected: null, page: 'results', filter: '', readiness: null,
   providers: [], selectionRequest: 0, selectionPending: 0, loadRequest: 0, apiHealthy: false,
-  conversationIds: readStoredJson(AI_CONVERSATIONS_KEY, {}), aiBusy: false,
+  operatorId: readOperatorId(),
   panelWidth: storedPanelWidth, panelPreferredWidth: storedPanelWidth,
-  dshWebUrl: '', dshWebLoading: false,
+  dshWebUrl: '', dshWebLoading: false, dshWebAttempted: false,
   panelWidthBeforeExpand: 0, uiScale: readStoredNumber(UI_SCALE_KEY, 1.2),
   progressRefreshBusy: false,
-  analysisCatalogs: {}, reportScripts: {}, reportLoads: {}, reportDrafts: {},
+  analysisCatalogs: {}, reportScripts: {}, reportScriptRevisions: {}, reportLoads: {}, reportDrafts: {}, reportDraftBases: {},
   reportScriptLoads: {},
   report: null, reportRequest: 0, reportBusy: false, reportSelectionKey: '', reportSelectionGeneration: 0,
-  reportEditorPlugin: '', reportEditorRequest: 0, reportEditorOriginal: '',
-  reportEditorCandidate: null, reportEditorSaving: false,
+  reportEditorPlugin: '', reportEditorRequest: 0, reportEditorOriginal: '', reportEditorRevision: '',
+  reportEditorSaving: false, reportEditorLoading: false, reportEditorConflicted: false, reportConflictDrafts: {},
+  viewEditorPlugin: '', viewEditorRevision: '',
   historyRuns: [], historyOffset: 0, historySearch: '', historyHasMore: false,
   historyRequest: 0, historyBusy: false,
   scheduler: null, schedulerRequest: 0, schedulerBusy: false, commandBusy: false,
+  selectedWorkerIds: [],
+  artifacts: [], deployments: [], artifactBusy: false, deploymentBusy: false,
+  workspaceTab: 'plugins', artifactSearch: '', artifactFilter: '', workspaceDrawerTrigger: null,
+  deploymentStep: 0, deploymentEditorOpen: false,
+  deploymentClient: '', deploymentRevision: null, deploymentSelected: {}, deploymentDraftLoaded: false,
+  deploymentWizard: null, deploymentWizardDrafts: {}, deploymentWizardSource: '', deploymentWizardDirty: false, deploymentPreview: '', deploymentBinding: null,
+  serverPluginPreview: null, serverPluginBusy: false,
   logsRequest: 0, logsBusy: false, logsLoaded: false,
-  configKind: 'scheduler', configs: {}, configDrafts: {}, configRequest: 0, configBusy: false,
+  configKind: 'scheduler', configs: {}, configDrafts: {}, configRequest: 0, configBusy: false, configFormInvalid: false, configFormErrors: {},
 };
 const $ = (id) => document.getElementById(id);
 
@@ -47,14 +68,19 @@ const pages = {
   results: ['结果分析', '从已入库结果生成可替换的 Python 交互报告。'],
   clients: ['客户端', '查看实时连接、心跳、资源和正在处理的任务。'],
   history: ['历史运行', '查看长期保存的运行记录。'],
-  plugins: ['插件与配置', '查看执行插件、分析适配器并维护部署配置。'],
+  plugins: ['插件与部署', '管理插件和制品，按步骤配置客户端部署。'],
   logs: ['运行日志', '查询服务器日志，按级别和内容筛选。']
 };
 
 async function jsonFetch(url, options) {
   const response = await fetch(url, options);
   const data = await response.json();
-  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+  if (!response.ok) {
+    const error = new Error(data.error || `HTTP ${response.status}`);
+    error.status = response.status;
+    error.data = data;
+    throw error;
+  }
   return data;
 }
 
@@ -69,9 +95,9 @@ function escapeHtml(value) {
 }
 
 function number(value) { return Number(value || 0).toLocaleString('zh-CN'); }
-function statusLabel(value) { return ({ finished: '已完成', running: '运行中', planning: '规划中', planned: '已计划', stopped: '已停止', failed: '失败', interrupted: '已中断', cancelled: '已取消' })[value] || value || '--'; }
+function statusLabel(value) { return ({ queued: '排队中', finished: '已完成', running: '运行中', planning: '规划中', planned: '已计划', stopped: '已停止', failed: '失败', interrupted: '已中断', cancelled: '已取消' })[value] || value || '--'; }
 function timeLabel(value) { return value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '--'; }
-function executionChipClass(value) { return value === 'running' ? 'blue' : (value === 'stopped' || value === 'planning' || value === 'planned' ? 'amber' : (value === 'failed' || value === 'interrupted' ? 'red' : '')); }
+function executionChipClass(value) { return value === 'running' ? 'blue' : (value === 'queued' || value === 'stopped' || value === 'planning' || value === 'planned' ? 'amber' : (value === 'failed' || value === 'interrupted' ? 'red' : '')); }
 
 function emptyRunState() {
   if (state.readiness && !state.readiness.ready) {
@@ -102,7 +128,7 @@ function setAnalysisState(status, label) {
 function renderServiceState(readiness, providers) {
   const ready = readiness.ok;
   const configured = Boolean(readiness.data.database_configured);
-  const availableProviders = providers.filter((provider) => provider.available).map((provider) => provider.name);
+  const dshAvailable = Boolean(providers.find((provider) => provider.name === 'dsh')?.available);
   state.readiness = { ready, configured };
 
   $('api-status').textContent = 'API 已连接';
@@ -130,10 +156,10 @@ function renderServiceState(readiness, providers) {
     setDotState('footer-dot', 'offline');
   }
 
-  $('provider-status').textContent = availableProviders.length ? `AI 可用：${availableProviders.join(' / ')}` : 'AI 服务不可用';
+  $('provider-status').textContent = dshAvailable ? 'AI 可用：DSH' : 'AI 服务不可用';
   const noticeParts = [];
   if (!ready) noticeParts.push(configured ? '只读数据库当前无法连接。' : '请配置只读数据库连接以读取运行记录。');
-  if (!availableProviders.length) noticeParts.push('未找到可用的 Codex 或 DSH 命令，请安装并确保命令位于 PATH 中。');
+  if (!dshAvailable) noticeParts.push('未找到可用的 DSH 命令，请安装并确保命令位于 PATH 中。');
   $('system-notice').hidden = noticeParts.length === 0;
   $('notice-title').textContent = !ready
     ? (configured ? '数据库连接异常' : '数据库未配置')
@@ -142,37 +168,17 @@ function renderServiceState(readiness, providers) {
 }
 
 function updateAiControls() {
-  const provider = state.providers.find((item) => item.name === $('provider').value);
+  const provider = state.providers.find((item) => item.name === 'dsh');
   const hasProvider = Boolean(provider?.available);
-  const hasRun = Boolean(state.selected?.run_id);
-  // A server provider can answer general questions without a selected run.
-  // Selecting a run only enriches the context sent with the request.
-  const enabled = hasProvider && !state.aiBusy;
-  // Keep the editor usable while a reply is running so the next question is
-  // not lost; only submission must wait for the active provider call.
-  $('question').disabled = !hasProvider;
-  $('send-button').disabled = !enabled;
-  $('send-button').textContent = state.aiBusy ? '…' : '➤';
-  $('send-button').title = state.aiBusy ? 'AI 正在回复' : '发送';
-  $('send-button').setAttribute('aria-label', $('send-button').title);
-  $('new-conversation').disabled = state.aiBusy || !hasProvider;
-  document.querySelectorAll('#quick-actions button').forEach((button) => { button.disabled = !enabled; });
-  $('ai-design-view').disabled = !enabled || !state.pluginViews[$('result-type').value];
-  $('ai-design-report').disabled = !enabled || !$('result-type').value;
-  $('design-view-from-chat').disabled = !enabled || !$('result-type').value;
-  $('question').placeholder = hasProvider ? (hasRun ? '询问当前结果...' : '询问 Codex 或 DSH...') : '当前 AI 服务不可用';
-  $('compose-hint').textContent = hasProvider
-    ? (state.aiBusy ? `${provider.name} 正在回复，可继续编辑下一条` : (hasRun ? '当前运行的结构化结果' : '未选择运行，使用通用上下文'))
-    : 'AI 服务不可用';
+  $('ai-design-view').disabled = !state.pluginViews[$('result-type').value];
+  $('ai-design-report').disabled = !$('result-type').value;
   const providerStatus = $('provider-availability');
   providerStatus.className = hasProvider ? 'available' : 'unavailable';
-  providerStatus.textContent = provider ? `${provider.name} ${hasProvider ? '可用' : '不可用'}` : '没有可用的 AI 服务';
-  const conversationId = state.conversationIds[$('provider').value];
-  $('conversation-status').textContent = conversationId ? `会话 ${conversationId.slice(0, 8)}` : '新会话';
-
-  const dshAvailable = state.providers.some((item) => item.name === 'dsh' && item.available);
-  $('dsh-native-open').disabled = !dshAvailable || state.dshWebLoading;
-  if (!dshAvailable && !state.dshWebUrl) $('dsh-native-status').textContent = '服务器 DSH 命令不可用。';
+  providerStatus.textContent = hasProvider ? 'DSH 可用' : 'DSH 未就绪';
+  $('dsh-native-open').disabled = state.dshWebLoading;
+  if (!hasProvider && !state.dshWebAttempted) $('dsh-native-status').textContent = '服务器 DSH 命令未就绪，配置后可重新连接。';
+  $('dsh-context-copy').disabled = !$('dsh-context-prompt').value;
+  ensureDshWeb();
   updateReportControls();
 }
 
@@ -190,6 +196,7 @@ function navigate(page) {
   if (page === 'clients' || page === 'overview' || page === 'plugins') loadScheduler();
   if (page === 'logs') loadLogs();
   if (page === 'plugins') loadConfig($('config-kind').value || state.configKind);
+  if (page === 'plugins') loadArtifacts();
 }
 
 function executionPluginNames() {
@@ -215,14 +222,26 @@ function renderScheduler() {
   $('scheduler-status').textContent = online ? (delayed ? `调度器响应中 · 状态更新延迟 ${(state.scheduler.snapshot_age_ms / 1000).toFixed(1)} 秒` : `调度器在线 · ${number(state.scheduler.in_flight)} 个在途任务`) : '调度器离线';
   $('scheduler-status').className = `chip ${online && !delayed ? 'green' : 'amber'}`;
   const active = state.scheduler?.active_runs || [];
+  const queued = state.scheduler?.queued_runs || [];
   const selectedActive = active.some((run) => run.plugin_type === $('run-plugin').value);
   $('run-plugin').disabled = !online || state.commandBusy || !names.length;
   $('run-dataset').disabled = !online || state.commandBusy;
   $('run-params').disabled = !online || state.commandBusy;
-  $('run-start').disabled = !online || state.commandBusy || !names.length || selectedActive;
-  $('run-start').title = selectedActive ? '该插件已有活动运行，请先停止并等待完成' : '';
+  $('run-all-clients').disabled = !online || state.commandBusy;
+  $('run-clients-field').hidden = $('run-all-clients').checked;
+  const candidates = (state.scheduler?.clients || []).filter((item) => item.registered && item.plugin_type === $('run-plugin').value);
+  $('run-clients').innerHTML = candidates.map((item) => `<option value="${escapeHtml(item.worker_id)}" ${state.selectedWorkerIds.includes(item.worker_id) ? 'selected' : ''} ${item.status === 'busy' && !state.selectedWorkerIds.includes(item.worker_id) ? 'disabled' : ''}>${escapeHtml(item.worker_id)} · ${item.status === 'busy' ? '处理中' : '空闲'}</option>`).join('');
+  $('run-clients').disabled = !online || state.commandBusy || $('run-all-clients').checked;
+  $('run-force').disabled = !online || state.commandBusy;
+  $('run-force-reason').disabled = !online || state.commandBusy || !$('run-force').checked;
+  $('run-force-reason-field').hidden = !$('run-force').checked;
+  $('run-start').disabled = !online || state.commandBusy || !names.length;
+  $('run-start').textContent = selectedActive ? '加入队列' : '启动运行';
+  $('run-start').title = selectedActive ? '该插件正在运行，新任务会进入持久队列' : '';
   $('run-wakeup').disabled = !online || state.commandBusy || !names.length;
-  $('active-runs').innerHTML = online && active.length ? active.map((run) => `<div class="active-run"><div><strong>${escapeHtml(run.plugin_type)}</strong><span>${escapeHtml(run.run_id)}</span></div><button type="button" class="button" data-stop-run="${escapeHtml(run.run_id)}" data-stop-plugin="${escapeHtml(run.plugin_type)}" ${state.commandBusy || run.stopping ? 'disabled' : ''}>${run.stopping ? '正在停止…' : '停止运行'}</button></div>`).join('') : `<p class="management-status">${online ? '当前没有活动运行。' : '执行控制暂不可用，已入库结果仍可分析。'}</p>`;
+  const activeRows = active.map((run) => `<div class="active-run"><div><strong>${escapeHtml(run.plugin_type)} · 执行中</strong><span>${escapeHtml(run.run_id)}</span></div><button type="button" class="button" data-stop-run="${escapeHtml(run.run_id)}" data-stop-plugin="${escapeHtml(run.plugin_type)}" ${state.commandBusy || run.stopping ? 'disabled' : ''}>${run.stopping ? '正在停止…' : '停止运行'}</button></div>`);
+  const queuedRows = queued.map((run, index) => `<div class="active-run"><div><strong>${escapeHtml(run.plugin_type)} · ${run.blocked ? '等待恢复原配置' : `队列 ${index + 1}`}</strong><span>${escapeHtml(run.run_id)} · 数据集 ${escapeHtml(run.dataset_version || '--')}</span>${run.blocked ? `<span class="management-status warning">${escapeHtml(run.blocked_reason || '配置或数据已变化，请恢复原配置，或取消后创建新运行。')}</span>` : ''}${run.worker_ids?.length ? `<span>指定客户端：${escapeHtml(run.worker_ids.join(', '))}</span>` : ''}</div><button type="button" class="button" data-stop-run="${escapeHtml(run.run_id)}" data-stop-plugin="${escapeHtml(run.plugin_type)}" ${state.commandBusy ? 'disabled' : ''}>取消排队</button></div>`);
+  $('active-runs').innerHTML = online && (activeRows.length || queuedRows.length) ? [...activeRows, ...queuedRows].join('') : `<p class="management-status">${online ? '当前没有活动运行。' : '执行控制暂不可用，已入库结果仍可分析。'}</p>`;
   renderClients();
   renderPlugins(state.plugins);
 }
@@ -260,16 +279,23 @@ async function loadScheduler() {
 
 async function schedulerCommand(action, plugin, runId = '') {
   if (state.commandBusy || !state.scheduler?.online || !plugin) return;
-  if (action === 'run' && (state.scheduler.active_runs || []).some((run) => run.plugin_type === plugin)) return;
   const payload = { action, plugin_type: plugin };
   if (action === 'run') {
     payload.dataset_version = $('run-dataset').value.trim();
     payload.params = $('run-params').value;
+    if (!$('run-all-clients').checked) {
+      payload.worker_ids = state.selectedWorkerIds.filter((id) => (state.scheduler.clients || []).some((item) => item.worker_id === id && item.plugin_type === plugin && item.registered));
+      if (!payload.worker_ids.length) { $('scheduler-command-status').textContent = '请选择执行客户端，或勾选全部匹配客户端。'; return; }
+    }
+    payload.force_rerun = $('run-force').checked;
+    if (payload.force_rerun) payload.force_rerun_reason = $('run-force-reason').value.trim();
     if (!payload.dataset_version) { $('scheduler-command-status').textContent = '请输入数据版本。'; return; }
+    if (payload.force_rerun && !payload.force_rerun_reason) { $('scheduler-command-status').textContent = '强制重跑需要填写原因。'; return; }
   }
   if (action === 'stop') {
     const active = (state.scheduler.active_runs || []).find((run) => run.run_id === runId && run.plugin_type === plugin);
-    if (!active || active.stopping) return;
+    const queued = (state.scheduler.queued_runs || []).find((run) => run.run_id === runId && run.plugin_type === plugin);
+    if ((!active && !queued) || active?.stopping) return;
     payload.run_id = runId;
   }
   state.commandBusy = true;
@@ -277,10 +303,14 @@ async function schedulerCommand(action, plugin, runId = '') {
   $('scheduler-command-status').textContent = '正在提交命令…';
   try {
     const result = await jsonFetch('/api/scheduler/commands', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-    $('scheduler-command-status').textContent = action === 'run' ? `已启动运行 ${result.run_id || ''}` : action === 'stop' ? `已请求停止 ${runId}` : `已唤醒 ${plugin} 客户端`;
+    $('scheduler-command-status').textContent = action === 'run' ? `${result.status === 'queued' ? '已加入队列' : '已启动运行'} ${result.run_id || ''}` : action === 'stop' ? `${result.status === 'cancelled' ? '已取消排队' : '已请求停止'} ${runId}` : `已唤醒 ${plugin} 客户端`;
     await loadScheduler();
   } catch (error) {
-    $('scheduler-command-status').textContent = `命令失败：${error.message}`;
+    const duplicate = error.data;
+    const duplicateState = { finished: '相同任务已全部完成', running: '相同任务正在执行', queued: '相同任务已在排队', planning: '相同任务正在规划', stopped: '相同任务已停止，仍有待恢复的进度' };
+    $('scheduler-command-status').textContent = duplicate?.duplicate === true
+      ? `${duplicateState[duplicate.status] || `已存在相同任务（${statusLabel(duplicate.status)}）`}。已有运行：${duplicate.run_id || '--'}。${duplicate.force_rerun_available === true ? '确需重新执行时，请勾选“强制重跑”并填写原因。' : ''}`
+      : `命令失败：${error.message}`;
   } finally { state.commandBusy = false; renderScheduler(); }
 }
 
@@ -302,6 +332,73 @@ async function loadLogs() {
   } finally { if (requestId === state.logsRequest) { state.logsBusy = false; $('logs-refresh').disabled = false; } }
 }
 
+function commonConfigFields(config = state.configs[state.configKind]) {
+  const common = /^(host|port|scheduler_management_url|db_conn|logs_dir|server\.(router_endpoint|management_endpoint|client_timeout_ms|task_lease_timeout_ms)|scheduler\.endpoint|client\.(worker_id|task_threads)|plugins\.[^.]+\.(enabled|task_size|stp_manifest|expected_dataset_version|expected_program_version|expected_baseline_program_version|expected_candidate_program_version)|providers\.dsh\.(enabled|command|cwd|timeout_seconds))$/;
+  const labels = { enabled: '启用状态', stp_manifest: 'STP 清单', expected_dataset_version: '预期数据版本', expected_program_version: '预期程序版本', expected_baseline_program_version: '预期老程序版本（baseline）', expected_candidate_program_version: '预期新程序版本（candidate）', command: '启动命令', cwd: '工作目录', timeout_seconds: '超时时间（秒）' };
+  return (config?.fields || []).filter((field) => common.test(field.path) && ['string', 'number', 'boolean'].includes(field.type)).map((field) => {
+    const key = field.path.split('.').pop();
+    return {
+      ...field,
+      label: !field.label || field.label === key ? (labels[key] || field.label || key) : field.label,
+      description: key === 'stp_manifest' ? '服务端调度器使用的 STP 清单路径。请与客户端数据集及服务端预期数据版本保持一致；上传数据制品不会自动替换此清单。' : field.description,
+    };
+  });
+}
+
+function renderConfigForm() {
+  const container = $('config-form');
+  if (!container) return;
+  state.configFormInvalid = false;
+  state.configFormErrors = {};
+  let draft;
+  try { draft = JSON.parse($('config-json').value || '{}'); }
+  catch (_) { container.innerHTML = '<p class="config-help">高级 JSON 尚未完整，请修正后继续使用常用配置。</p>'; return; }
+  const fields = commonConfigFields();
+  container.innerHTML = fields.length ? fields.map((field, index) => {
+    const value = deploymentGet(draft, field.path);
+    const id = `config-common-${index}`;
+    const group = field.path.startsWith('plugins.') ? field.path.split('.')[1] : '';
+    const input = field.type === 'boolean'
+      ? `<select id="${id}" data-config-field="${escapeHtml(field.path)}" data-config-type="boolean"><option value="true" ${value === true ? 'selected' : ''}>启用</option><option value="false" ${value !== true ? 'selected' : ''}>禁用</option></select>`
+      : `<input id="${id}" type="${field.type === 'number' ? 'number' : 'text'}" data-config-field="${escapeHtml(field.path)}" data-config-type="${field.type}" value="${escapeHtml(value ?? '')}" autocomplete="off">`;
+    return `<div class="management-field config-common-field"><label for="${id}">${group ? `${escapeHtml(group)} · ` : ''}${escapeHtml(field.label)}</label>${input}<small>${escapeHtml(field.description)}</small></div>`;
+  }).join('') : '<p class="config-help">此配置暂无常用字段，可展开高级配置查看和编辑全部内容。</p>';
+  for (const [index, field] of fields.entries()) {
+    const input = $(`config-common-${index}`);
+    input.value = String(deploymentGet(draft, field.path) ?? '');
+    input.disabled = state.configBusy || !state.configs[state.configKind]?.available;
+  }
+  if ($('config-form-status')) $('config-form-status').textContent = '';
+}
+
+function editCommonConfig(event) {
+  const input = event.target.closest('[data-config-field]');
+  if (!input || state.configBusy || !state.configs[state.configKind]?.available) return;
+  const field = commonConfigFields().find((item) => item.path === input.dataset.configField);
+  if (!field) return;
+  try {
+    const draft = JSON.parse($('config-json').value || '{}');
+    if (!deploymentObject(draft)) throw new Error('高级配置必须是 JSON 对象');
+    let value = input.value;
+    if (field.type === 'boolean') value = value === 'true';
+    if (field.type === 'number') {
+      if (!value.trim() || !Number.isFinite(Number(value))) throw new Error(`${field.label}需要填写数字`);
+      value = Number(value);
+    }
+    deploymentSet(draft, field.path, value);
+    $('config-json').value = JSON.stringify(draft, null, 2);
+    delete state.configFormErrors[field.path];
+    state.configFormInvalid = Object.keys(state.configFormErrors).length > 0;
+    $('config-form-status').textContent = state.configFormInvalid ? Object.values(state.configFormErrors).join('；') : '修改已加入草稿，保存后按提示重启服务。';
+    rememberConfigDraft();
+  } catch (error) {
+    state.configFormInvalid = true;
+    state.configFormErrors[field.path] = error.message;
+    $('config-form-status').textContent = error.message;
+    updateConfigControls();
+  }
+}
+
 function configDirty(kind = state.configKind) {
   return state.configDrafts[kind] !== undefined && state.configDrafts[kind] !== JSON.stringify(state.configs[kind]?.config, null, 2);
 }
@@ -315,13 +412,14 @@ function rememberConfigDraft() {
 function updateConfigControls() {
   const available = Boolean(state.configs[state.configKind]?.available);
   const dirty = configDirty();
-  $('config-save').disabled = !available || !dirty || state.configBusy;
+  $('config-save').disabled = !available || !dirty || state.configBusy || state.configFormInvalid;
   $('config-json').disabled = !available || state.configBusy;
   $('config-kind').disabled = state.configBusy;
   $('config-reload').disabled = state.configBusy || dirty;
   $('config-discard').hidden = !dirty;
   $('config-discard').disabled = state.configBusy;
   $('config-dirty').hidden = !dirty;
+  commonConfigFields().forEach((_, index) => { const input = $(`config-common-${index}`); if (input) input.disabled = !available || state.configBusy; });
 }
 
 function renderConfig() {
@@ -332,6 +430,7 @@ function renderConfig() {
   $('config-json').value = state.configDrafts[state.configKind] ?? (config?.available ? JSON.stringify(config.config, null, 2) : '');
   $('config-fields').innerHTML = config?.fields?.length ? `<div class="table-wrap"><table><thead><tr><th>配置字段</th><th>类型</th><th>说明</th></tr></thead><tbody>${config.fields.map((field) => `<tr><td><strong>${escapeHtml(field.label)}</strong><br><code>${escapeHtml(field.path)}</code></td><td>${escapeHtml(field.type)}</td><td>${escapeHtml(field.description)}</td></tr>`).join('')}</tbody></table></div>` : '';
   $('config-effective').textContent = config?.effective_values ? JSON.stringify(config.effective_values, null, 2) : '';
+  renderConfigForm();
   updateConfigControls();
 }
 
@@ -357,7 +456,7 @@ async function loadConfig(kind = state.configKind, force = false) {
 }
 
 async function saveConfig() {
-  if (state.configBusy || !state.configs[state.configKind]?.available) return;
+  if (state.configBusy || state.configFormInvalid || !state.configs[state.configKind]?.available) return;
   rememberConfigDraft();
   let config;
   try {
@@ -536,7 +635,7 @@ function renderPluginView(plugin, run, analysisStatus) {
   $('plugin-view-title').textContent = view?.title || `${plugin} 结果`;
   $('plugin-view-description').textContent = view?.description || '当前插件尚未提供展示定义。';
   $('edit-plugin-view').disabled = !view;
-  $('ai-design-view').disabled = !view || state.aiBusy;
+  $('ai-design-view').disabled = !view;
   const stateText = view?.empty_states?.[analysisStatus];
   $('plugin-view-state').hidden = !stateText || analysisStatus === 'ready';
   $('plugin-view-state').textContent = stateText || '';
@@ -630,14 +729,649 @@ async function switchPlugin(plugin, preferredRun = '') {
   }
 }
 
+function setWorkspaceTab(tab, focus = false) {
+  if (!['plugins', 'artifacts', 'deployments', 'settings'].includes(tab)) return;
+  state.workspaceTab = tab;
+  document.querySelectorAll('[data-workspace-tab]').forEach((button) => {
+    const selected = button.dataset.workspaceTab === tab;
+    button.setAttribute('aria-selected', String(selected));
+    button.tabIndex = selected ? 0 : -1;
+    button.classList.toggle('active', selected);
+    if (selected && focus) button.focus?.();
+  });
+  document.querySelectorAll('[data-workspace-panel]').forEach((panel) => { panel.hidden = panel.dataset.workspacePanel !== tab; });
+}
+
+function openWorkspaceDrawer(title, content, trigger = document.activeElement) {
+  const drawer = $('workspace-drawer');
+  if (!drawer) return;
+  state.workspaceDrawerTrigger = trigger;
+  $('workspace-drawer-title').textContent = title;
+  $('workspace-drawer-content').innerHTML = content;
+  drawer.hidden = false;
+  if (!drawer.open) drawer.showModal?.();
+  $('workspace-drawer-close').focus?.();
+}
+
+function closeWorkspaceDrawer() {
+  $('workspace-drawer').close?.();
+  $('workspace-drawer').hidden = true;
+  state.workspaceDrawerTrigger?.focus?.();
+}
+
+function openPluginDetails(name, trigger) {
+  const plugin = state.plugins.find((item) => item.name === name);
+  const enabled = executionPluginNames().includes(name);
+  openWorkspaceDrawer(`${name} · 插件详情`, `<p class="drawer-intro">${escapeHtml(plugin?.view?.description || '由调度器加载的任务执行插件。')}</p><dl class="detail-list"><div><dt>任务执行</dt><dd>${state.scheduler?.online ? enabled ? '调度器已启用' : '调度器未启用' : '调度器离线，待确认'}</dd></div><div><dt>数据库分析</dt><dd>${plugin ? plugin.configured ? '分析适配器已配置' : '分析适配器待配置' : '未提供分析适配器'}</dd></div><div><dt>结果展示</dt><dd>${plugin?.view_editable ? '支持编辑展示定义和 Python 报告' : '由插件提供展示能力'}</dd></div></dl><p class="config-help">执行插件负责结果入库；结果分析读取数据库，可独立修改和运行。</p><div class="drawer-actions"><button type="button" class="button primary" data-workspace-go="deployments">配置客户端部署</button><button type="button" class="button" data-workspace-go="settings">查看服务配置</button></div>`, trigger);
+}
+
 function renderPlugins(plugins) {
   const execution = executionPluginNames();
   const names = [...new Set([...plugins.map((plugin) => plugin.name), ...execution])];
   $('plugin-grid').innerHTML = names.map((name) => {
     const plugin = plugins.find((item) => item.name === name);
     const executionState = state.scheduler?.online ? (execution.includes(name) ? '已启用' : '未启用') : '调度器离线，待确认';
-    return `<article class="plugin-card"><div class="panel-head"><h2>${escapeHtml(name)}</h2></div><p>${escapeHtml(plugin?.view?.description || '此插件由调度器加载执行')}</p><div class="plugin-capability"><span>执行插件</span><b>${executionState}</b></div><div class="plugin-capability"><span>分析适配器</span><b>${plugin ? (plugin.configured ? '已配置' : '待配置') : '未提供'}</b></div><div class="plugin-capability"><span>结果展示</span><b>${plugin?.view_editable ? '可编辑' : '未提供可编辑视图'}</b></div></article>`;
-  }).join('');
+    return `<article class="workspace-plugin-card"><div class="workspace-plugin-title"><span class="workspace-plugin-icon">${name === 'coverage' ? 'C' : name === 'stpcompare' ? 'S' : escapeHtml(name.slice(0, 1).toUpperCase())}</span><div><h3>${escapeHtml(name)}</h3><span>${name === 'coverage' ? '覆盖率采集' : name === 'stpcompare' ? '新老程序结果采集' : '任务执行插件'}</span></div><span class="chip ${state.scheduler?.online && execution.includes(name) ? 'green' : 'amber'}">${executionState}</span></div><p class="workspace-plugin-description">${escapeHtml(plugin?.view?.description || '此插件由调度器加载执行')}</p><div class="workspace-plugin-capabilities"><span>分析适配器 <b>${plugin ? (plugin.configured ? '已配置' : '待配置') : '未提供'}</b></span><span>结果展示 <b>${plugin?.view_editable ? '可编辑' : '未提供'}</b></span></div><div class="workspace-plugin-footer"><span>执行与分析独立维护</span><button type="button" class="button" data-plugin-detail="${escapeHtml(name)}">查看详情</button></div></article>`;
+  }).join('') || '<div class="workspace-empty"><strong>还没有加载插件</strong><p>安装服务端插件包并重启服务后，可在这里查看插件状态。</p></div>';
+}
+
+const deploymentGroups = {
+  shared: [
+    { id: 'plugin', kind: 'plugin', title: '插件程序', fields: [['dll', '插件 DLL 路径', 'path']] },
+    { id: 'dataset', kind: 'dataset', title: 'STP 数据', fields: [['stp_root', '数据目录（包内根目录可留空）', 'root']] },
+  ],
+  coverage: [
+    { id: 'coverage', kind: 'program', title: '覆盖率业务程序', fields: [['program_dir', '程序目录（包内根目录可留空）', 'root'], ['target_exe', '被执行程序路径', 'path'], ['engine_dlls', '采集 DLL（每行一个；绑定程序时留空表示不限制模块）', 'paths']] },
+    { id: 'collector', kind: 'program', title: '覆盖率采集工具', fields: [['opencppcoverage', 'OpenCppCoverage 程序路径', 'path']] },
+  ],
+  stpcompare: ['baseline', 'candidate'].map((role) => ({ id: role, kind: 'program', title: role === 'baseline' ? '老程序 · baseline' : '新程序 · candidate', fields: [[`programs.${role}.executable`, '可执行程序路径', 'path'], [`programs.${role}.version_file`, '版本文件路径（留空使用程序旁 version.txt）', 'optionalPath'], [`programs.${role}.version`, '注册版本（留空读取版本文件）', 'version'], [`programs.${role}.arguments`, '参数模板（每行一个参数，需包含 {stp} 和 {outdir}）', 'arguments']] })),
+};
+function wizardGroups(plugin) { return [...deploymentGroups.shared, ...(deploymentGroups[plugin] || [])]; }
+function deploymentObject(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
+function deploymentGet(value, path) { return path.split('.').reduce((node, key) => node?.[key], value); }
+function deploymentSet(value, path, next) {
+  const parts = path.split('.'); const last = parts.pop();
+  for (const key of parts) {
+    if (value[key] !== undefined && !deploymentObject(value[key])) throw new Error(`${path} 的父字段必须为对象，请使用高级 JSON 修正`);
+    if (!value[key]) value[key] = {};
+    value = value[key];
+  }
+  value[last] = next;
+}
+function deploymentUnset(value, path) {
+  const parts = path.split('.'); const last = parts.pop();
+  for (const key of parts) { value = value?.[key]; if (!deploymentObject(value)) return; }
+  delete value[last];
+}
+function deploymentReference(value) { return typeof value === 'string' ? value.match(/^\{artifact:([^}]+)\}(?:[\\/](.*))?$/) : null; }
+function deploymentFieldId(group, path) { return `deployment-field-${group}-${path.replaceAll('.', '-')}`; }
+function deploymentComponents() { return Object.entries(state.deploymentSelected).map(([slot, artifact_id]) => ({ slot, artifact_id })); }
+
+// These transformations do not mutate the saved patch. Unknown plugin and client
+// options survive editing; only fields represented by the chosen form change.
+function readDeploymentWizard(patch, components, requestedPlugin) {
+  const enabled = Object.entries(patch.plugins || {}).find(([, item]) => item?.enabled === true)?.[0];
+  const plugin = requestedPlugin || (['coverage', 'stpcompare'].includes(enabled) ? enabled : 'coverage');
+  const config = patch.plugins?.[plugin] || {};
+  const groups = {};
+  for (const group of wizardGroups(plugin)) {
+    const reference = group.fields.map(([path]) => deploymentReference(deploymentGet(config, path))).find(Boolean);
+    const slot = reference?.[1] || `${group.kind}.${group.id === 'plugin' ? plugin : group.id === 'dataset' ? 'stp' : group.id === 'coverage' ? 'coverage-tool' : group.id === 'collector' ? 'opencppcoverage' : `stp-${group.id}`}`;
+    const values = {};
+    for (const [path, , type] of group.fields) {
+      let value = deploymentGet(config, path);
+      const strip = (item) => { const ref = deploymentReference(item); return ref && ref[1] === slot ? (ref[2] || '') : item; };
+      if (type === 'arguments') value = (value || ['--input', '{stp}', '--output-dir', '{outdir}']).join('\n');
+      else if (type === 'paths') value = (value || []).map(strip).join('\n');
+      else value = strip(value);
+      values[path] = value ?? '';
+    }
+    groups[group.id] = { slot, artifactId: reference ? (components.find((item) => item.slot === slot)?.artifact_id || '') : '', values };
+  }
+  const windows = {};
+  for (const kind of ['execution', 'update']) {
+    const value = patch.client?.[`${kind}_windows`];
+    windows[kind] = { mode: value === undefined ? 'inherit' : value.length ? 'custom' : 'all', items: JSON.parse(JSON.stringify(value || [])) };
+  }
+  return { plugin, groups, windows, threads: patch.client?.task_threads ?? '', dryRun: config.dry_run ?? null, storeCov: config.store_cov ?? false };
+}
+
+function buildDeploymentWizard(patch, components, model, artifacts, knownPlugins = []) {
+  if (!deploymentObject(patch)) throw new Error('配置覆盖必须是 JSON 对象');
+  const next = JSON.parse(JSON.stringify(patch));
+  const plan = new Map(components.map((item) => [item.slot, item.artifact_id]));
+  if (!['coverage', 'stpcompare'].includes(model.plugin)) throw new Error('请选择 coverage 或 stpcompare');
+  for (const name of new Set(['demo', 'coverage', 'stpcompare', ...knownPlugins, ...Object.keys(next.plugins || {})])) deploymentSet(next, `plugins.${name}.enabled`, name === model.plugin);
+  const hasProgramArtifact = wizardGroups(model.plugin).some((group) => group.kind === 'program' && model.groups[group.id].artifactId);
+  if (hasProgramArtifact && typeof model.dryRun !== 'boolean') throw new Error('分发程序制品时，请明确选择真实执行或模拟执行，以便核对程序身份');
+  if (typeof model.dryRun === 'boolean') deploymentSet(next, `plugins.${model.plugin}.dry_run`, model.dryRun);
+  const config = next.plugins[model.plugin];
+  const previousConfig = patch.plugins?.[model.plugin] || {};
+  if (model.dryRun === null) delete config.dry_run;
+  if (model.plugin === 'coverage') config.store_cov = Boolean(model.storeCov);
+  const formSlots = new Map();
+  const detachedSlots = new Set();
+  for (const group of wizardGroups(model.plugin)) {
+    const input = model.groups[group.id];
+    const artifact = input.artifactId ? artifacts.find((item) => item.artifact_id === input.artifactId) : null;
+    if (input.artifactId && (!artifact || artifact.kind !== group.kind)) throw new Error(`${group.title}：请选择有效的${group.kind}制品`);
+    if (artifact) {
+      if (formSlots.has(input.slot) && formSlots.get(input.slot) !== artifact.artifact_id) throw new Error(`槽位 ${input.slot} 被两个不同制品占用，请在高级 JSON 中分配独立槽位`);
+      formSlots.set(input.slot, artifact.artifact_id); plan.set(input.slot, artifact.artifact_id);
+    } else if (group.fields.some(([path]) => deploymentReference(deploymentGet(previousConfig, path))?.[1] === input.slot)) {
+      detachedSlots.add(input.slot);
+    }
+    const resolve = (value, root = false) => {
+      const path = value.trim();
+      if (!artifact || deploymentReference(path)) return path;
+      const relative = path.replaceAll('\\', '/').replace(/^\.\//, '');
+      if ((!relative && !root) || relative.startsWith('/') || relative.includes(':') || relative.split('/').includes('..')) throw new Error(`${group.title}：请填写有效的包内相对路径`);
+      return `{artifact:${input.slot}}${relative ? '/' + relative : ''}`;
+    };
+    for (const [path, , type] of group.fields) {
+      const value = String(input.values[path] ?? '');
+      if (type === 'arguments') {
+        const args = value.split(/\r?\n/).filter((item) => item.trim());
+        if (!args.some((item) => item.includes('{stp}')) || !args.some((item) => item.includes('{outdir}'))) throw new Error(`${group.title}参数必须包含 {stp} 和 {outdir}`);
+        deploymentSet(config, path, args);
+      } else if (type === 'version') deploymentSet(config, path, value.trim());
+      else if (type === 'paths') { if (artifact || value.trim() || detachedSlots.has(input.slot)) deploymentSet(config, path, value.split(/\r?\n/).filter((item) => item.trim()).map((item) => resolve(item))); }
+      else if (type === 'optionalPath') { if (value.trim()) deploymentSet(config, path, resolve(value)); else deploymentSet(config, path, ''); }
+      else if (artifact || value.trim()) deploymentSet(config, path, resolve(value, type === 'root'));
+      else if (detachedSlots.has(input.slot) && deploymentReference(deploymentGet(previousConfig, path))) deploymentUnset(config, path);
+    }
+  }
+  // Leaving a managed executable must also leave its generated identity. Local
+  // programs return to version.txt unless the user explicitly supplies a version.
+  const versions = model.plugin === 'coverage'
+    ? [['target_exe', 'program_version']]
+    : ['baseline', 'candidate'].map((role) => [`programs.${role}.executable`, `programs.${role}.version`]);
+  for (const [executable, version] of versions) {
+    const previous = deploymentGet(previousConfig, version);
+    if (deploymentReference(deploymentGet(previousConfig, executable)) && !deploymentReference(deploymentGet(config, executable))
+        && typeof previous === 'string' && previous.startsWith('sha256:') && deploymentGet(config, version) === previous) deploymentSet(config, version, '');
+  }
+  const referencedSlots = new Set();
+  const collectSlots = (value) => {
+    if (value && typeof value === 'object') Object.values(value).forEach(collectSlots);
+    else { const reference = deploymentReference(value); if (reference) referencedSlots.add(reference[1]); }
+  };
+  collectSlots(next);
+  for (const slot of detachedSlots) if (!formSlots.has(slot) && !referencedSlots.has(slot)) plan.delete(slot);
+  if (model.plugin === 'coverage' && model.groups.coverage.artifactId && !config.opencppcoverage) throw new Error('分发覆盖率程序时，请填写覆盖率采集工具路径或选择其制品');
+  if (String(model.threads).trim()) {
+    const count = Number(model.threads);
+    if (!Number.isInteger(count) || count < 1) throw new Error('任务并发数必须为正整数');
+    deploymentSet(next, 'client.task_threads', count);
+  } else if (next.client) delete next.client.task_threads;
+  for (const kind of ['execution', 'update']) {
+    const window = model.windows[kind];
+    if (window.mode === 'inherit') { if (next.client) delete next.client[`${kind}_windows`]; continue; }
+    if (window.mode === 'custom' && !window.items.length) throw new Error('指定时间窗至少需要一个时段，全天运行请选择“全天”');
+    const items = window.mode === 'all' ? [] : window.items.map((item) => {
+      if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(item.start) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(item.end)) throw new Error('时间窗需要有效的开始和结束时间');
+      const days = item.days || [];
+      if (!Array.isArray(days) || days.some((day) => !Number.isInteger(day) || day < 1 || day > 7)) throw new Error('星期应为 1 至 7 的数字，逗号分隔');
+      return item.days === undefined ? { ...item } : { ...item, days: [...new Set(days)] };
+    });
+    deploymentSet(next, `client.${kind}_windows`, items);
+  }
+  return { config_patch: next, components: [...plan].map(([slot, artifact_id]) => ({ slot, artifact_id })) };
+}
+
+function setDeploymentBusy(busy) {
+  state.deploymentBusy = busy;
+  $('deployment-form')?.querySelectorAll?.('input, select, textarea, button').forEach((input) => {
+    if (busy) { input.dataset.busyDisabled = String(input.disabled); input.disabled = true; }
+    else if (input.dataset.busyDisabled !== undefined) { input.disabled = input.dataset.busyDisabled === 'true'; delete input.dataset.busyDisabled; }
+  });
+  for (const id of ['deployment-client', 'deployment-load', 'deployment-new', 'deployment-close', 'deployment-next', 'deployment-back', 'deployment-preview', 'deployment-editor-mode', 'deployment-save', 'deployment-rollback-button']) {
+    if ($(id)) $(id).disabled = busy;
+  }
+  if (!busy) {
+    if ($('deployment-bind-scheduler')) $('deployment-bind-scheduler').disabled = !state.deploymentBinding?.program_bindings?.length;
+    updateDeploymentMode();
+  }
+}
+
+function showDeploymentStep(step, focus = false) {
+  state.deploymentStep = Math.max(0, Math.min(4, Number(step) || 0));
+  const wizard = $('deployment-editor-mode').value === 'wizard';
+  document.querySelectorAll('[data-deployment-stage]').forEach((section) => { section.hidden = Number(section.dataset.deploymentStage) !== state.deploymentStep; });
+  document.querySelectorAll('[data-deployment-step]').forEach((button) => {
+    const index = Number(button.dataset.deploymentStep);
+    button.setAttribute('aria-current', index === state.deploymentStep ? 'step' : 'false');
+    button.classList.toggle('active', index === state.deploymentStep);
+    button.classList.toggle('complete', index < state.deploymentStep);
+    button.disabled = state.deploymentBusy || index > state.deploymentStep || (!wizard && index > 0 && index < 4);
+  });
+  if ($('deployment-back')) $('deployment-back').hidden = state.deploymentStep === 0;
+  if ($('deployment-next')) {
+    $('deployment-next').hidden = state.deploymentStep === 4;
+    $('deployment-next').textContent = state.deploymentStep === 3 || (!wizard && state.deploymentStep === 0) ? '核对部署' : '下一步';
+  }
+  $('deployment-save').hidden = state.deploymentEditorOpen && state.deploymentStep !== 4;
+  $('deployment-preview').hidden = !wizard || (state.deploymentEditorOpen && state.deploymentStep !== 4);
+  if (state.deploymentStep === 4) renderDeploymentSummary();
+  if (focus) {
+    const firstResource = state.deploymentWizard ? wizardGroups(state.deploymentWizard.plugin).find((group) => group.id !== 'plugin') : null;
+    const target = [ 'deployment-client', 'deployment-plugin', firstResource ? `deployment-artifact-${firstResource.id}` : 'deployment-dry-run', 'deployment-threads', 'deployment-summary' ][state.deploymentStep];
+    $(target)?.focus?.({ preventScroll: true });
+    $('deployment-editor')?.scrollIntoView?.({ block: 'start' });
+  }
+}
+
+function renderDeploymentSummary() {
+  if (!$('deployment-summary')) return;
+  let patch;
+  try { patch = readDeploymentPatch(); } catch (_) { $('deployment-summary').textContent = '配置 JSON 尚未完整，请修正后核对。'; return; }
+  const enabled = Object.entries(patch.plugins || {}).filter(([, value]) => value?.enabled).map(([name]) => name).join(', ') || '继承客户端配置';
+  const windows = (kind) => {
+    const items = patch.client?.[`${kind}_windows`];
+    if (items === undefined) return '继承客户端基础配置';
+    if (!items.length) return '全天允许';
+    return items.map((item) => `${item.days?.length ? `星期 ${item.days.join('、')}` : '每天'} ${item.start}–${item.end}`).join('；');
+  };
+  const components = deploymentComponents();
+  $('deployment-summary').innerHTML = `<div class="deployment-review-head"><strong>${escapeHtml(state.deploymentClient || $('deployment-client').value)}</strong><span class="chip blue">${escapeHtml(enabled)}</span></div><dl class="deployment-review-grid"><div><dt>程序与数据</dt><dd>${components.length} 个制品</dd></div><div><dt>任务并发</dt><dd>${escapeHtml(patch.client?.task_threads ?? '继承基础配置')}</dd></div><div><dt>执行时间</dt><dd>${escapeHtml(windows('execution'))}</dd></div><div><dt>更新时间</dt><dd>${escapeHtml(windows('update'))}</dd></div></dl>${components.length ? `<ul class="deployment-review-artifacts">${components.map((component) => { const item = state.artifacts.find((artifact) => artifact.artifact_id === component.artifact_id); return `<li><span>${escapeHtml(item?.name || component.slot)}</span><b>${escapeHtml(item?.version || '未知版本')}</b></li>`; }).join('')}</ul>` : '<p class="config-help">使用客户端现有程序和数据，不分发新的制品。</p>'}`;
+}
+
+async function openDeploymentEditor(client = '') {
+  if (state.deploymentBusy) return;
+  setWorkspaceTab('deployments');
+  state.deploymentEditorOpen = true;
+  $('deployment-editor').hidden = false;
+  const changeClient = Boolean(client && client !== state.deploymentClient);
+  if (changeClient) await loadDeployment(client);
+  if (!client && !state.deploymentDraftLoaded) {
+    $('deployment-editor-mode').value = 'wizard';
+    if (!$('deployment-patch').value) $('deployment-patch').value = '{}';
+    importDeploymentWizard();
+  }
+  if (changeClient && state.deploymentDraftLoaded && state.deploymentClient === client) {
+    const enabled = Object.entries(readDeploymentPatch().plugins || {}).find(([, item]) => item?.enabled)?.[0];
+    if (!enabled || ['coverage', 'stpcompare'].includes(enabled)) {
+      $('deployment-editor-mode').value = 'wizard';
+      if ($('deployment-advanced')) $('deployment-advanced').open = false;
+    }
+    updateDeploymentMode();
+  }
+  showDeploymentStep(0, true);
+}
+
+function closeDeploymentEditor() {
+  if (state.deploymentBusy) return;
+  state.deploymentEditorOpen = false;
+  $('deployment-editor').hidden = true;
+  $('deployment-new')?.focus?.();
+  renderArtifacts();
+}
+
+async function advanceDeploymentStep() {
+  if (state.deploymentBusy) return false;
+  try {
+    if (state.deploymentStep === 0) {
+      const client = $('deployment-client').value.trim();
+      if (!client) throw new Error('请选择或填写目标客户端标识。');
+      if (!state.deploymentDraftLoaded || state.deploymentClient !== client) {
+        const preferredMode = $('deployment-editor-mode').value;
+        const advancedOpen = Boolean($('deployment-advanced')?.open);
+        const loaded = await loadDeployment(client);
+        if (!loaded) return false;
+        const enabled = Object.entries(readDeploymentPatch().plugins || {}).find(([, item]) => item?.enabled)?.[0];
+        if (preferredMode === 'wizard' && (!enabled || ['coverage', 'stpcompare'].includes(enabled))) {
+          $('deployment-editor-mode').value = 'wizard';
+          if ($('deployment-advanced')) $('deployment-advanced').open = advancedOpen;
+        }
+        else $('deployment-editor-mode').value = 'json';
+        updateDeploymentMode();
+      }
+      if ($('deployment-editor-mode').value !== 'wizard') { readDeploymentPatch(); showDeploymentStep(4, true); return true; }
+    }
+    if (state.deploymentStep === 1 && !['coverage', 'stpcompare'].includes($('deployment-plugin').value)) throw new Error('请选择客户端执行插件。');
+    if (state.deploymentStep === 2) {
+      const model = collectDeploymentWizard();
+      buildDeploymentWizard(readDeploymentPatch(), deploymentComponents(), { ...model, threads: '', windows: { execution: { mode: 'inherit' }, update: { mode: 'inherit' } } }, state.artifacts, executionPluginNames());
+    }
+    if (state.deploymentStep === 3 && !(await previewDeploymentWizard())) {
+      $('deployment-status').textContent = $('deployment-preview-status').textContent;
+      return false;
+    }
+    if (state.deploymentStep < 4) { $('deployment-status').textContent = ''; showDeploymentStep(state.deploymentStep + 1, true); }
+    return true;
+  } catch (error) { $('deployment-status').textContent = error.message; return false; }
+}
+
+function readDeploymentPatch() {
+  const patch = JSON.parse($('deployment-patch').value || '{}');
+  if (!deploymentObject(patch)) throw new Error('配置覆盖必须是 JSON 对象');
+  return patch;
+}
+function wizardArtifactOptions(kind, selected) {
+  return '<option value="">使用客户端现有路径 / 继承配置</option>' + state.artifacts.filter((item) => item.kind === kind).map((item) => `<option value="${escapeHtml(item.artifact_id)}" ${item.artifact_id === selected ? 'selected' : ''}>${escapeHtml(item.name)} @ ${escapeHtml(item.version)}</option>`).join('');
+}
+function renderDeploymentWizard() {
+  const model = state.deploymentWizard;
+  if (!model) return;
+  $('deployment-plugin').value = model.plugin;
+  $('deployment-fields').innerHTML = wizardGroups(model.plugin).map((group) => `<section class="deployment-section" data-deployment-stage="${group.id === 'plugin' ? 1 : 2}"><h3>${group.title}</h3><div class="management-form"><div class="management-field"><label for="deployment-artifact-${group.id}">已上传制品</label><select id="deployment-artifact-${group.id}">${wizardArtifactOptions(group.kind, model.groups[group.id].artifactId)}</select></div>${group.fields.map(([path, label, type]) => `<div class="management-field grow-field"><label for="${deploymentFieldId(group.id, path)}">${escapeHtml(label)}</label>${['arguments', 'paths'].includes(type) ? `<textarea id="${deploymentFieldId(group.id, path)}" spellcheck="false">${escapeHtml(model.groups[group.id].values[path])}</textarea>` : `<input id="${deploymentFieldId(group.id, path)}" value="${escapeHtml(model.groups[group.id].values[path])}" autocomplete="off">`}</div>`).join('')}</div></section>`).join('');
+  // Assign properties as well as markup so the form and tests share one source.
+  for (const group of wizardGroups(model.plugin)) {
+    $(`deployment-artifact-${group.id}`).value = model.groups[group.id].artifactId;
+    for (const [path] of group.fields) $(deploymentFieldId(group.id, path)).value = model.groups[group.id].values[path];
+  }
+  $('deployment-threads').value = model.threads;
+  $('deployment-dry-run').value = model.dryRun === null ? 'inherit' : model.dryRun ? 'simulate' : 'real';
+  $('deployment-store-cov').checked = model.storeCov;
+  $('deployment-store-cov-field').hidden = model.plugin !== 'coverage';
+  for (const kind of ['execution', 'update']) renderDeploymentWindows(kind);
+  $('deployment-preview-status').textContent = model.plugin === 'coverage' ? '预览时核对所选程序制品的内容身份；数据注册版本仍需与数据目录的 version.txt 一致。业务程序参数由插件传入 STP 文件路径。' : '两个程序分别使用独立输出目录，并各生成 info.txt 和 info_new.txt；预览时核对程序内容与注册版本。';
+  showDeploymentStep(state.deploymentStep);
+}
+function renderDeploymentWindows(kind) {
+  const window = state.deploymentWizard.windows[kind];
+  $(`deployment-${kind}-windows`).innerHTML = `<label class="config-help" for="deployment-${kind}-mode">时间安排</label><select id="deployment-${kind}-mode" data-window-mode="${kind}"><option value="inherit">继承客户端基础配置</option><option value="all">全天允许</option><option value="custom">指定时段</option></select>` + window.items.map((item, index) => `<div class="deployment-window-row" ${window.mode === 'custom' ? '' : 'hidden'}><label class="deployment-days">星期（1–7，逗号分隔；空为每天）<input data-window-kind="${kind}" data-window-index="${index}" data-window-field="days" value="${escapeHtml((item.days || []).join(','))}"></label><label>开始<input type="time" data-window-kind="${kind}" data-window-index="${index}" data-window-field="start" value="${escapeHtml(item.start)}"></label><label>结束<input type="time" data-window-kind="${kind}" data-window-index="${index}" data-window-field="end" value="${escapeHtml(item.end)}"></label><button type="button" class="button" data-window-remove="${kind}" data-window-index="${index}">移除此时段</button></div>`).join('');
+  $(`deployment-${kind}-mode`).value = window.mode;
+}
+function collectDeploymentWizard() {
+  if (!state.deploymentWizard) throw new Error('请先读取部署配置并回填表单');
+  const model = JSON.parse(JSON.stringify(state.deploymentWizard));
+  for (const group of wizardGroups(model.plugin)) {
+    model.groups[group.id].artifactId = $(`deployment-artifact-${group.id}`).value;
+    for (const [path] of group.fields) model.groups[group.id].values[path] = $(deploymentFieldId(group.id, path)).value;
+  }
+  model.threads = $('deployment-threads').value;
+  model.dryRun = $('deployment-dry-run').value === 'inherit' ? null : $('deployment-dry-run').value === 'simulate';
+  model.storeCov = Boolean($('deployment-store-cov').checked);
+  return model;
+}
+function importDeploymentWizard(plugin) {
+  state.deploymentWizard = null;
+  state.deploymentWizardDrafts = {};
+  try {
+    state.deploymentWizard = readDeploymentWizard(readDeploymentPatch(), deploymentComponents(), plugin);
+    state.deploymentWizardSource = JSON.stringify({ patch: $('deployment-patch').value, components: deploymentComponents() });
+    state.deploymentWizardDirty = false; state.deploymentPreview = '';
+    renderDeploymentWizard();
+  } catch (error) { $('deployment-editor-mode').value = 'json'; updateDeploymentMode(); $('deployment-preview-status').textContent = `回填失败：${error.message}。可继续使用高级 JSON 编辑。`; }
+}
+function updateDeploymentMode() {
+  const wizard = $('deployment-editor-mode').value === 'wizard';
+  $('deployment-wizard').hidden = !wizard;
+  $('deployment-plugin').disabled = !wizard;
+  $('deployment-preview').hidden = !wizard;
+  $('deployment-import').hidden = !wizard;
+  $('deployment-patch').readOnly = wizard;
+  showDeploymentStep(wizard ? state.deploymentStep : state.deploymentStep > 0 ? 4 : 0);
+  if (!wizard && $('deployment-advanced')) $('deployment-advanced').open = true;
+  renderArtifacts();
+}
+function deploymentPreviewSnapshot(model = collectDeploymentWizard()) {
+  return JSON.stringify({ model, patch: $('deployment-patch').value, components: deploymentComponents() });
+}
+async function previewDeploymentWizard() {
+  if (state.deploymentBusy) return false;
+  try {
+    if (!state.deploymentDraftLoaded || $('deployment-client').value.trim() !== state.deploymentClient) throw new Error('请先读取目标客户端的当前部署');
+    const model = collectDeploymentWizard();
+    const result = buildDeploymentWizard(readDeploymentPatch(), deploymentComponents(), model, state.artifacts, executionPluginNames());
+    const snapshot = deploymentPreviewSnapshot(model); const client = state.deploymentClient;
+    setDeploymentBusy(true);
+    $('deployment-preview-status').textContent = '正在核对程序内容和服务端匹配配置…';
+    const verified = await jsonFetch('/api/deployments/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(result) });
+    if (snapshot !== deploymentPreviewSnapshot() || $('deployment-client').value.trim() !== client) {
+      $('deployment-preview-status').textContent = '预览期间草稿已修改，请重新生成预览。'; return false;
+    }
+    $('deployment-patch').value = JSON.stringify(verified.config_patch, null, 2);
+    state.deploymentSelected = Object.fromEntries(verified.components.map((item) => [item.slot, item.artifact_id]));
+    importDeploymentWizard(model.plugin);
+    state.deploymentPreview = deploymentPreviewSnapshot();
+    state.deploymentBinding = verified;
+    renderDeploymentBindings(verified);
+    renderArtifacts();
+    $('deployment-preview-status').textContent = `预览已生成：${state.deploymentClient} · ${model.plugin} · ${result.components.length} 个制品。请核对部署摘要后发布。`;
+    return true;
+  } catch (error) { $('deployment-preview-status').textContent = `无法生成预览：${error.message}`; return false; }
+  finally { setDeploymentBusy(false); }
+}
+function renderDeploymentBindings(result) {
+  $('deployment-bindings').hidden = false;
+  const bindings = result.program_bindings || [];
+  $('deployment-binding-list').innerHTML = bindings.map((item) => `<details class="binding-item"><summary><strong>${escapeHtml(item.plugin)} · ${escapeHtml(item.role === 'baseline' ? '老程序' : item.role === 'candidate' ? '新程序' : item.role === 'program' ? '业务程序' : item.role)}</strong><span class="chip green">内容已核对</span></summary><p class="config-help">程序路径：${escapeHtml(item.executable)}<br>注册版本：<code>${escapeHtml(item.version)}</code></p></details>`).join('') || '<p class="config-help">当前路径没有可绑定的程序制品，需自行核对服务端预期版本与客户端注册版本。</p>';
+  $('deployment-binding-status').textContent = (result.warnings || []).join('\n');
+  $('deployment-bind-scheduler').disabled = !bindings.length;
+}
+async function bindDeploymentScheduler() {
+  if (state.deploymentBusy) return;
+  if (!state.deploymentBinding || state.deploymentWizardDirty || state.deploymentPreview !== deploymentPreviewSnapshot() || $('deployment-client').value.trim() !== state.deploymentClient) {
+    $('deployment-binding-status').textContent = '草稿已变化，请重新生成预览后保存匹配配置。'; return;
+  }
+  setDeploymentBusy(true); $('deployment-bind-scheduler').disabled = true;
+  try {
+    const result = await jsonFetch('/api/deployments/bind-scheduler', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ components: deploymentComponents(), config_patch: readDeploymentPatch(), scheduler_revision: state.deploymentBinding.scheduler_revision, operator_id: state.operatorId }) });
+    state.deploymentBinding.scheduler_revision = result.scheduler_revision || result.revision;
+    $('deployment-binding-status').textContent = '服务端匹配配置已保存。需重启调度器后生效；客户端部署仍需单独点击发布。';
+  } catch (error) { $('deployment-binding-status').textContent = `保存失败：${error.message}。当前草稿已保留。`; }
+  finally { setDeploymentBusy(false); }
+}
+function deploymentWizardChanged(event) {
+  state.deploymentWizardDirty = true;
+  const target = event.target;
+  if (target.dataset.windowMode) {
+    const window = state.deploymentWizard.windows[target.dataset.windowMode];
+    window.mode = target.value;
+    renderDeploymentWindows(target.dataset.windowMode);
+  }
+  if (target.dataset.windowKind) {
+    const item = state.deploymentWizard.windows[target.dataset.windowKind].items[Number(target.dataset.windowIndex)];
+    item[target.dataset.windowField] = target.dataset.windowField === 'days' ? target.value.split(/[,，\s]+/).filter(Boolean).map(Number) : target.value;
+  }
+  $('deployment-preview-status').textContent = '表单已修改，请重新生成配置预览后发布。';
+}
+
+function renderArtifacts() {
+  const kinds = { plugin: '插件', program: '程序', dataset: '数据集' };
+  const query = state.artifactSearch.trim().toLowerCase();
+  const filtered = state.artifacts.filter((artifact) => (!state.artifactFilter || state.artifactFilter === 'all' || artifact.kind === state.artifactFilter) && (!query || [artifact.name, artifact.version, artifact.filename, artifact.sha256].some((value) => String(value || '').toLowerCase().includes(query))));
+  const advanced = state.deploymentEditorOpen && $('deployment-editor-mode').value === 'json';
+  const rows = filtered.map((artifact) => `<tr><td><div class="artifact-name-cell">${advanced ? `<input type="checkbox" data-artifact-id="${escapeHtml(artifact.artifact_id)}" ${Object.values(state.deploymentSelected).includes(artifact.artifact_id) ? 'checked' : ''} ${state.deploymentBusy ? 'disabled' : ''} aria-label="选择 ${escapeHtml(artifact.name)} ${escapeHtml(artifact.version)}">` : ''}<button type="button" class="workspace-table-link" data-artifact-detail="${escapeHtml(artifact.artifact_id)}">${escapeHtml(artifact.name)}</button></div><small class="workspace-table-sub">${escapeHtml(artifact.filename || '')}</small></td><td><span class="chip">${escapeHtml(kinds[artifact.kind] || artifact.kind)}</span></td><td>${escapeHtml(artifact.version)}</td><td>${formatBytes(artifact.size_bytes)}</td><td>${escapeHtml(artifact.created_at ? timeLabel(artifact.created_at) : '--')}</td><td><button type="button" class="button compact" data-artifact-detail="${escapeHtml(artifact.artifact_id)}">详情</button></td></tr>`);
+  $('artifact-list').innerHTML = rows.length ? rows.join('') : `<tr><td colspan="6" class="empty-row">${state.artifacts.length ? '没有匹配的制品，请调整搜索或类型筛选。' : '还没有制品。上传插件包、业务程序或数据集后即可部署。'}</td></tr>`;
+  if ($('artifact-count')) $('artifact-count').textContent = `${filtered.length} / ${state.artifacts.length} 个制品`;
+  const pluginSelection = $('server-plugin-artifact').value;
+  $('server-plugin-artifact').innerHTML = '<option value="">选择插件包</option>' + state.artifacts.filter((item) => item.kind === 'plugin').map((item) => `<option value="${escapeHtml(item.artifact_id)}">${escapeHtml(item.name)} @ ${escapeHtml(item.version)}</option>`).join('');
+  $('server-plugin-artifact').value = pluginSelection;
+}
+
+function openArtifactDetails(artifactId, trigger) {
+  const artifact = state.artifacts.find((item) => item.artifact_id === artifactId);
+  if (!artifact) return;
+  const kinds = { plugin: '插件', program: '业务程序', dataset: '数据集' };
+  openWorkspaceDrawer(artifact.name, `<p class="drawer-intro">${escapeHtml(kinds[artifact.kind] || artifact.kind)} · ${escapeHtml(artifact.version)}</p><dl class="detail-list"><div><dt>文件名</dt><dd>${escapeHtml(artifact.filename || '--')}</dd></div><div><dt>文件大小</dt><dd>${formatBytes(artifact.size_bytes)}</dd></div><div><dt>上传时间</dt><dd>${escapeHtml(artifact.created_at ? timeLabel(artifact.created_at) : '--')}</dd></div><div><dt>内容 SHA-256</dt><dd><code>${escapeHtml(artifact.sha256 || '--')}</code><button type="button" class="button compact" data-copy-value="${escapeHtml(artifact.sha256 || '')}">复制摘要</button></dd></div><div><dt>制品标识</dt><dd><code>${escapeHtml(artifact.artifact_id)}</code></dd></div></dl><p class="config-help">制品保持原内容不变。更新时上传新版本，再从客户端部署向导选择。</p><div class="drawer-actions"><button type="button" class="button primary" data-workspace-go="deployments">前往客户端部署</button>${artifact.kind === 'plugin' ? `<button type="button" class="button" data-install-artifact="${escapeHtml(artifact.artifact_id)}">预览服务端安装</button>` : ''}</div><p id="workspace-copy-status" class="management-status" role="status"></p>`, trigger);
+}
+
+async function copyWorkspaceValue(value) {
+  try {
+    if (globalThis.navigator?.clipboard?.writeText) await globalThis.navigator.clipboard.writeText(value);
+    else {
+      const field = document.createElement('textarea');
+      field.value = value;
+      field.setAttribute('aria-label', '复制内容');
+      $('workspace-drawer-content').appendChild(field);
+      field.select?.();
+      const copied = document.execCommand?.('copy');
+      field.remove?.();
+      if (!copied) throw new Error('此浏览器不支持自动复制，请选中上面的完整摘要复制。');
+    }
+    $('workspace-copy-status').textContent = '摘要已复制。';
+  } catch (error) { $('workspace-copy-status').textContent = error.message; }
+}
+
+async function previewServerPlugin() {
+  const artifactId = $('server-plugin-artifact').value;
+  if (!artifactId || state.serverPluginBusy) return;
+  state.serverPluginBusy = true; state.serverPluginPreview = null; $('server-plugin-install').disabled = true;
+  $('server-plugin-status').textContent = '正在验证服务端插件包…';
+  try {
+    const result = await jsonFetch('/api/server-plugins/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ artifact_id: artifactId }) });
+    if ($('server-plugin-artifact').value !== artifactId) { $('server-plugin-status').textContent = '所选插件包已变更，请重新预览。'; return; }
+    state.serverPluginPreview = { artifactId, ...result };
+    if ($('server-plugin-summary')) $('server-plugin-summary').innerHTML = `<div class="server-install-summary"><strong>${escapeHtml(result.plugin)} <span>${escapeHtml(result.version)}</span></strong><p>${result.action === 'upgrade' ? '更新已有插件，保留业务配置与用户分析脚本。' : '安装服务端插件与配套分析资源。新插件安装后默认不启用。'}</p><span class="chip amber">安装后需重启调度器和结果服务</span>${result.warnings?.length ? `<p>${escapeHtml(result.warnings.join(' '))}</p>` : ''}</div>`;
+    $('server-plugin-plan').textContent = JSON.stringify({ plugin: result.plugin, version: result.version, action: result.action, enabled_after_install: result.enabled_after_install, preserves_existing_configuration: result.preserves_existing_configuration, scheduler_config_path: result.scheduler_config_path, result_service_config_path: result.result_service_config_path, files: result.files, warnings: result.warnings }, null, 2);
+    $('server-plugin-status').textContent = '预览完成。核对以上文件与配置改动后可安装；安装后需要重启服务。';
+    $('server-plugin-install').disabled = false;
+  } catch (error) { $('server-plugin-status').textContent = `预览失败：${error.message}`; }
+  finally { state.serverPluginBusy = false; }
+}
+async function installServerPlugin() {
+  const preview = state.serverPluginPreview;
+  if (state.serverPluginBusy || !preview || $('server-plugin-artifact').value !== preview.artifactId) return;
+  state.serverPluginBusy = true; $('server-plugin-install').disabled = true;
+  try {
+    await jsonFetch('/api/server-plugins/install', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ artifact_id: preview.artifactId, scheduler_revision: preview.scheduler_revision, result_service_revision: preview.result_service_revision, operator_id: state.operatorId }) });
+    state.serverPluginPreview = null;
+    $('server-plugin-status').textContent = '服务端插件已安装。新插件需在调度器配置中启用；请重启调度器和结果服务后核对加载状态。刷新网页不会代替进程重启。';
+  } catch (error) { $('server-plugin-status').textContent = `安装失败：${error.message}。安装预览已保留，请重新预览核对后再试。`; }
+  finally { state.serverPluginBusy = false; }
+}
+
+function renderDeployments() {
+  const labels = { current: '已生效', pending: '等待客户端', applying: '应用中', failed: '更新失败', unconfigured: '未配置', staged: '已下载', waiting_window: '等待更新时间窗', waiting_idle: '等待当前任务完成' };
+  const rows = state.deployments.map((deployment) => {
+    const summary = (value) => (value?.components || []).map((item) => `${item.artifact?.name || item.slot} @ ${item.artifact?.version || '--'}`).join('、') || (value ? '客户端配置' : '尚未回报');
+    const applied = deployment.reported?.state === 'ready' ? summary(deployment.reported) : '尚未确认生效';
+    return `<tr><td><button type="button" class="workspace-table-link" data-deployment-detail="${escapeHtml(deployment.client_id)}">${escapeHtml(deployment.client_id)}</button><small class="workspace-table-sub">${escapeHtml(deployment.reported?.message || '')}</small></td><td><span class="chip ${deployment.state === 'current' ? 'green' : deployment.state === 'failed' ? 'red' : 'amber'}">${escapeHtml(labels[deployment.state] || deployment.state)}</span></td><td class="deployment-version-cell">${escapeHtml(applied)}</td><td class="deployment-version-cell">${escapeHtml(deployment.desired ? summary(deployment.desired) : '未配置')}</td><td><div class="workspace-row-actions"><button type="button" class="button compact" data-deployment-detail="${escapeHtml(deployment.client_id)}">详情</button><button type="button" class="button compact" data-edit-deployment="${escapeHtml(deployment.client_id)}" ${state.deploymentBusy ? 'disabled' : ''}>编辑</button></div></td></tr>`;
+  });
+  $('deployment-list').innerHTML = rows.length ? rows.join('') : '<tr><td colspan="5" class="empty-row">还没有客户端部署。点击“创建部署”，选择一台客户端开始配置。</td></tr>';
+  const clientIds = new Set(state.deployments.map((item) => item.client_id));
+  for (const worker of state.scheduler?.clients || []) {
+    const suffix = `/${worker.plugin_type}`;
+    clientIds.add(worker.worker_id.endsWith(suffix) ? worker.worker_id.slice(0, -suffix.length) : worker.worker_id);
+  }
+  $('deployment-client-options').innerHTML = [...clientIds].sort().map((id) => `<option value="${escapeHtml(id)}"></option>`).join('');
+}
+
+function openDeploymentDetails(client, trigger) {
+  const deployment = state.deployments.find((item) => item.client_id === client);
+  if (!deployment) return;
+  const labels = { current: '已生效', pending: '等待客户端', applying: '应用中', failed: '更新失败', unconfigured: '未配置', staged: '已下载', waiting_window: '等待更新时间窗', waiting_idle: '等待当前任务完成' };
+  const components = deployment.desired?.components || [];
+  openWorkspaceDrawer(`${client} · 部署详情`, `<p class="drawer-intro"><span class="chip ${deployment.state === 'current' ? 'green' : deployment.state === 'failed' ? 'red' : 'amber'}">${escapeHtml(labels[deployment.state] || deployment.state)}</span></p><dl class="detail-list"><div><dt>客户端回报</dt><dd>${escapeHtml(deployment.reported?.message || '尚未收到客户端回报')}</dd></div><div><dt>目标版本</dt><dd><code>${escapeHtml(deployment.desired?.revision || '--')}</code></dd></div><div><dt>回报版本</dt><dd><code>${escapeHtml(deployment.reported?.desired_revision || '--')}</code></dd></div><div><dt>变更说明</dt><dd>${escapeHtml(deployment.desired?.reason || '未填写')}</dd></div></dl><h3>目标制品</h3>${components.length ? `<ul class="deployment-review-artifacts">${components.map((item) => `<li><span>${escapeHtml(item.artifact?.name || item.slot)}</span><b>${escapeHtml(item.artifact?.version || '--')}</b></li>`).join('')}</ul>` : '<p class="config-help">此部署没有分发制品。</p>'}<p class="config-help">客户端将在更新时间窗内、当前任务完成后应用。回退历史版本可在编辑部署的确认步骤中操作。</p><div class="drawer-actions"><button type="button" class="button primary" data-edit-deployment="${escapeHtml(client)}" ${state.deploymentBusy ? 'disabled' : ''}>编辑或恢复历史部署</button></div>`, trigger);
+}
+
+async function loadArtifacts() {
+  try {
+    const [artifacts, deployments] = await Promise.all([jsonFetch('/api/artifacts'), jsonFetch('/api/deployments')]);
+    state.artifacts = artifacts.artifacts || [];
+    state.deployments = deployments.clients || [];
+    renderArtifacts(); renderDeployments();
+    if (state.deploymentWizard) for (const group of wizardGroups(state.deploymentWizard.plugin)) {
+      const input = $(`deployment-artifact-${group.id}`); const selected = input.value;
+      input.innerHTML = wizardArtifactOptions(group.kind, selected); input.value = selected;
+    }
+  } catch (error) {
+    $('artifact-status').textContent = `制品读取失败：${error.message}`;
+  }
+}
+
+async function uploadArtifact(event) {
+  event.preventDefault();
+  if (state.artifactBusy) return;
+  const file = $('artifact-file').files?.[0];
+  if (!file) return;
+  const params = new URLSearchParams({ kind: $('artifact-kind').value, name: $('artifact-name').value.trim(), version: $('artifact-version').value.trim(), filename: file.name });
+  state.artifactBusy = true; $('artifact-upload').disabled = true; $('artifact-status').textContent = '正在上传并校验 SHA-256…';
+  try {
+    // The service hashes the stream while receiving it. This also works over
+    // plain LAN HTTP, where browser SubtleCrypto is unavailable.
+    const artifact = await jsonFetch(`/api/artifacts/upload?${params}`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file });
+    $('artifact-status').textContent = `制品上传成功，SHA-256：${artifact.sha256}`;
+    $('artifact-file').value = ''; await loadArtifacts();
+  } catch (error) { $('artifact-status').textContent = `上传失败：${error.message}`; }
+  finally { state.artifactBusy = false; $('artifact-upload').disabled = false; }
+}
+
+async function loadDeployment(client = $('deployment-client').value.trim()) {
+  if (!client || state.deploymentBusy) return false;
+  setDeploymentBusy(true);
+  try {
+    const result = await jsonFetch(`/api/deployments/${encodeURIComponent(client)}`);
+    state.deploymentClient = client; state.deploymentRevision = result.desired?.revision || null;
+    state.deploymentDraftLoaded = true;
+    state.deploymentSelected = Object.fromEntries((result.desired?.components || []).map((item) => [item.slot, item.artifact_id]));
+    $('deployment-client').value = client;
+    $('deployment-patch').value = JSON.stringify(result.desired?.config_patch || {}, null, 2);
+    $('deployment-editor-mode').value = result.desired ? 'json' : 'wizard';
+    state.deploymentBinding = null; $('deployment-bindings').hidden = true;
+    importDeploymentWizard(); updateDeploymentMode();
+    renderDeploymentHistory(result);
+    $('deployment-status').textContent = result.desired ? '已读取当前部署；修改并发布后生效。' : '此客户端尚未配置部署。';
+    renderArtifacts();
+    return true;
+  } catch (error) { $('deployment-status').textContent = `读取失败：${error.message}`; return false; }
+  finally { setDeploymentBusy(false); }
+}
+
+function renderDeploymentHistory(result) {
+  $('deployment-rollback').innerHTML = '<option value="">选择历史版本</option>' + (result.history || []).map((item) => `<option value="${escapeHtml(item.revision)}">${escapeHtml(timeLabel(item.updated_at))} · ${escapeHtml(item.reason || item.revision.slice(0, 8))}</option>`).join('');
+}
+
+function selectArtifact(event) {
+  if (state.deploymentBusy) return;
+  const input = event.target.closest('[data-artifact-id]');
+  if (!input) return;
+  const artifact = state.artifacts.find((item) => item.artifact_id === input.dataset.artifactId);
+  if (!artifact) return;
+  if (input.checked) {
+    const slot = `${artifact.kind}.${artifact.name}`;
+    state.deploymentSelected[slot] = artifact.artifact_id;
+  } else for (const [slot, id] of Object.entries(state.deploymentSelected)) { if (id === artifact.artifact_id) delete state.deploymentSelected[slot]; }
+  state.deploymentWizardDirty = true;
+  renderArtifacts();
+}
+
+async function saveDeployment(event) {
+  event.preventDefault();
+  if (state.deploymentBusy) return;
+  if (state.deploymentEditorOpen && state.deploymentStep !== 4) return advanceDeploymentStep();
+  const client = $('deployment-client').value.trim();
+  const components = deploymentComponents();
+  if (!client || !state.deploymentDraftLoaded || state.deploymentClient !== client) { $('deployment-status').textContent = '请先读取目标客户端的当前部署。'; return; }
+  if ($('deployment-editor-mode').value === 'wizard' && (state.deploymentWizardDirty || state.deploymentPreview !== JSON.stringify({ model: collectDeploymentWizard(), patch: $('deployment-patch').value, components }))) {
+    $('deployment-status').textContent = '请先生成配置预览，确认后再发布。'; return;
+  }
+  let patch;
+  try {
+    patch = JSON.parse($('deployment-patch').value || '{}');
+    if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new Error('配置覆盖必须是 JSON 对象');
+  } catch (error) { $('deployment-status').textContent = `配置格式错误：${error.message}`; return; }
+  setDeploymentBusy(true); $('deployment-status').textContent = '正在发布部署期望…';
+  try {
+    const result = await jsonFetch(`/api/deployments/${encodeURIComponent(client)}/desired`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ revision: state.deploymentRevision, components, config_patch: patch, reason: $('deployment-reason').value.trim(), operator_id: state.operatorId }) });
+    state.deploymentRevision = result.desired.revision;
+    $('deployment-patch').value = JSON.stringify(result.desired.config_patch || patch, null, 2);
+    if ($('deployment-editor-mode').value === 'wizard') {
+      importDeploymentWizard();
+      state.deploymentPreview = JSON.stringify({ model: collectDeploymentWizard(), patch: $('deployment-patch').value, components: deploymentComponents() });
+    }
+    renderDeploymentHistory(result);
+    $('deployment-status').textContent = '部署期望已发布，客户端将在更新时间窗内应用。'; await loadArtifacts();
+  } catch (error) { $('deployment-status').textContent = `发布失败：${error.message}`; }
+  finally { setDeploymentBusy(false); }
+}
+
+async function rollbackDeployment() {
+  const target = $('deployment-rollback').value;
+  if (!target || !state.deploymentDraftLoaded || state.deploymentBusy) return;
+  if ($('deployment-client').value.trim() !== state.deploymentClient) { $('deployment-status').textContent = '请先读取目标客户端的当前部署。'; return; }
+  setDeploymentBusy(true);
+  try {
+    await jsonFetch(`/api/deployments/${encodeURIComponent(state.deploymentClient)}/desired`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ revision: state.deploymentRevision, action: 'rollback', target_revision: target, reason: $('deployment-reason').value.trim(), operator_id: state.operatorId }) });
+    await loadArtifacts();
+    setDeploymentBusy(false);
+    await loadDeployment(state.deploymentClient);
+    $('deployment-status').textContent = '回滚期望已发布，客户端将在更新时间窗内应用。';
+  } catch (error) { $('deployment-status').textContent = `回滚失败：${error.message}`; }
+  finally { setDeploymentBusy(false); }
 }
 
 async function loadAll() {
@@ -647,7 +1381,6 @@ async function loadAll() {
   state.apiHealthy = false;
   const preferredPlugin = $('result-type').value;
   const preferredRun = $('result-run').value;
-  const preferredProvider = $('provider').value;
   try {
     const [health, readiness] = await Promise.all([jsonFetch('/healthz'), statusFetch('/readyz')]);
     if (requestId !== state.loadRequest) return;
@@ -667,11 +1400,6 @@ async function loadAll() {
     state.pluginViews = Object.fromEntries(plugins.filter((plugin) => plugin.view).map((plugin) => [plugin.name, plugin.view]));
     state.pluginViewSchema = viewSchema;
     renderServiceState(readiness, providers);
-    const wantedProvider = $('provider').value || preferredProvider;
-    $('provider').innerHTML = providers.map((provider) => `<option value="${escapeHtml(provider.name)}" ${provider.available ? '' : 'disabled'}>${escapeHtml(provider.name)}${provider.available ? '' : ' · 不可用'}</option>`).join('');
-    const selectedProvider = providers.find((provider) => provider.name === wantedProvider && provider.available)
-      || providers.find((provider) => provider.available);
-    if (selectedProvider) $('provider').value = selectedProvider.name;
     updateAiControls();
     let overviewError = null;
     const runs = readiness.ok ? await jsonFetch('/api/runs?limit=100').catch((error) => { overviewError = error; return []; }) : [];
@@ -702,6 +1430,7 @@ async function loadAll() {
     await schedulerRefresh;
     if (state.page === 'logs') await loadLogs();
     if (state.page === 'plugins') await loadConfig($('config-kind').value || state.configKind);
+    if (state.page === 'plugins') await loadArtifacts();
   } catch (error) {
     if (requestId !== state.loadRequest) return;
     throw error;
@@ -742,28 +1471,18 @@ async function refreshProgress() {
   }
 }
 
-function addMessage(role, text) {
-  const node = document.createElement('div');
-  node.className = `message ${role === 'user' ? 'user-message' : 'assistant-message'}`;
-  node.textContent = text;
-  $('chat').appendChild(node);
-  $('chat').scrollTop = $('chat').scrollHeight;
-  return node;
-}
-
 function updateReportControls() {
   const plugin = $('result-type').value;
   const canRun = Boolean(state.selected?.run_id && state.readiness?.configured && state.reportScripts[plugin] !== undefined);
   $('run-report').disabled = !canRun || state.reportBusy;
   $('run-report').textContent = state.reportBusy ? '正在生成…' : (state.report ? '重新运行报告' : '运行报告');
   $('edit-report-script').disabled = !plugin;
-  const candidate = state.reportEditorCandidate;
-  const staleCandidate = candidate && !reportCandidateMatchesSelection(candidate);
-  $('save-report-editor').disabled = state.reportEditorSaving || Boolean(staleCandidate);
-  $('save-run-report-editor').disabled = !canRun || state.reportBusy || state.reportEditorPlugin !== plugin || state.reportEditorSaving || Boolean(staleCandidate);
-  $('report-editor-text').disabled = state.reportEditorSaving;
-  $('report-candidate-index').disabled = state.reportEditorSaving || (candidate?.sources.length || 0) < 2;
-  if (staleCandidate) $('report-editor-status').textContent = '运行选择已变化，此候选不能应用。请为当前运行重新生成脚本；候选编辑内容已保留。';
+  const editorBusy = state.reportEditorSaving || state.reportEditorLoading;
+  $('save-report-editor').disabled = editorBusy || !state.reportEditorRevision;
+  $('save-run-report-editor').disabled = !canRun || state.reportBusy || state.reportEditorPlugin !== plugin || editorBusy || !state.reportEditorRevision;
+  $('report-editor-text').disabled = editorBusy;
+  $('report-load-latest').hidden = !state.reportEditorConflicted;
+  $('report-load-latest').disabled = editorBusy;
 }
 
 function setReportSelection(plugin, runId) {
@@ -802,7 +1521,10 @@ async function refreshReportScript(plugin) {
   const requestId = (state.reportScriptLoads[plugin] || 0) + 1;
   state.reportScriptLoads[plugin] = requestId;
   const result = await jsonFetch(`/api/plugins/${encodeURIComponent(plugin)}/report-script`);
-  if (state.reportScriptLoads[plugin] === requestId) state.reportScripts[plugin] = result.source;
+  if (state.reportScriptLoads[plugin] === requestId) {
+    state.reportScripts[plugin] = result.source;
+    state.reportScriptRevisions[plugin] = result.revision;
+  }
   return result;
 }
 
@@ -858,30 +1580,37 @@ async function runReport(plugin = $('result-type').value, runId = state.selected
   }
 }
 
-async function saveReportScript(plugin, source) {
+async function saveReportScript(plugin, source, revision) {
   const saved = await jsonFetch(`/api/plugins/${encodeURIComponent(plugin)}/report-script`, {
-    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source }),
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source, revision, operator_id: state.operatorId }),
   });
   state.reportLoads[plugin] = (state.reportLoads[plugin] || 0) + 1;
   state.reportScriptLoads[plugin] = (state.reportScriptLoads[plugin] || 0) + 1;
   state.reportScripts[plugin] = saved.source;
-  if (state.reportDrafts[plugin] === source) delete state.reportDrafts[plugin];
+  state.reportScriptRevisions[plugin] = saved.revision;
+  if (state.reportDrafts[plugin] === source) {
+    delete state.reportDrafts[plugin];
+    delete state.reportDraftBases[plugin];
+  }
   updateReportControls();
   return saved;
 }
 
 async function openReportEditor() {
   const plugin = $('result-type').value;
-  if (!plugin || state.reportEditorSaving) return;
+  if (!plugin || state.reportEditorSaving || state.reportEditorLoading) return;
   if ($('report-editor-dialog').open) rememberReportDraft();
   const requestId = ++state.reportEditorRequest;
-  state.reportEditorCandidate = null;
   state.reportEditorPlugin = plugin;
-  state.reportEditorOriginal = state.reportScripts[plugin] ?? '';
+  state.reportEditorOriginal = state.reportDraftBases[plugin]?.source ?? state.reportScripts[plugin] ?? '';
+  state.reportEditorRevision = state.reportDraftBases[plugin]?.revision ?? state.reportScriptRevisions[plugin] ?? '';
+  state.reportEditorConflicted = false;
   $('report-editor-title').textContent = '编辑 Python 报告脚本';
-  $('report-candidate-picker').hidden = true;
   $('report-editor-plugin').textContent = plugin;
   $('report-editor-text').value = state.reportDrafts[plugin] ?? state.reportScripts[plugin] ?? '';
+  $('report-conflict-section').hidden = state.reportConflictDrafts[plugin] === undefined;
+  $('report-conflict-draft').value = state.reportConflictDrafts[plugin] ?? '';
   $('report-editor-status').textContent = '保存后可用于当前插件的其他运行。';
   const dialog = $('report-editor-dialog');
   if (typeof dialog.showModal === 'function') dialog.showModal();
@@ -891,9 +1620,21 @@ async function openReportEditor() {
   try {
     await refreshReportScript(plugin);
     if (requestId !== state.reportEditorRequest) return;
-    state.reportEditorOriginal = state.reportScripts[plugin] ?? '';
+    // With no cached script, the first completed read supplies the initial
+    // baseline for text typed while the editor was loading.
+    if (state.reportDrafts[plugin] !== undefined && !state.reportDraftBases[plugin]?.revision) {
+      state.reportDraftBases[plugin] = { source: state.reportScripts[plugin] ?? '', revision: state.reportScriptRevisions[plugin] ?? '' };
+    }
+    // A refreshed cache must not rebase an existing draft: its source and
+    // revision stay paired until a save succeeds or the draft is discarded.
+    state.reportEditorOriginal = state.reportDraftBases[plugin]?.source ?? state.reportScripts[plugin] ?? '';
+    state.reportEditorRevision = state.reportDraftBases[plugin]?.revision ?? state.reportScriptRevisions[plugin] ?? '';
+    state.reportEditorConflicted = state.reportEditorRevision !== state.reportScriptRevisions[plugin];
     $('report-editor-text').value = state.reportDrafts[plugin] ?? state.reportEditorOriginal;
-    $('report-editor-status').textContent = state.reportDrafts[plugin] !== undefined ? '已保留未保存的草稿。保存将替换当前插件脚本。' : '已加载最新脚本。保存后可用于当前插件的其他运行。';
+    $('report-editor-status').textContent = state.reportDrafts[plugin] !== undefined
+      ? (state.reportEditorConflicted ? '已保留未保存的草稿。服务器脚本已有新版本，可载入最新版本后参考原草稿合并。' : '已保留未保存的草稿。保存将替换当前插件脚本。')
+      : '已加载最新脚本。保存后可用于当前插件的其他运行。';
+    updateReportControls();
   } catch (error) {
     if (requestId === state.reportEditorRequest) $('report-editor-status').textContent = `最新脚本读取失败：${error.message}`;
   }
@@ -902,12 +1643,13 @@ async function openReportEditor() {
 function rememberReportDraft() {
   const plugin = state.reportEditorPlugin;
   const source = $('report-editor-text').value;
-  if (state.reportEditorCandidate) {
-    state.reportEditorCandidate.drafts[state.reportEditorCandidate.index] = source;
-    return;
+  if (source !== state.reportEditorOriginal) {
+    state.reportDrafts[plugin] = source;
+    state.reportDraftBases[plugin] = { source: state.reportEditorOriginal, revision: state.reportEditorRevision };
+  } else {
+    delete state.reportDrafts[plugin];
+    delete state.reportDraftBases[plugin];
   }
-  if (source !== state.reportEditorOriginal) state.reportDrafts[plugin] = source;
-  else delete state.reportDrafts[plugin];
 }
 
 function closeReportEditor() {
@@ -918,14 +1660,40 @@ function closeReportEditor() {
   else dialog.open = false;
 }
 
+async function loadLatestReportEditor() {
+  const plugin = state.reportEditorPlugin;
+  if (!plugin || state.reportEditorSaving || state.reportEditorLoading) return;
+  const source = $('report-editor-text').value;
+  rememberReportDraft();
+  const requestId = ++state.reportEditorRequest;
+  state.reportEditorLoading = true;
+  updateReportControls();
+  $('report-editor-status').textContent = '正在读取最新版本，原草稿将保留供合并…';
+  try {
+    const latest = await refreshReportScript(plugin);
+    if (requestId !== state.reportEditorRequest) return;
+    state.reportConflictDrafts[plugin] = source;
+    state.reportEditorOriginal = latest.source;
+    state.reportEditorRevision = latest.revision;
+    state.reportEditorConflicted = false;
+    delete state.reportDrafts[plugin];
+    delete state.reportDraftBases[plugin];
+    $('report-editor-text').value = latest.source;
+    $('report-conflict-draft').value = source;
+    $('report-conflict-section').hidden = false;
+    $('report-conflict-section').open = true;
+    $('report-editor-status').textContent = '已载入最新版本，原草稿已单独保留。请参考原草稿合并修改后保存。';
+  } catch (error) {
+    if (requestId === state.reportEditorRequest) $('report-editor-status').textContent = `最新版本读取失败：${error.message}。原草稿未改动。`;
+  } finally {
+    state.reportEditorLoading = false;
+    updateReportControls();
+  }
+}
+
 async function saveReportEditor(andRun = false) {
   const plugin = state.reportEditorPlugin;
-  if (!plugin || state.reportEditorSaving) return;
-  const candidate = state.reportEditorCandidate;
-  if (candidate && !reportCandidateMatchesSelection(candidate)) {
-    updateReportControls();
-    return;
-  }
+  if (!plugin || state.reportEditorSaving || state.reportEditorLoading || !state.reportEditorRevision) return;
   if (andRun && ($('result-type').value !== plugin || !state.selected?.run_id)) return;
   const runId = state.selected?.run_id;
   const editorRequest = state.reportEditorRequest;
@@ -936,116 +1704,39 @@ async function saveReportEditor(andRun = false) {
   updateReportControls();
   $('report-editor-status').textContent = '正在保存…';
   try {
-    await saveReportScript(plugin, source);
+    const saved = await saveReportScript(plugin, source, state.reportEditorRevision);
     if (editorRequest !== state.reportEditorRequest) return;
-    state.reportEditorOriginal = source;
+    state.reportEditorOriginal = saved.source;
+    state.reportEditorRevision = saved.revision;
+    state.reportEditorConflicted = false;
     $('report-editor-status').textContent = '脚本已保存。';
     if (andRun && selectionGeneration === state.reportSelectionGeneration) {
       closeReportEditor();
       await runReport(plugin, runId);
     }
   } catch (error) {
-    if (editorRequest === state.reportEditorRequest) $('report-editor-status').textContent = `无法保存：${error.message}`;
+    if (editorRequest === state.reportEditorRequest) {
+      state.reportEditorConflicted = error.status === 409 || state.reportEditorConflicted;
+      $('report-editor-status').textContent = error.status === 409
+        ? '服务器脚本已有新版本，原草稿已保留。请载入最新版本，参考原草稿合并后再保存。'
+        : `无法保存：${error.message}`;
+    }
   } finally {
     state.reportEditorSaving = false;
     updateReportControls();
   }
 }
 
-function extractReportScripts(text) {
-  const blocks = String(text || '').matchAll(/(?:^|\n)[ \t]*(`{3,}|~{3,})[ \t]*(?:python|py)[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*\1[ \t]*(?=\r?\n|$)/gi);
-  return [...blocks].map((match) => match[2].trim()).filter(Boolean);
+function pluginViewDefinition(view) {
+  const { revision, ...definition } = view || {};
+  return definition;
 }
 
-function reportCandidateMatchesSelection(candidate) {
-  return $('result-type').value === candidate.plugin && state.selected?.run_id === candidate.runId
-    && state.reportSelectionGeneration === candidate.selectionGeneration;
-}
-
-function showReportCandidateSource() {
-  const candidate = state.reportEditorCandidate;
-  if (!candidate) return;
-  $('report-candidate-index').value = String(candidate.index);
-  $('report-editor-text').value = candidate.drafts[candidate.index] ?? candidate.sources[candidate.index];
-  $('report-editor-status').textContent = `正在预览候选 ${candidate.index + 1} / ${candidate.sources.length}。保存将应用编辑框中的完整源码。${state.reportDrafts[candidate.plugin] !== undefined ? '原先手写的未保存草稿仍保留在“编辑 Python”中。' : ''}`;
-  updateReportControls();
-}
-
-function openReportCandidate(candidate) {
-  if (state.reportEditorSaving) return;
-  if (!reportCandidateMatchesSelection(candidate)) {
-    addMessage('assistant', `此脚本针对 ${candidate.plugin} / ${candidate.runId || '未选择运行'} 生成，运行选择已变化。请为当前运行重新生成脚本。`);
-    return;
-  }
-  if ($('report-editor-dialog').open) rememberReportDraft();
-  state.reportEditorRequest += 1;
-  state.reportEditorPlugin = candidate.plugin;
-  state.reportEditorCandidate = candidate;
-  $('report-editor-title').textContent = '预览 AI 候选脚本';
-  $('report-editor-plugin').textContent = `${candidate.plugin} / ${candidate.runId || '未选择运行'}`;
-  $('report-candidate-picker').hidden = false;
-  $('report-candidate-index').innerHTML = candidate.sources.map((source, index) => `<option value="${index}">候选 ${index + 1} · ${source.split('\n').length} 行</option>`).join('');
-  showReportCandidateSource();
-  const dialog = $('report-editor-dialog');
-  if (typeof dialog.showModal === 'function') dialog.showModal();
-  else dialog.open = true;
-}
-
-function addReportCandidate(plugin, sources, runId, selectionGeneration) {
-  const candidate = { plugin, sources, runId, selectionGeneration, drafts: {}, index: 0 };
-  const node = document.createElement('div');
-  node.className = 'message assistant-message report-candidate';
-  const summary = document.createElement('span');
-  summary.textContent = `找到 ${sources.length} 个 ${plugin} Python 候选脚本。先查看、选择并编辑源码，再保存或保存并运行。`;
-  const button = document.createElement('button');
-  button.type = 'button';
-  button.className = 'button primary';
-  button.textContent = '查看候选脚本';
-  button.addEventListener('click', () => openReportCandidate(candidate));
-  node.appendChild(summary);
-  node.appendChild(button);
-  $('chat').appendChild(node);
-}
-
-function persistConversationIds() {
-  try {
-    if (typeof localStorage !== 'undefined') localStorage.setItem(AI_CONVERSATIONS_KEY, JSON.stringify(state.conversationIds));
-  } catch (_) { /* A blocked local store must not prevent local AI use. */ }
-}
-
-function newAiConversation() {
-  const provider = $('provider').value;
-  if (provider) {
-    delete state.conversationIds[provider];
-    persistConversationIds();
-  }
-  $('chat').replaceChildren();
-  addMessage('assistant', `${provider || 'AI'} 新会话已就绪。选择运行只会附加结果上下文。`);
-  updateAiControls();
-}
-
-function extractViewDefinition(text, plugin) {
-  const raw = String(text || '').trim();
-  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const candidates = [fenced?.[1], raw];
-  const firstBrace = raw.indexOf('{');
-  const lastBrace = raw.lastIndexOf('}');
-  if (firstBrace >= 0 && lastBrace > firstBrace) candidates.push(raw.slice(firstBrace, lastBrace + 1));
-  for (const candidate of candidates) {
-    if (!candidate) continue;
-    try {
-      const value = JSON.parse(candidate);
-      if (value && typeof value === 'object' && value.plugin === plugin && Array.isArray(value.widgets)) return value;
-    } catch (_) { /* Try the next representation. */ }
-  }
-  return null;
-}
-
-async function savePluginView(plugin, definition) {
+async function savePluginView(plugin, definition, revision) {
   const saved = await jsonFetch(`/api/plugins/${encodeURIComponent(plugin)}/view`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(definition),
+    body: JSON.stringify({ ...pluginViewDefinition(definition), revision }),
   });
   state.pluginViews[plugin] = saved;
   const metadata = state.plugins.find((item) => item.name === plugin);
@@ -1055,117 +1746,73 @@ async function savePluginView(plugin, definition) {
   return saved;
 }
 
-function addViewCandidate(plugin, definition) {
-  const node = document.createElement('div');
-  node.className = 'message assistant-message view-candidate';
-  const summary = document.createElement('span');
-  summary.textContent = `已生成 ${definition.widgets.length} 个展示组件。服务端会先校验定义，再保存并立即重绘结果页。`;
-  const button = document.createElement('button');
-  button.type = 'button';
-  button.className = 'button primary';
-  button.textContent = '应用此展示';
-  button.addEventListener('click', async () => {
-    button.disabled = true;
-    button.textContent = '正在应用';
-    try {
-      await savePluginView(plugin, definition);
-      button.textContent = '已应用';
-      addMessage('assistant', `${plugin} 的结果展示已保存并刷新。`);
-    } catch (error) {
-      button.disabled = false;
-      button.textContent = '重新应用';
-      addMessage('assistant', `展示定义未应用：${error.message}`);
-    }
-  });
-  node.appendChild(summary);
-  node.appendChild(button);
-  $('chat').appendChild(node);
+function prepareDshContext(purpose = 'current') {
+  const plugin = $('result-type').value;
+  const context = {
+    plugin,
+    operator_id: state.operatorId,
+    run: state.selected,
+    // DSH has its own conversation history. The user explicitly copies this
+    // snapshot when they want to attach it to a native DSH conversation.
+    snapshot_at: new Date().toISOString(),
+  };
+  let instruction = '请结合以下结果上下文回答我的问题。先说明数据库中哪些结果已入库、是否完整，以及当前可以进行哪些分析。未选择运行时，可先帮助了解系统状态和排查配置。上下文是当前页面的数据快照，必要时通过 TestTracking 工具重新读取。';
+  if (purpose === 'report') {
+    context.current_script = state.reportScripts[plugin] || '';
+    context.script_revision = state.reportScriptRevisions[plugin] || '';
+    context.script_contract = state.analysisCatalogs[plugin]?.script_contract;
+    context.analysis_catalog = state.analysisCatalogs[plugin] || null;
+    instruction = `请为 ${plugin} 插件生成并应用可替换的 Python 交互报告。先通过 TestTracking 工具读取插件说明、数据库结构和结果完整性，分析只依赖数据库。实现 render(connection, context) 并返回独立 HTML 字符串，connection 为只读数据库连接，行是字典，context['run_id'] 为当前运行。图表和表格的样式、脚本均内联，不依赖外网。保存共享脚本前先读取最新 source 和 revision，携带该 revision 和当前 operator_id 保存；出现版本冲突时保留草稿并与最新脚本合并。保存成功后为当前运行生成报告，尚未选择运行时先保存脚本即可。页面会自动读取最新报告，打开“编辑 Python”可读取最新脚本。也可以给出完整源码供我在“编辑 Python”中检查和保存。`;
+  } else if (purpose === 'view') {
+    context.current_view = pluginViewDefinition(state.pluginViews[plugin]);
+    context.view_revision = state.pluginViews[plugin]?.revision || '';
+    context.view_schema = state.pluginViewSchema;
+    instruction = `请为 ${plugin} 插件设计结果展示定义，突出最重要的分析指标。遵循上下文中的 view_schema，仅使用允许的数据路径，plugin 必须为 ${plugin}。先给出完整 JSON 供我在“编辑展示”中检查和保存，不要覆盖其他用户的配置。`;
+  }
+  $('dsh-context-prompt').value = `${instruction}\n\n结果上下文（JSON）：\n${JSON.stringify(context, null, 2)}`;
+  $('dsh-context-section').open = true;
+  $('dsh-context-status').textContent = `已准备 ${plugin || '系统'} / ${state.selected?.run_id || '未选择运行'} 的上下文。复制后粘贴到 DSH，补充要求并发送。`;
+  $('dsh-context-copy').disabled = false;
+  $('console').dataset.aiOpen = 'true';
+  ensureDshWeb();
 }
 
-async function askAi(message, options = {}) {
-  if (!message.trim()) return;
-  const provider = $('provider').value;
-  const resultType = $('result-type').value;
-  const reportRunId = state.selected?.run_id;
-  const reportSelectionGeneration = state.reportSelectionGeneration;
-  if (!state.providers.some((item) => item.name === provider && item.available)) { addMessage('assistant', '当前 AI 服务不可用。'); return; }
-  state.aiBusy = true;
-  updateAiControls();
-  addMessage('user', options.displayMessage || message);
-  const waiting = document.createElement('div');
-  waiting.className = 'message assistant-message'; waiting.textContent = `${provider} 正在分析...`; $('chat').appendChild(waiting);
+async function copyDshContext() {
+  const field = $('dsh-context-prompt');
+  if (!field.value) return;
   try {
-    const result = await jsonFetch('/api/ai/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        provider,
-        message,
-        conversation_id: state.conversationIds[provider] || null,
-        context: {
-          run: state.selected,
-          result_type: resultType,
-          ...(options.viewDesign ? {
-            purpose: 'plugin_result_view_design',
-            current_view: state.pluginViews[resultType],
-            view_schema: state.pluginViewSchema,
-          } : {}),
-          ...(options.reportDesign ? {
-            purpose: 'analysis_report_design',
-            current_script: state.reportScripts[resultType] || '',
-            script_contract: state.analysisCatalogs[resultType]?.script_contract,
-            analysis_catalog: state.analysisCatalogs[resultType],
-          } : {}),
-        },
-      }),
-    });
-    if (result.conversation_id) {
-      state.conversationIds[provider] = result.conversation_id;
-      persistConversationIds();
+    if (globalThis.navigator?.clipboard?.writeText) await globalThis.navigator.clipboard.writeText(field.value);
+    else {
+      field.focus?.();
+      field.select?.();
+      if (!document.execCommand?.('copy')) throw new Error('请选中上面的提示内容，手动复制后粘贴到 DSH。');
     }
-    waiting.textContent = result.text;
-    if (options.viewDesign) {
-      const definition = extractViewDefinition(result.text, resultType);
-      if (definition) addViewCandidate(resultType, definition);
-      else addMessage('assistant', '回复中没有可应用的展示 JSON。可以补充要求后再次生成。');
-    }
-    if (options.reportDesign) {
-      const sources = extractReportScripts(result.text);
-      if (sources.length) addReportCandidate(resultType, sources, reportRunId, reportSelectionGeneration);
-      else addMessage('assistant', '回复中没有可预览的 Python 代码块。请让 AI 使用 python 或 py 围栏提供完整脚本。尚未保存或运行任何脚本。');
-    }
-  } catch (error) { waiting.textContent = `请求失败：${error.message}`; }
-  finally { state.aiBusy = false; updateAiControls(); }
-  $('chat').scrollTop = $('chat').scrollHeight;
+    $('dsh-context-status').textContent = '提示已复制。请粘贴到 DSH 原生输入框，补充要求后发送。';
+  } catch (_) {
+    field.focus?.();
+    field.select?.();
+    $('dsh-context-status').textContent = '浏览器未允许自动复制，请手动复制已选中的提示内容。';
+  }
 }
 
-async function designPluginView() {
-  const plugin = $('result-type').value;
-  const requirements = $('question').value.trim();
-  $('question').value = '';
-  $('console').dataset.aiOpen = 'true';
-  selectAiTab('chat');
-  const prompt = `为 ${plugin} 插件生成结果展示定义。${requirements ? `使用者要求：${requirements}` : '保持信息清晰，突出最重要的分析指标。'} 严格遵循上下文中的 view_schema，只引用上下文允许的数据路径。plugin 必须是 ${plugin}。只回复一个 JSON 对象，不要附加解释或 Markdown。`;
-  await askAi(prompt, { viewDesign: true, displayMessage: requirements || `为 ${plugin} 设计结果展示` });
+function designPluginView() {
+  if (!state.pluginViews[$('result-type').value]) return;
+  prepareDshContext('view');
 }
 
-async function designPythonReport() {
-  const plugin = $('result-type').value;
-  if (!plugin || state.aiBusy) return;
-  const requirements = $('question').value.trim();
-  $('question').value = '';
-  $('console').dataset.aiOpen = 'true';
-  selectAiTab('chat');
-  const prompt = `为 ${plugin} 插件生成可替换的 Python 交互报告脚本。${requirements ? `使用者要求：${requirements}` : '先说明数据库中已有结果的完整性，再展示有用的图表和表格。'} 遵循上下文中的 script_contract 和真实数据库表结构。实现 render(connection, context) 并返回独立 HTML 字符串，connection 为只读数据库连接，行是字典，context['run_id'] 是当前运行。查询只依赖数据库中的结果，不依赖任务执行过程或调度状态。HTML 的样式和交互脚本内联，不依赖外部网络。以一个完整的 python 代码块回复。`;
-  await askAi(prompt, { reportDesign: true, displayMessage: requirements || `为 ${plugin} 生成 Python 交互报告` });
+function designPythonReport() {
+  if (!$('result-type').value) return;
+  prepareDshContext('report');
 }
 
 function openViewEditor() {
   const plugin = $('result-type').value;
   const definition = state.pluginViews[plugin];
   if (!definition) return;
+  state.viewEditorPlugin = plugin;
+  state.viewEditorRevision = definition.revision;
   $('view-editor-plugin').textContent = plugin;
-  $('view-editor-text').value = JSON.stringify(definition, null, 2);
+  $('view-editor-text').value = JSON.stringify(pluginViewDefinition(definition), null, 2);
   $('view-editor-status').textContent = '保存后立即应用到结果页';
   const dialog = $('view-editor-dialog');
   if (typeof dialog.showModal === 'function') dialog.showModal();
@@ -1179,13 +1826,14 @@ function closeViewEditor() {
 }
 
 async function saveViewEditor() {
-  const plugin = $('result-type').value;
+  const plugin = state.viewEditorPlugin;
+  const revision = state.viewEditorRevision;
   $('save-view-editor').disabled = true;
   try {
     const definition = JSON.parse($('view-editor-text').value);
-    await savePluginView(plugin, definition);
+    await savePluginView(plugin, definition, revision);
     closeViewEditor();
-    addMessage('assistant', `${plugin} 的结果展示已保存并刷新。`);
+    $('footer-status').textContent = `${plugin} 的结果展示已保存并刷新。`;
   } catch (error) {
     $('view-editor-status').textContent = `无法保存：${error.message}`;
   } finally {
@@ -1193,36 +1841,25 @@ async function saveViewEditor() {
   }
 }
 
-async function submitChat() {
-  const question = $('question');
-  const message = question.value;
-  if (!message.trim() || state.aiBusy) return;
-  question.value = '';
-  await askAi(message);
-}
-
-function selectAiTab(tab) {
-  document.querySelectorAll('[data-ai-tab]').forEach((button) => {
-    button.setAttribute('aria-selected', String(button.dataset.aiTab === tab));
-  });
-  $('ai-chat-panel').hidden = tab !== 'chat';
-  $('dsh-native-panel').hidden = tab !== 'dsh';
-  if (tab === 'dsh' && !state.dshWebUrl) openDshWeb();
+function ensureDshWeb() {
+  if ($('console').dataset.aiOpen === 'true' && !state.dshWebAttempted
+      && state.providers.some((item) => item.name === 'dsh' && item.available)) {
+    void openDshWeb();
+  }
 }
 
 async function openDshWeb() {
   if (state.dshWebLoading) return;
-  const dshAvailable = state.providers.some((item) => item.name === 'dsh' && item.available);
-  if (!dshAvailable) {
-    $('dsh-native-status').textContent = '服务器 DSH 命令不可用。';
-    return;
-  }
+  state.dshWebAttempted = true;
   state.dshWebLoading = true;
   $('dsh-native-open').disabled = true;
   $('dsh-native-open').textContent = '正在启动';
   $('dsh-native-status').textContent = '正在启动服务器 DSH Web...';
   try {
-    const result = await jsonFetch('/api/ai/dsh-web', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    const result = await jsonFetch('/api/ai/dsh-web', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ operator_id: state.operatorId }),
+    });
     if (!result.url) throw new Error('服务未返回 DSH Web 地址');
     state.dshWebUrl = result.url;
     $('dsh-native-frame').src = result.url;
@@ -1296,10 +1933,12 @@ function setUiScale(value, persist = true) {
 }
 
 document.querySelectorAll('.nav-item').forEach((button) => button.addEventListener('click', () => navigate(button.dataset.page)));
-document.querySelectorAll('[data-prompt]').forEach((button) => button.addEventListener('click', () => askAi(button.dataset.prompt)));
 $('overview-filter').addEventListener('click', (event) => { const button = event.target.closest('button'); if (!button) return; state.filter = button.dataset.filter; document.querySelectorAll('#overview-filter button').forEach((item) => item.setAttribute('aria-pressed', String(item === button))); renderRunCards(); });
 $('run-start-form').addEventListener('submit', async (event) => { event.preventDefault(); await schedulerCommand('run', $('run-plugin').value); });
-$('run-plugin').addEventListener('change', renderScheduler);
+$('run-force').addEventListener('change', () => renderScheduler());
+$('run-plugin').addEventListener('change', () => { state.selectedWorkerIds = []; renderScheduler(); });
+$('run-all-clients').addEventListener('change', renderScheduler);
+$('run-clients').addEventListener('change', () => { state.selectedWorkerIds = Array.from($('run-clients').selectedOptions).map((item) => item.value); });
 $('run-wakeup').addEventListener('click', () => schedulerCommand('wakeup', $('run-plugin').value));
 $('active-runs').addEventListener('click', (event) => {
   const button = event.target.closest('[data-stop-run]');
@@ -1310,11 +1949,130 @@ $('logs-form').addEventListener('submit', async (event) => { event.preventDefaul
 $('logs-file').addEventListener('change', loadLogs);
 $('logs-level').addEventListener('change', loadLogs);
 $('logs-limit').addEventListener('change', loadLogs);
+document.querySelectorAll('[data-workspace-tab]').forEach((button) => {
+  button.addEventListener('click', () => setWorkspaceTab(button.dataset.workspaceTab));
+  button.addEventListener('keydown', (event) => {
+    const tabs = ['plugins', 'artifacts', 'deployments', 'settings'];
+    const index = tabs.indexOf(button.dataset.workspaceTab);
+    const next = event.key === 'ArrowRight' ? (index + 1) % tabs.length : event.key === 'ArrowLeft' ? (index + tabs.length - 1) % tabs.length : event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : -1;
+    if (next >= 0) { event.preventDefault(); setWorkspaceTab(tabs[next], true); }
+  });
+});
+$('workspace-drawer-close')?.addEventListener('click', closeWorkspaceDrawer);
+$('workspace-drawer')?.addEventListener('cancel', (event) => { event.preventDefault(); closeWorkspaceDrawer(); });
+$('workspace-drawer-content')?.addEventListener('click', async (event) => {
+  const copy = event.target.closest('[data-copy-value]');
+  if (copy) { await copyWorkspaceValue(copy.dataset.copyValue); return; }
+  const link = event.target.closest('[data-workspace-go]');
+  if (link) { closeWorkspaceDrawer(); setWorkspaceTab(link.dataset.workspaceGo, true); return; }
+  const edit = event.target.closest('[data-edit-deployment]');
+  if (edit && !state.deploymentBusy) { closeWorkspaceDrawer(); await openDeploymentEditor(edit.dataset.editDeployment); return; }
+  const install = event.target.closest('[data-install-artifact]');
+  if (install && !state.serverPluginBusy) {
+    closeWorkspaceDrawer(); setWorkspaceTab('plugins');
+    $('server-plugin-section').open = true;
+    $('server-plugin-artifact').value = install.dataset.installArtifact;
+    await previewServerPlugin();
+  }
+});
+$('plugin-grid').addEventListener('click', (event) => { const button = event.target.closest('[data-plugin-detail]'); if (button) openPluginDetails(button.dataset.pluginDetail, button); });
+$('plugin-install-open')?.addEventListener('click', () => { $('server-plugin-section').open = true; $('server-plugin-artifact').focus?.(); });
+$('artifact-upload-open')?.addEventListener('click', () => { $('artifact-upload-section').open = true; $('artifact-kind').focus?.(); });
+$('artifact-search')?.addEventListener('input', () => { state.artifactSearch = $('artifact-search').value; renderArtifacts(); });
+$('artifact-filter')?.addEventListener('change', () => { state.artifactFilter = $('artifact-filter').value; renderArtifacts(); });
 $('config-kind').addEventListener('change', () => loadConfig($('config-kind').value));
-$('config-json').addEventListener('input', rememberConfigDraft);
+$('config-json').addEventListener('input', () => { rememberConfigDraft(); renderConfigForm(); updateConfigControls(); });
+$('config-form')?.addEventListener('input', editCommonConfig);
+$('config-form')?.addEventListener('change', editCommonConfig);
 $('config-reload').addEventListener('click', () => { if (!configDirty()) return loadConfig(state.configKind, true); });
 $('config-discard').addEventListener('click', () => loadConfig(state.configKind, true));
 $('config-save').addEventListener('click', saveConfig);
+$('artifact-upload-form').addEventListener('submit', uploadArtifact);
+$('server-plugin-preview').addEventListener('click', previewServerPlugin);
+$('server-plugin-install').addEventListener('click', installServerPlugin);
+$('server-plugin-artifact').addEventListener('change', () => { state.serverPluginPreview = null; $('server-plugin-install').disabled = true; $('server-plugin-plan').textContent = ''; if ($('server-plugin-summary')) $('server-plugin-summary').textContent = ''; });
+$('artifacts-refresh').addEventListener('click', loadArtifacts);
+$('deployment-form').addEventListener('submit', saveDeployment);
+$('deployment-load').addEventListener('click', async () => {
+  const guided = state.deploymentEditorOpen && $('deployment-editor-mode').value === 'wizard';
+  const advancedOpen = Boolean($('deployment-advanced')?.open);
+  const loaded = await loadDeployment();
+  if (!loaded || !guided) return loaded;
+  const enabled = Object.entries(readDeploymentPatch().plugins || {}).find(([, item]) => item?.enabled)?.[0];
+  if (!enabled || ['coverage', 'stpcompare'].includes(enabled)) {
+    $('deployment-editor-mode').value = 'wizard';
+    if ($('deployment-advanced')) $('deployment-advanced').open = advancedOpen;
+    updateDeploymentMode();
+  }
+  return loaded;
+});
+$('deployment-new')?.addEventListener('click', () => openDeploymentEditor());
+$('deployment-close')?.addEventListener('click', closeDeploymentEditor);
+$('deployment-next')?.addEventListener('click', advanceDeploymentStep);
+$('deployment-back')?.addEventListener('click', () => { if (!state.deploymentBusy) showDeploymentStep($('deployment-editor-mode').value === 'json' ? 0 : state.deploymentStep - 1, true); });
+document.querySelectorAll('[data-deployment-step]').forEach((button) => button.addEventListener('click', () => {
+  const step = Number(button.dataset.deploymentStep);
+  if (!state.deploymentBusy && step <= state.deploymentStep) showDeploymentStep(step, true);
+}));
+$('deployment-editor-mode').addEventListener('change', () => {
+  if (state.deploymentBusy) return;
+  if ($('deployment-editor-mode').value === 'wizard') {
+    const source = JSON.stringify({ patch: $('deployment-patch').value, components: deploymentComponents() });
+    if (state.deploymentWizard && state.deploymentWizardSource === source) renderDeploymentWizard();
+    else importDeploymentWizard();
+  } else if (state.deploymentWizard) {
+    try {
+      const model = collectDeploymentWizard();
+      const draft = buildDeploymentWizard(readDeploymentPatch(), deploymentComponents(), model, state.artifacts, executionPluginNames());
+      $('deployment-patch').value = JSON.stringify(draft.config_patch, null, 2);
+      state.deploymentSelected = Object.fromEntries(draft.components.map((item) => [item.slot, item.artifact_id]));
+      state.deploymentWizard = model;
+      state.deploymentWizardSource = JSON.stringify({ patch: $('deployment-patch').value, components: deploymentComponents() });
+      state.deploymentPreview = '';
+      state.deploymentBinding = null;
+      $('deployment-bindings').hidden = true;
+      $('deployment-preview-status').textContent = '表单修改已同步到高级 JSON，发布时将使用当前配置和制品。';
+    } catch (error) {
+      $('deployment-editor-mode').value = 'wizard';
+      $('deployment-preview-status').textContent = `无法切换到高级 JSON：${error.message}。请先修正表单。`;
+      $('deployment-status').textContent = $('deployment-preview-status').textContent;
+    }
+  }
+  updateDeploymentMode();
+});
+$('deployment-plugin').addEventListener('change', () => {
+  if (state.deploymentBusy) return;
+  const plugin = $('deployment-plugin').value;
+  if (state.deploymentWizard) state.deploymentWizardDrafts[state.deploymentWizard.plugin] = collectDeploymentWizard();
+  state.deploymentWizard = state.deploymentWizardDrafts[plugin] || readDeploymentWizard(readDeploymentPatch(), deploymentComponents(), plugin);
+  renderDeploymentWizard(); state.deploymentWizardDirty = true;
+});
+$('deployment-import').addEventListener('click', () => importDeploymentWizard());
+$('deployment-preview').addEventListener('click', previewDeploymentWizard);
+$('deployment-bind-scheduler').addEventListener('click', bindDeploymentScheduler);
+$('deployment-wizard').addEventListener('input', deploymentWizardChanged);
+$('deployment-wizard').addEventListener('change', deploymentWizardChanged);
+for (const kind of ['execution', 'update']) $('deployment-' + kind + '-add').addEventListener('click', () => {
+  const window = state.deploymentWizard?.windows[kind]; if (!window) return;
+  window.mode = 'custom'; window.items.push({ days: [1, 2, 3, 4, 5, 6, 7], start: '09:00', end: '18:00' });
+  state.deploymentWizardDirty = true; renderDeploymentWindows(kind);
+});
+$('deployment-wizard').addEventListener('click', (event) => {
+  const button = event.target.closest('[data-window-remove]'); if (!button || !state.deploymentWizard) return;
+  const kind = button.dataset.windowRemove;
+  state.deploymentWizard.windows[kind].items.splice(Number(button.dataset.windowIndex), 1);
+  state.deploymentWizardDirty = true; renderDeploymentWindows(kind);
+});
+$('artifact-list').addEventListener('change', selectArtifact);
+$('artifact-list').addEventListener('click', (event) => { const button = event.target.closest('[data-artifact-detail]'); if (button) openArtifactDetails(button.dataset.artifactDetail, button); });
+$('deployment-list').addEventListener('click', (event) => {
+  const edit = event.target.closest('[data-edit-deployment]');
+  if (edit) return openDeploymentEditor(edit.dataset.editDeployment);
+  const detail = event.target.closest('[data-deployment-detail]');
+  if (detail) openDeploymentDetails(detail.dataset.deploymentDetail, detail);
+});
+$('deployment-rollback-button').addEventListener('click', rollbackDeployment);
+setWorkspaceTab(state.workspaceTab);
 $('run-cards').addEventListener('click', async (event) => { const button = event.target.closest('[data-open-run]'); if (!button) return; navigate('results'); await switchPlugin(button.dataset.openPlugin, button.dataset.openRun); });
 $('history-table').addEventListener('click', async (event) => { const row = event.target.closest('[data-open-run]'); if (!row) return; navigate('results'); await switchPlugin(row.dataset.openPlugin, row.dataset.openRun); });
 $('history-search-form').addEventListener('submit', async (event) => {
@@ -1334,11 +2092,10 @@ $('open-run-form').addEventListener('submit', async (event) => {
     $('open-run-status').textContent = '';
   } catch (error) { $('open-run-status').textContent = `无法打开运行：${error.message}`; }
 });
-$('result-type').addEventListener('change', () => switchPlugin($('result-type').value).catch((error) => addMessage('assistant', error.message)));
-$('result-run').addEventListener('change', () => selectRun($('result-run').value, $('result-type').value).catch((error) => addMessage('assistant', error.message)));
-$('provider').addEventListener('change', updateAiControls);
+$('result-type').addEventListener('change', () => switchPlugin($('result-type').value).catch((error) => { $('report-state').textContent = error.message; }));
+$('result-run').addEventListener('change', () => selectRun($('result-run').value, $('result-type').value).catch((error) => { $('report-state').textContent = error.message; }));
 $('refresh').addEventListener('click', () => loadAll().catch(showLoadError));
-$('ai-toggle').addEventListener('click', () => { $('console').dataset.aiOpen = String($('console').dataset.aiOpen !== 'true'); });
+$('ai-toggle').addEventListener('click', () => { $('console').dataset.aiOpen = String($('console').dataset.aiOpen !== 'true'); ensureDshWeb(); });
 $('ai-close').addEventListener('click', () => { $('console').dataset.aiOpen = 'false'; });
 $('ai-expand').addEventListener('click', toggleAiExpanded);
 $('text-smaller').addEventListener('click', () => setUiScale(state.uiScale - 0.1));
@@ -1347,35 +2104,20 @@ $('edit-plugin-view').addEventListener('click', openViewEditor);
 $('close-view-editor').addEventListener('click', closeViewEditor);
 $('save-view-editor').addEventListener('click', saveViewEditor);
 $('ai-design-view').addEventListener('click', designPluginView);
-$('design-view-from-chat').addEventListener('click', designPythonReport);
 $('ai-design-report').addEventListener('click', designPythonReport);
 $('run-report').addEventListener('click', () => runReport());
 $('edit-report-script').addEventListener('click', openReportEditor);
 $('close-report-editor').addEventListener('click', closeReportEditor);
 $('report-editor-text').addEventListener('input', rememberReportDraft);
-$('report-candidate-index').addEventListener('change', () => {
-  const candidate = state.reportEditorCandidate;
-  if (!candidate || state.reportEditorSaving) return;
-  const index = Number($('report-candidate-index').value);
-  if (!Number.isInteger(index) || index < 0 || index >= candidate.sources.length) return;
-  rememberReportDraft();
-  candidate.index = index;
-  showReportCandidateSource();
-});
 $('report-editor-dialog').addEventListener('cancel', () => { rememberReportDraft(); state.reportEditorRequest += 1; });
 $('save-report-editor').addEventListener('click', () => saveReportEditor());
 $('save-run-report-editor').addEventListener('click', () => saveReportEditor(true));
-$('new-conversation').addEventListener('click', newAiConversation);
+$('report-load-latest').addEventListener('click', loadLatestReportEditor);
 $('dsh-native-open').addEventListener('click', openDshWeb);
-$('dsh-native-frame').addEventListener('load', () => { $('dsh-native-status').textContent = 'DSH 原生界面已连接'; });
-$('dsh-native-frame').addEventListener('error', () => { $('dsh-native-status').textContent = 'DSH 界面加载失败，请重新连接。'; });
-document.querySelectorAll('[data-ai-tab]').forEach((button) => button.addEventListener('click', () => selectAiTab(button.dataset.aiTab)));
-$('chat-form').addEventListener('submit', async (event) => { event.preventDefault(); await submitChat(); });
-$('question').addEventListener('keydown', async (event) => {
-  if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
-  event.preventDefault();
-  await submitChat();
-});
+$('dsh-context-current').addEventListener('click', () => prepareDshContext());
+$('dsh-context-copy').addEventListener('click', copyDshContext);
+$('dsh-native-frame').addEventListener('load', () => { if (state.dshWebUrl) $('dsh-native-status').textContent = 'DSH 原生界面已连接'; });
+$('dsh-native-frame').addEventListener('error', () => { if (state.dshWebUrl) $('dsh-native-status').textContent = 'DSH 界面加载失败，请重新连接。'; });
 
 let resizeStart = null;
 $('ai-resize').addEventListener('pointerdown', (event) => {
@@ -1418,7 +2160,7 @@ function showLoadError(error) {
   setDotState('health-dot', 'offline');
   setDotState('api-dot', state.apiHealthy ? 'online' : 'offline');
   setDotState('footer-dot', 'offline');
-  addMessage('assistant', `加载失败：${error.message}`);
+  $('report-state').textContent = `加载失败：${error.message}`;
 }
 
 $('snapshot-time').textContent = '--';
@@ -1435,6 +2177,7 @@ if (typeof window.setInterval === 'function') {
   window.setInterval(async () => {
     if (document.hidden) return;
     if (['overview', 'clients', 'plugins'].includes(state.page)) await loadScheduler();
+    if (state.page === 'plugins' && !state.deploymentBusy && !state.artifactBusy) await loadArtifacts();
     if (state.page === 'logs' && $('logs-auto').checked && !state.logsBusy) await loadLogs();
   }, 5000);
 }

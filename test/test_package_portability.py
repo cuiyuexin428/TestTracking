@@ -7,8 +7,55 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class SourceArchiveTests(unittest.TestCase):
+    def test_archive_keeps_offline_inputs_without_browser_review_state(self):
+        with tempfile.TemporaryDirectory(prefix='source delivery ') as temporary:
+            root = Path(temporary)
+            source = root / 'TestTracking-02'
+            included = {
+                'client/src/Client.cpp',
+                'result_service/app/program_bindings.py',
+                'result_service/app/server_plugins.py',
+                'plugins/coverage/AI_CONTEXT.md',
+                'tools/build_plugin_bundle.py',
+                'tools/client_update.ps1',
+                'runtime/python/python.exe',
+                'runtime/python-analysis-wheelhouse/numpy.whl',
+                'runtime/dataset/sample.stp',
+                'third_party/lib/example.lib',
+                'third_party_src/downloads/dependency.zip',
+            }
+            excluded = {
+                'runtime/deployment_ui_review/service.json',
+                'runtime/deployment_ui_review/stdout.log',
+                'runtime/deployment_ui_review/artifacts/catalog.json',
+                'runtime/deployment_ui_review/artifacts/deployments.json',
+                'runtime/deployment_ui_review/artifacts/objects/test-object',
+                'runtime/pgdata/postgresql.conf',
+                'runtime/logs/service.log',
+                'build/stale.exe',
+            }
+            for relative in included | excluded:
+                path = source / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(relative.encode('utf-8'))
+            output = root / 'offline source.zip'
+            result = subprocess.run(
+                [sys.executable, '-B', str(ROOT / 'tools/create_source_archive.py'),
+                 str(source), str(output)],
+                cwd=root, capture_output=True, text=True, timeout=15)
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            with zipfile.ZipFile(output) as archive:
+                self.assertEqual({source.name + '/' + relative for relative in included},
+                                 set(archive.namelist()))
+                for relative in included:
+                    self.assertEqual(relative.encode('utf-8'),
+                                     archive.read(source.name + '/' + relative))
 
 
 @unittest.skipUnless(os.name == 'nt', 'Windows deployment packages')
@@ -29,6 +76,8 @@ class ClientPackageTests(unittest.TestCase):
         for name in ('msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140_atomic_wait.dll'):
             (self.crt / name).write_bytes(b'fixture CRT never executed')
         (self.program / 'CustomRunner.exe').write_bytes(b'fixture never executed')
+        (self.program / 'BaselineRunner.exe').write_bytes(b'baseline fixture')
+        (self.program / 'CandidateRunner.exe').write_bytes(b'candidate fixture')
         (self.program / 'TKernel.dll').write_bytes(b'fixture never executed')
         (self.coverage / 'OpenCppCoverage.exe').write_bytes(b'fixture never executed')
         (self.dataset / 'sample.stp').write_text('fixture data')
@@ -71,10 +120,57 @@ class ClientPackageTests(unittest.TestCase):
         self.assertIn('Release', result.stderr)
 
     def test_client_component_includes_runtime_without_program_inputs(self):
-        output, _ = self.build('-OnlyClient', '-Plugin', 'stpcompare')
-        plugin = json.loads((output / 'config/client.json').read_text())['plugins']['stpcompare']
-        self.assertEqual(plugin['program_exe'], 'testenv/program/Converter.exe')
+        output, _ = self.build('-OnlyClient', '-Plugin', 'stpcompare',
+                               '-DeploymentEndpoint', 'http://192.0.2.1:56330')
+        config = json.loads((output / 'config/client.json').read_text())
+        plugin = config['plugins']['stpcompare']
+        self.assertEqual(plugin['programs']['baseline']['executable'],
+                         'testenv/program/baseline/BaselineConverter.exe')
+        self.assertEqual(plugin['programs']['candidate']['executable'],
+                         'testenv/program/candidate/CandidateConverter.exe')
         self.assertTrue((output / 'vcruntime140.dll').exists())
+        self.assertTrue((output / 'tools/client_update.ps1').is_file())
+        self.assertEqual(config['client']['deployment_endpoint'], 'http://192.0.2.1:56330')
+        self.build('-OnlyClient')
+        retained = json.loads((output / 'config/client.json').read_text())
+        self.assertEqual(retained['client']['deployment_endpoint'], 'http://192.0.2.1:56330')
+
+    def test_stpcompare_package_contains_two_versioned_programs(self):
+        output, _ = self.build(
+            '-Plugin', 'stpcompare',
+            '-BaselineConverterExe', self.program / 'BaselineRunner.exe',
+            '-CandidateConverterExe', self.program / 'CandidateRunner.exe',
+            '-BaselineProgramVersion', 'old-7', '-CandidateProgramVersion', 'new-9',
+            '-DatasetDir', self.dataset)
+        plugin = json.loads((output / 'config/client.json').read_text())['plugins']['stpcompare']
+        baseline = output / plugin['programs']['baseline']['executable']
+        candidate = output / plugin['programs']['candidate']['executable']
+        self.assertTrue(baseline.is_file())
+        self.assertTrue(candidate.is_file())
+        self.assertNotEqual(baseline.parent, candidate.parent)
+        self.assertEqual((baseline.parent / 'version.txt').read_text(), 'old-7')
+        self.assertEqual((candidate.parent / 'version.txt').read_text(), 'new-9')
+
+        next_baseline = self.program / 'BaselineV2.exe'
+        next_candidate = self.program / 'CandidateV2.exe'
+        next_baseline.write_bytes(b'next baseline')
+        next_candidate.write_bytes(b'next candidate')
+        self.build('-OnlyProgram', '-Plugin', 'stpcompare',
+                   '-BaselineConverterExe', next_baseline,
+                   '-CandidateConverterExe', next_candidate,
+                   '-BaselineProgramVersion', 'old-8', '-CandidateProgramVersion', 'new-10')
+        updated = json.loads((output / 'config/client.json').read_text())['plugins']['stpcompare']
+        self.assertEqual(updated['programs']['baseline']['executable'],
+                         'testenv/program/baseline/BaselineV2.exe')
+        self.assertEqual(updated['programs']['candidate']['executable'],
+                         'testenv/program/candidate/CandidateV2.exe')
+        self.assertTrue((output / 'testenv/dataset/sample.stp').is_file())
+
+    def test_stpcompare_program_update_requires_both_programs(self):
+        _, result = self.build('-OnlyProgram', '-Plugin', 'stpcompare',
+                               '-BaselineConverterExe', self.program / 'BaselineRunner.exe',
+                               succeeds=False)
+        self.assertIn('both -BaselineConverterExe and -CandidateConverterExe', result.stderr)
 
     def test_dataset_update_needs_only_dataset_inputs(self):
         shutil.rmtree(self.bin)
@@ -121,7 +217,10 @@ class ClientPackageTests(unittest.TestCase):
         config['client'].update(worker_id='worker-production-07', task_threads=8, custom_setting={'keep': True})
         config['plugins']['stpcompare'].update(
             db_conn="host='db-production' port=6543 dbname='production' user='writer' password='secret' sslmode=require",
-            table='production_results', program_exe='testenv/program/ProductionConverter.exe',
+            table='production_results',
+            programs={
+                'baseline': {'executable': 'testenv/program/baseline/ProductionOld.exe'},
+                'candidate': {'executable': 'testenv/program/candidate/ProductionNew.exe'}},
             custom_plugin_setting={'threshold': 7})
         config_path.write_text(json.dumps(config), encoding='utf-8')
         self.build('-OnlyClient')
@@ -139,7 +238,10 @@ class ClientPackageTests(unittest.TestCase):
         config_path = output / 'config/client.json'
         config = json.loads(config_path.read_text())
         config['plugins']['stpcompare'] = {
-            'enabled': False, 'dll': 'stpcompare.dll', 'program_exe': 'testenv/program/KeepConverter.exe',
+            'enabled': False, 'dll': 'stpcompare.dll',
+            'programs': {
+                'baseline': {'executable': 'testenv/program/baseline/KeepOld.exe'},
+                'candidate': {'executable': 'testenv/program/candidate/KeepNew.exe'}},
             'table': 'custom_results', 'db_conn': 'dbname=custom user=custom', 'custom_setting': 42}
         config_path.write_text(json.dumps(config), encoding='utf-8')
         self.build('-OnlyClient', '-Plugin', 'stpcompare')
@@ -256,8 +358,15 @@ class ServerPackageTests(unittest.TestCase):
         template = json.loads((output / 'config/client.template.json').read_text(encoding='utf-8-sig'))
         self.assertFalse(template['plugins']['coverage']['dry_run'])
         self.assertEqual('../data/logs', config['logs_dir'])
+        self.assertEqual('../data/artifacts', config['artifact_store_dir'])
+        self.assertEqual(['../data/artifact_import'], config['artifact_import_roots'])
+        self.assertTrue((output / 'data/artifact_import').is_dir())
         self.assertIn('-NoNewWindow -PassThru', start_server)
         readme = (output / 'README.md').read_text(encoding='utf-8')
+        for name in ('自动部署使用指南.md', '服务端插件包格式.md', '已知限制.md'):
+            self.assertEqual((ROOT / 'docs' / name).read_bytes(),
+                             (output / 'docs' / name).read_bytes())
+            self.assertIn('docs/' + name, readme)
         self.assertIn('plugin_options.stpcompare.result_table', readme)
         self.assertNotIn('Set stp_result_table', readme)
         for port in ('TCP 5555', 'TCP 5432', 'TCP 56330'):
@@ -268,7 +377,8 @@ class ServerPackageTests(unittest.TestCase):
         manifest = json.loads((output / 'data/result_views/resources.manifest').read_text(encoding='utf-8'))
         expected = {}
         for view in (ROOT / 'plugins').glob('*/result_view.json'):
-            resources = ['view']
+            resources = ['view', 'ai_context']
+            self.assertTrue((output / 'result_service/plugin_ai_contexts' / (view.parent.name + '.md')).is_file())
             for filename, resource in (('result_adapter.py', 'adapter'), ('result_report.py', 'report_template')):
                 if (view.parent / filename).is_file():
                     resources.append(resource)
@@ -284,12 +394,14 @@ class ServerPackageTests(unittest.TestCase):
             "from result_service.app.config import ServiceConfig; "
             "from result_service.app.server import ResultService; "
             "service=ResultService(replace(ServiceConfig.from_file(root/'config/result_service.json'),db_conn='')); "
-            "print(json.dumps(sorted(service.plugins))); service.close()",
+            "print(json.dumps({'plugins':sorted(service.plugins),'artifacts':str(service.artifacts.root.relative_to(root))})); service.close()",
             str(moved)], cwd=self.root, capture_output=True, encoding='utf-8', errors='replace', timeout=15,
             env={key: value for key, value in os.environ.items() if not key.startswith('RESULT_SERVICE_')},
             creationflags=subprocess.CREATE_NO_WINDOW)
         self.assertEqual(0, probe.returncode, probe.stdout + probe.stderr)
-        self.assertEqual(sorted(expected), json.loads(probe.stdout))
+        loaded = json.loads(probe.stdout)
+        self.assertEqual(sorted(expected), loaded['plugins'])
+        self.assertEqual('data\\artifacts', loaded['artifacts'])
 
 
 if __name__ == '__main__':

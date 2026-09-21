@@ -7,15 +7,12 @@
 #include <atomic>
 
 #include "stpcompare.pb.h"
-#include "stpcompare/StpUtil.h"
-
 #include <json.hpp>
 
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <string>
-#include <thread>
 
 namespace stpcompare {
 
@@ -71,6 +68,30 @@ std::string ReadVersionFile(const std::string& path) {
     return version;
 }
 
+std::string CompositeProgramVersion(const std::string& baseline,const std::string& candidate) {
+    return "baseline="+baseline+";candidate="+candidate;
+}
+
+bool ContainsPlaceholder(const std::vector<std::string>& arguments,const std::string& placeholder) {
+    for(const auto& argument:arguments)
+        if(argument.find(placeholder)!=std::string::npos) return true;
+    return false;
+}
+
+void AddRawOutput(const std::string& role,const std::string& stage,
+                  const std::string& version,const std::string& filename,
+                  std::string content,FileResult* output) {
+    RawOutput raw;
+    raw.program_role=role;
+    raw.export_stage=stage;
+    raw.program_version=version;
+    raw.original_filename=filename;
+    raw.content_size=content.size();
+    raw.content_sha256=common::Sha256Hex(content);
+    raw.content=std::move(content);
+    output->outputs.push_back(std::move(raw));
+}
+
 }  // namespace
 
 std::string ClientPlugin::pluginType() const {
@@ -81,19 +102,8 @@ bool ClientPlugin::init(const std::string& config) {
     const nlohmann::json cfg = nlohmann::json::parse(config);
     dry_run_ = cfg.value("dry_run", true);
     stp_root_ = cfg.value("stp_root", std::string());
-    program_exe_ = cfg.value("program_exe", std::string());
-    program_cmd_ = cfg.value("program_cmd", std::string());
-    program_args_=cfg.value("program_args",std::vector<std::string>{"{stp}"});
-    // Legacy templates are tokenized before substitution, so filenames can
-    // never create additional arguments or shell syntax.
-    if(!program_cmd_.empty()) {
-        std::vector<std::string> parsed;
-        if(!ParseProgramArguments(program_cmd_,&parsed) || parsed.empty()) return false;
-        program_exe_=parsed.front();
-        program_args_.assign(parsed.begin()+1,parsed.end());
-    }
-    info_file_ = cfg.value("info_file", std::string("info.txt"));
-    info_new_file_ = cfg.value("info_new_file", std::string("info_new.txt"));
+    if(!ReadProgram(cfg,"baseline",&baseline_) || !ReadProgram(cfg,"candidate",&candidate_))
+        return false;
     work_base_ = cfg.value("work_dir", std::string("stp_compare_work"));
     if (work_base_.empty()) {
         work_base_ = "stp_compare_work";
@@ -102,27 +112,23 @@ bool ClientPlugin::init(const std::string& config) {
     dry_run_delay_ms_ = cfg.value("dry_run_delay_ms", 0);
     process_timeout_ms_=cfg.value("process_timeout_ms",300000);
     if(process_timeout_ms_<=0) return false;
-    const std::string program_dir = cfg.value("program_dir", std::string());
     const std::string dataset_version_file =
         cfg.value("dataset_version_file", std::string());
 
-    program_version_ = ReadVersionFile(program_dir + "/version.txt");
     dataset_version_ =
         dataset_version_file.empty() ? ReadVersionFile(stp_root_ + "/version.txt")
                                      : ReadVersionFile(dataset_version_file);
 
     if (!dry_run_) {
-        if (stp_root_.empty() || (program_exe_.empty() && program_cmd_.empty())) {
-            LOG_ERROR(
-                "stp_compare plugin: stp_root and program_exe/program_cmd are required "
-                "when dry_run=false");
+        if (stp_root_.empty()) {
+            LOG_ERROR("stpcompare plugin: stp_root is required when dry_run=false");
             return false;
         }
-        if (!program_cmd_.empty() || !program_exe_.empty()) {
+        for(const auto* program:{&baseline_,&candidate_}) {
             std::error_code ec;
-            if (!program_exe_.empty() &&
-                (!std::filesystem::exists(program_exe_, ec) || ec)) {
-                LOG_ERROR("stp_compare plugin: program_exe not found: " << program_exe_);
+            if (!std::filesystem::is_regular_file(program->executable,ec) || ec) {
+                LOG_ERROR("stpcompare plugin: "<<program->role<<" executable not found: "
+                          <<program->executable);
                 return false;
             }
         }
@@ -141,9 +147,41 @@ bool ClientPlugin::init(const std::string& config) {
     return true;
 }
 
+bool ClientPlugin::ReadProgram(const nlohmann::json& config,const std::string& role,
+                               Program* program) {
+    if(!program || !config.contains("programs") || !config["programs"].is_object() ||
+       !config["programs"].contains(role) || !config["programs"][role].is_object()) {
+        LOG_ERROR("stpcompare plugin: programs."<<role<<" is required");
+        return false;
+    }
+    const auto& item=config["programs"][role];
+    program->role=role;
+    program->executable=item.value("executable",std::string());
+    program->arguments=item.value("arguments",std::vector<std::string>{
+        "--input","{stp}","--output-dir","{outdir}"});
+    if(program->executable.empty() || program->arguments.empty() ||
+       !ContainsPlaceholder(program->arguments,"{stp}") ||
+       !ContainsPlaceholder(program->arguments,"{outdir}")) {
+        LOG_ERROR("stpcompare plugin: programs."<<role
+                  <<" needs executable and argument placeholders {stp}, {outdir}");
+        return false;
+    }
+    const auto version_file=item.value("version_file",std::string());
+    program->version=item.value("version",std::string());
+    if(program->version.empty()) {
+        const auto path=version_file.empty()
+            ? std::filesystem::path(program->executable).parent_path()/"version.txt"
+            : std::filesystem::path(version_file);
+        program->version=ReadVersionFile(path.string());
+    }
+    return true;
+}
+
 bool ClientPlugin::collectRegistrationInfo(std::string* payload) {
     stpcompare::StpCompareClientInfo info;
-    info.set_program_version(program_version_);
+    info.set_baseline_program_version(baseline_.version);
+    info.set_candidate_program_version(candidate_.version);
+    info.set_program_version(CompositeProgramVersion(baseline_.version,candidate_.version));
     info.set_dataset_version(dataset_version_);
     return info.SerializeToString(payload);
 }
@@ -153,7 +191,43 @@ common::RegisterOutcome ClientPlugin::handleValidationReply(const std::string&) 
 }
 
 std::string ClientPlugin::heartbeatInfo() const {
-    return "program=" + program_version_ + ",dataset=" + dataset_version_;
+    return "baseline="+baseline_.version+",candidate="+candidate_.version+
+        ",dataset="+dataset_version_;
+}
+
+bool ClientPlugin::RunProgram(const Program& program,const std::filesystem::path& task_dir,
+                              const std::string& stp_path,const std::string& file,
+                              const std::string& run_id,FileResult* output,
+                              const common::CancellationToken& cancellation) {
+    const auto outdir=task_dir/program.role;
+    std::error_code ec;
+    if(!std::filesystem::create_directory(outdir,ec) || ec) {
+        output->detail="cannot create "+program.role+" output directory";
+        return false;
+    }
+    common::ProcessOptions options;
+    options.executable=std::filesystem::absolute(program.executable).string();
+    options.arguments=program.arguments;
+    options.working_directory=outdir.string();
+    options.timeout=std::chrono::milliseconds(process_timeout_ms_);
+    for(auto& argument:options.arguments)
+        argument=ExpandArgumentTemplate(argument,stp_path,outdir.string(),file,run_id);
+    const auto process=common::ProcessRunner::run(options,cancellation);
+    if(!process.started || process.exit_code!=0 || process.cancelled || process.timed_out) {
+        output->detail=process.cancelled?"cancelled":process.timed_out?
+            program.role+" process timed out":program.role+" converter failed: "+
+            std::to_string(process.exit_code)+" "+process.error;
+        return false;
+    }
+    std::string first,second;
+    if(!common::ReadCompleteFile(outdir/"info.txt",&first) ||
+       !common::ReadCompleteFile(outdir/"info_new.txt",&second)) {
+        output->detail=program.role+" did not produce info.txt and info_new.txt";
+        return false;
+    }
+    AddRawOutput(program.role,"first",program.version,"info.txt",std::move(first),output);
+    AddRawOutput(program.role,"second",program.version,"info_new.txt",std::move(second),output);
+    return true;
 }
 
 bool ClientPlugin::RunOneFile(const std::string& run_id, const std::string& file,
@@ -171,24 +245,12 @@ bool ClientPlugin::RunOneFile(const std::string& run_id, const std::string& file
         ~Cleanup() { if(!keep) { std::error_code ignored; std::filesystem::remove_all(path,ignored); } }
     } cleanup{outdir,keep_work_};
     const auto stp_path=std::filesystem::absolute(std::filesystem::path(stp_root_)/file).string();
-    common::ProcessOptions options;
-    options.executable=std::filesystem::absolute(program_exe_).string();
-    options.arguments=program_args_;
-    options.working_directory=outdir.string();
-    options.timeout=std::chrono::milliseconds(process_timeout_ms_);
-    for (auto& argument : options.arguments)
-        argument = ExpandArgumentTemplate(argument, stp_path, outdir.string(), file, run_id);
-    const auto process=common::ProcessRunner::run(options,cancellation);
-    if(!process.started || process.exit_code!=0 || process.cancelled || process.timed_out) {
-        output->detail=process.cancelled?"cancelled":process.timed_out?"process timed out":
-            "converter failed: "+std::to_string(process.exit_code)+" "+process.error;
+    if(!RunProgram(baseline_,outdir,stp_path,file,run_id,output,cancellation) ||
+       !RunProgram(candidate_,outdir,stp_path,file,run_id,output,cancellation)) {
+        output->outputs.clear();
         return false;
     }
-    if(!common::ReadCompleteFile(outdir/info_file_,&output->info_txt) ||
-       !common::ReadCompleteFile(outdir/info_new_file_,&output->info_new_txt)) {
-        output->detail="missing converter output"; return false;
-    }
-    return true;
+    return output->outputs.size()==4;
 }
 
 bool ClientPlugin::execute(const common::Task& task, common::TaskResult& result) {
@@ -217,8 +279,12 @@ bool ClientPlugin::execute(const common::Task& task, common::TaskResult& result,
                 result.set_exit_code(-2); return false;
             }
             output.successful=true;
-            output.info_txt="dry-run file="+file+"\n";
-            output.info_new_txt="dry-run file="+file+" (converted)\n";
+            for(const auto* program:{&baseline_,&candidate_}) {
+                AddRawOutput(program->role,"first",program->version,"info.txt",
+                             "dry-run role="+program->role+" file="+file+" first\n",&output);
+                AddRawOutput(program->role,"second",program->version,"info_new.txt",
+                             "dry-run role="+program->role+" file="+file+" second\n",&output);
+            }
         } else output.successful=RunOneFile(payload.run_id(),file,&output,cancellation);
         if(cancellation.isCancellationRequested()) { result.set_exit_code(-2); return false; }
         if(!cached && !store_->publish(output)) {

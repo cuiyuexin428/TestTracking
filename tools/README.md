@@ -77,18 +77,62 @@ TestTracking 与 DSH dist 一起复制到内网后，可运行
 它默认编译 Release、初始化 PostgreSQL、生成数据 manifest 和客户端包、从本地 wheelhouse
 安装 Python 分析依赖，并生成 `runtime/result_service.json` 和启动入口。
 `plugin=coverage` 使用 `step_test_exe` 与 `opencppcoverage_dir`；
-`plugin=stpcompare` 使用 `converter_exe`。两者的客户端包均携带完整 STP 数据。
+`plugin=stpcompare` 使用 `baseline_converter_exe`、`candidate_converter_exe` 以及各自的
+程序版本。两个程序分别打包到独立目录，均通过 `--input` 和 `--output-dir` 接收本次任务路径。
+两类客户端包均携带完整 STP 数据。
+
+## 客户端自动更新
+
+完整客户端包携带 `tools/client_update.ps1`。它使用 Windows PowerShell 5.1 和 .NET，
+不需要 Python、npm 或外网；由客户端 Agent 调用，不是独立启动器。
+在基础 `config/client.json` 设置唯一 `client.worker_id` 及
+`client.deployment_endpoint=http://<服务器IP>:56330` 后，Agent 轮询网页服务的部署期望。
+`build_package.ps1 -DeploymentEndpoint <地址>` 可在打包时写入该入口。
+
+脚本负责下载、SHA-256 校验、安全解压和生成不可变配置：
+
+```text
+客户端目录/deployments/
+  objects/<sha256>/archive              原始制品
+  objects/<sha256>/content/             ZIP 解压内容
+  objects/raw/<content_and_filename_sha256>/content/  普通文件（按内容和文件名隔离）
+  releases/<revision>/client.json       合并后的配置
+  active.json                          Agent 确认已注册成功的版本
+  agent_report.json                     待提交的客户端部署状态
+```
+
+脚本只做准备，不覆盖运行中的 DLL、数据或基础配置；Agent 等待当前任务和结果上报完成，
+再启动单个插件 Worker 子进程。注册成功后才更新 `active.json`；失败恢复之前的配置。
+`execution_windows` 只控制新任务请求，`update_windows` 控制下载和激活；查询期望和上报
+部署状态不受更新窗口限制。两种窗口均使用客户端本机时间，空数组表示全天开放。
+
+网页“插件与配置”提供单客户端部署向导及高级 JSON 编辑，可选择制品、包内路径、STP
+双程序参数与独立时间窗，预览后按所读 revision 发布 `config_patch`。内置插件引用程序
+制品时，服务端按制品 SHA-256、执行入口及参数等配置派生注册版本；“保存服务端匹配
+配置”将其写入 expected 字段，要求相关插件没有未完成任务，并在保存后重启调度器。
+本机程序路径仍可使用原 `version.txt`；包外依赖的内容不会自动纳入程序身份。
+
+含 `server_plugin.json` 的完整服务端插件 ZIP 可单独预览并安装到独立目录，配套资源
+通过完整快照切换，两份配置 revision 防止覆盖他人修改，备份与事务记录处理失败恢复。
+普通客户端插件上传不会触发服务端安装。新服务端插件需手工启用，安装后重启调度器和
+结果服务。尚无跨客户端批量发布事务或框架 EXE 自更新；框架协议升级仍须使用兼容的
+完整服务端和客户端包。ZIP 结构、版本约定、双程序配置及回滚步骤见
+[自动部署使用指南](../docs/自动部署使用指南.md)。
+
+## 服务启动与本地配置
 
 运行 `runtime/start_server.bat` 启动调度器和网页，浏览器访问
 `http://<服务器IP>:56330/`；`runtime/start_result_service.bat` 单独启动网页，
 `runtime/stop_result_service.bat` 停止网页服务。调度器退出后，网页仍可查询数据库和生成报告。
 配置页编辑的调度配置位于 `runtime/scheduler.json`，后续重新编译 Release 不会覆盖它；
-客户端配置指向生成包的 `config/client.json`，使用 `-SkipPackage` 时指向明确标注的
+普通配置编辑区的客户端配置指向生成包的 `config/client.json`，使用 `-SkipPackage` 时指向明确标注的
 `runtime/client.template.json`，正式模板默认关闭模拟执行，业务路径需补入。
 日志集中在 `runtime/logs`。`management_port` 默认 5556，仅本机访问；
 `result_port` 默认 56330，防火墙同时开放网页、任务和数据库端口。
 已安装分析依赖时可用 `-SkipPythonAnalysis`；脚本不会在线补下载缺失依赖。
-DSH 仍用 `setup_offline_dependencies.ps1` 配置内网模型接口；自定义 CLI 路径可写入
+AI 仅支持 DSH。每个浏览器操作身份拥有独立聊天历史和原生 DSH Web 进程，使用服务器
+同一 Windows 账号的模型配置，不代表数据库或文件权限隔离。DSH 仍用
+`setup_offline_dependencies.ps1` 配置内网模型接口；自定义 CLI 路径可写入
 `offline_deploy.json` 的 `dsh_command`。再次部署会保留结果服务中的 AI 提供商配置。
 一键部署自己初始化的 PostgreSQL 会记录准确的数据目录，联合启动入口在系统重启后会
 按需启动这一实例；使用 `-SkipDatabase` 时不托管数据库启动。数据源不要设为

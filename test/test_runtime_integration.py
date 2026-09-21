@@ -5,8 +5,10 @@ created below build/test/runtime-integration-*. Failed-case logs are retained.
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import ctypes
 from ctypes import wintypes
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,6 +21,8 @@ import tempfile
 import time
 import unittest
 import uuid
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_coverage_settle import PrivatePostgres, sql_text
@@ -110,6 +114,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.server_number = 0
         self.client_number = 0
         self.endpoint = f'tcp://127.0.0.1:{unused_port()}'
+        self.management_url = f'http://127.0.0.1:{unused_port()}'
         self.store = self.root / 'store'
         self.store.mkdir()
         self.manifest = self.root / 'manifest.txt'
@@ -138,6 +143,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
                   'store_dir': str(self.store), 'db_conn': self.conn}
         self.server_json = {
             'server': {'router_endpoint': self.endpoint, 'poll_timeout_ms': 10,
+                       'management_endpoint': self.management_url,
                        'process_threads': 2, 'client_timeout_ms': client_timeout_ms,
                        'task_lease_timeout_ms': 0},
             'plugins': {'coverage': dict(plugin, stp_manifest=str(self.manifest), task_size=1,
@@ -193,11 +199,26 @@ class RuntimeIntegrationTests(unittest.TestCase):
                    'client registration')
         self.assertIsNone(self.client.process.poll(), self.client.text())
 
-    def start_run(self, label=''):
+    def start_run(self):
         previous = self.server.text().count('run started:')
-        self.server.send(f'run coverage d1 {label}'.strip())
+        self.server.send('run coverage d1')
         self.until(lambda: self.server.text().count('run started:') > previous, 'run start')
         return re.findall(r'run started: (\S+)', self.server.text())[-1]
+
+    def management_command(self, **body):
+        request = Request(self.management_url + '/commands',
+                          data=json.dumps(body).encode('utf-8'),
+                          headers={'Content-Type': 'application/json'})
+        try:
+            response = urlopen(request, timeout=10)
+        except HTTPError as error:
+            response = error
+        with response:
+            return response.status, json.load(response)
+
+    def management_status(self):
+        with urlopen(self.management_url + '/status', timeout=3) as response:
+            return json.load(response)
 
     def finished(self, run_id):
         self.until(lambda: self.sql('SELECT status FROM runs WHERE run_id=' + sql_text(run_id)) == 'finished',
@@ -211,10 +232,475 @@ class RuntimeIntegrationTests(unittest.TestCase):
                  f"CREATE TRIGGER runtime_failure BEFORE INSERT OR UPDATE ON {table} "
                  "FOR EACH ROW EXECUTE FUNCTION inject_fault();")
 
-    def test_stop_then_run_and_wakeup_follow_command_order(self):
+    def test_forced_rerun_queues_and_starts_after_original_run(self):
+        self.start_server()
+        self.start_client()
+        code, first = self.management_command(
+            action='run', plugin_type='coverage', dataset_version='d1')
+        self.assertEqual(200, code, first)
+        self.assertEqual('running', first['status'])
+        code, second = self.management_command(
+            action='run', plugin_type='coverage', dataset_version='d1', force_rerun=True,
+            force_rerun_reason='repeat the same workload after the current run completes')
+        self.assertEqual(200, code, second)
+        self.assertEqual(first['run_id'], second['rerun_of'])
+        self.assertEqual('queued', second['status'])
+        self.assertEqual(
+            self.sql('SELECT status FROM runs WHERE run_id=' + sql_text(second['run_id'])),
+            'queued')
+        self.finished(first['run_id'])
+        self.finished(second['run_id'])
+        starts = re.findall(r'run started: (\S+)', self.server.text())
+        self.assertLess(starts.index(first['run_id']), starts.index(second['run_id']))
+
+    def test_queue_survives_restart_behind_restored_active_run(self):
+        self.configure(delay=3500)
+        self.start_server()
+        self.start_client()
+        code, first = self.management_command(
+            action='run', plugin_type='coverage', dataset_version='d1')
+        self.assertEqual(200, code, first)
+        code, second = self.management_command(
+            action='run', plugin_type='coverage', dataset_version='d1', force_rerun=True,
+            force_rerun_reason='repeat the workload after recovery of the active run')
+        self.assertEqual(200, code, second)
+        self.assertEqual('queued', second['status'])
+        self.until(lambda: self.sql("SELECT count(*) FROM tasks WHERE status='acked'") == '1',
+                   'active task delivery before queue recovery')
+        self.server.crash()
+        self.assertEqual(
+            self.sql('SELECT status FROM runs WHERE run_id=' + sql_text(second['run_id'])),
+            'queued')
+        self.start_server()
+        self.until(lambda: 'run restored: ' + first['run_id'] in self.server.text(),
+                   'active run restored before queued work')
+        self.assertEqual(
+            self.sql('SELECT status FROM runs WHERE run_id=' + sql_text(second['run_id'])),
+            'queued')
+        self.finished(first['run_id'])
+        self.finished(second['run_id'])
+
+    def test_finished_duplicate_is_blocked_and_forced_rerun_is_audited(self):
+        self.configure(delay=100)
+        self.start_server()
+        self.start_client()
+        command = {'action': 'run', 'plugin_type': 'coverage', 'dataset_version': 'd1'}
+        code, missing = self.management_command(
+            **command, force_rerun=True, force_rerun_reason='there is no previous run')
+        self.assertEqual(409, code, missing)
+        self.assertEqual('0', self.sql('SELECT count(*) FROM runs'))
+        code, first = self.management_command(**command)
+        self.assertEqual(200, code, first)
+        self.finished(first['run_id'])
+        for params in ({}, {'params': ''}, {'params': {}}, {'params': ' { } '}, {'params': ' \t\r\n '}):
+            with self.subTest(params=params):
+                code, duplicate = self.management_command(**command, **params)
+                self.assertEqual(409, code, duplicate)
+                self.assertTrue(duplicate['duplicate'])
+                self.assertEqual(first['run_id'], duplicate['run_id'])
+                self.assertEqual('finished', duplicate['status'])
+                self.assertEqual('1', self.sql('SELECT count(*) FROM runs'))
+        self.assertEqual('t', self.sql('SELECT params=\'\' FROM runs WHERE run_id=' + sql_text(first['run_id'])))
+        code, forced = self.management_command(
+            **command, force_rerun=True,
+            force_rerun_reason='validate after repairing the execution environment')
+        self.assertEqual(200, code, forced)
+        self.assertEqual(first['run_id'], forced['rerun_of'])
+        audit = self.sql(
+            "SELECT force_rerun,force_rerun_reason,rerun_of,"
+            "work_fingerprint=(SELECT work_fingerprint FROM runs WHERE run_id=" +
+            sql_text(first['run_id']) + ") FROM runs WHERE run_id=" +
+            sql_text(forced['run_id']))
+        self.assertEqual(
+            't|validate after repairing the execution environment|' + first['run_id'] + '|t',
+            audit)
+        self.finished(forced['run_id'])
+
+    def test_business_failure_allows_retry_but_older_success_still_blocks_duplicates(self):
+        self.use_stpcompare()
+        (self.dataset / 'sample.stp').write_text('STP', encoding='utf-8')
+        failure = self.program / 'fail.marker'
+        failure.write_text('unavailable execution dependency', encoding='utf-8')
+        converter = self.program / 'converter.py'
+        converter.write_text(
+            'import sys\nfrom pathlib import Path\n'
+            'args=dict(zip(sys.argv[1::2],sys.argv[2::2])); '
+            'out=Path(args["--output-dir"])\n'
+            'if Path(__file__).with_name("fail.marker").exists(): sys.exit(7)\n'
+            '(out/"info.txt").write_text("first")\n'
+            '(out/"info_new.txt").write_text("second")\n', encoding='utf-8')
+        plugin = self.client_json['plugins']['stpcompare']
+        plugin.update(dry_run=False, work_dir=str(self.root / 'work'))
+        for role in ('baseline', 'candidate'):
+            plugin['programs'][role]['arguments'] = [
+                str(converter), '--input', '{stp}', '--output-dir', '{outdir}']
+        self.write_configs()
+        self.start_server()
+        self.start_client()
+        command = {'action': 'run', 'plugin_type': 'stpcompare', 'dataset_version': 'd1'}
+        self.fault_trigger("TG_OP='UPDATE' AND NEW.status='reported'", table='tasks')
+        code, first = self.management_command(**command)
+        self.assertEqual(200, code, first)
+        self.until(lambda: self.sql('SELECT exit_code FROM plugin_task_completions WHERE run_id='
+                                   + sql_text(first['run_id'])) == '1',
+                   'failed business outcome committed before the framework report')
+        self.server.crash()
+        self.sql('DROP TRIGGER runtime_failure ON tasks; DROP FUNCTION inject_fault(); '
+                 'DROP TABLE fault_gate;')
+        self.start_server()
+        self.finished(first['run_id'])
+        self.assertEqual('reported|1', self.sql('SELECT status,exit_code FROM tasks WHERE run_id='
+                                               + sql_text(first['run_id'])))
+        code, forced_failure = self.management_command(
+            **command, force_rerun=True, force_rerun_reason='diagnose the failed execution')
+        self.assertEqual(200, code, forced_failure)
+        self.assertEqual(first['run_id'], forced_failure['rerun_of'])
+        self.finished(forced_failure['run_id'])
+        self.assertEqual('1', self.sql('SELECT exit_code FROM tasks WHERE run_id='
+                                      + sql_text(forced_failure['run_id'])))
+        # Repair the environment without changing program/data identity.
+        failure.unlink()
+        code, successful = self.management_command(**command)
+        self.assertEqual(200, code, successful)
+        self.finished(successful['run_id'])
+        self.assertEqual('reported|0', self.sql('SELECT status,exit_code FROM tasks WHERE run_id='
+                                               + sql_text(successful['run_id'])))
+        failure.write_text('dependency unavailable again', encoding='utf-8')
+        code, latest = self.management_command(
+            **command, force_rerun=True, force_rerun_reason='verify repaired dependency')
+        self.assertEqual(200, code, latest)
+        self.assertEqual(successful['run_id'], latest['rerun_of'])
+        self.finished(latest['run_id'])
+        self.assertEqual('1', self.sql('SELECT exit_code FROM tasks WHERE run_id='
+                                      + sql_text(latest['run_id'])))
+        self.server.crash()
+        self.start_server()
+        code, duplicate = self.management_command(**command)
+        self.assertEqual(409, code, duplicate)
+        self.assertEqual(successful['run_id'], duplicate['run_id'])
+        self.assertEqual('finished', duplicate['status'])
+        self.assertEqual('4', self.sql('SELECT count(*) FROM runs'))
+        # A legacy/cleaned record without task evidence cannot prove success.
+        self.sql('DELETE FROM tasks WHERE run_id=' + sql_text(successful['run_id']))
+        code, unknown = self.management_command(**command)
+        self.assertEqual(200, code, unknown)
+        self.finished(unknown['run_id'])
+        self.assertEqual('5', self.sql('SELECT count(*) FROM runs'))
+
+    def test_selected_workers_are_preserved_across_active_and_queued_recovery(self):
+        self.configure(delay=200)
+        self.start_server()
+        code, first = self.management_command(
+            action='run', plugin_type='coverage', dataset_version='d1',
+            worker_ids=['selected/coverage'])
+        self.assertEqual(200, code, first)
+        code, second = self.management_command(
+            action='run', plugin_type='coverage', dataset_version='d1',
+            worker_ids=['later/coverage'], force_rerun=True,
+            force_rerun_reason='verify the same workload on the other selected worker')
+        self.assertEqual(200, code, second)
+        self.assertEqual('queued', second['status'])
+        self.server.crash()
+        self.start_server()
+        with urlopen(self.management_url + '/status', timeout=3) as response:
+            status = json.load(response)
+        self.assertEqual(['selected/coverage'], status['active_runs'][0]['worker_ids'])
+        self.assertEqual(['later/coverage'], status['queued_runs'][0]['worker_ids'])
+
+        # The agent base ID is deliberately a prefix of the selected identity.
+        # It must not match the plugin-specific selection.
+        self.client_json['client']['worker_id'] = 'selected'
+        self.write_configs()
+        self.start_client()
+        time.sleep(.3)
+        self.assertEqual('0', self.sql('SELECT count(*) FROM tasks'))
+        self.client_json['client']['worker_id'] = 'selected/coverage'
+        self.write_configs()
+        self.start_client()
+        self.finished(first['run_id'])
+        self.assertEqual('selected/coverage', self.sql(
+            'SELECT DISTINCT client_identity FROM tasks WHERE run_id=' + sql_text(first['run_id'])))
+        self.assertEqual('0', self.sql(
+            'SELECT count(*) FROM tasks WHERE run_id=' + sql_text(second['run_id'])))
+        self.client_json['client']['worker_id'] = 'later/coverage'
+        self.write_configs()
+        self.start_client()
+        self.finished(second['run_id'])
+        self.assertEqual('later/coverage', self.sql(
+            'SELECT DISTINCT client_identity FROM tasks WHERE run_id=' + sql_text(second['run_id'])))
+        code, duplicate = self.management_command(
+            action='run', plugin_type='coverage', dataset_version='d1',
+            worker_ids=['different-machine'])
+        self.assertEqual(409, code, duplicate)
+        self.assertEqual(second['run_id'], duplicate['run_id'])
+
+    def test_manifest_change_blocks_queued_run_across_restart_until_restored(self):
+        self.configure(delay=200)
+        original_manifest = self.manifest.read_text(encoding='utf-8')
+        self.start_server()
+        code, first = self.management_command(
+            action='run', plugin_type='coverage', dataset_version='d1')
+        self.assertEqual(200, code, first)
+        code, queued = self.management_command(
+            action='run', plugin_type='coverage', dataset_version='d1', force_rerun=True,
+            force_rerun_reason='repeat the original manifest after the active run')
+        self.assertEqual(200, code, queued)
+        original_identity = self.sql('SELECT work_fingerprint,execution_fingerprint FROM runs WHERE run_id='
+                                     + sql_text(queued['run_id']))
+        self.manifest.write_text('replacement.stp,1\n', encoding='utf-8')
+        self.start_client()
+        self.finished(first['run_id'])
+        self.until(lambda: self.management_status()['queued_runs'][0]['blocked'],
+                   'changed manifest blocks queued planning')
+        self.assertIn('restore the original', self.management_status()['queued_runs'][0]['blocked_reason'])
+        self.assertEqual('0', self.sql('SELECT count(*) FROM plugin_runs WHERE run_id='
+                                      + sql_text(queued['run_id'])))
+        self.server.crash()
+        self.start_server()
+        self.assertTrue(self.management_status()['queued_runs'][0]['blocked'])
+        self.assertEqual('queued', self.sql('SELECT status FROM runs WHERE run_id='
+                                           + sql_text(queued['run_id'])))
+        self.assertEqual(original_identity, self.sql(
+            'SELECT work_fingerprint,execution_fingerprint FROM runs WHERE run_id=' + sql_text(queued['run_id'])))
+        self.manifest.write_text(original_manifest, encoding='utf-8')
+        self.finished(queued['run_id'])
+        self.assertEqual('sample.stp', self.sql(
+            'SELECT file FROM plugin_run_files WHERE run_id=' + sql_text(queued['run_id'])))
+
+    def test_changed_expected_program_keeps_queue_cancellable_after_restart(self):
+        self.configure(delay=200)
+        original_manifest = self.manifest.read_text(encoding='utf-8')
+        self.start_server()
+        code, first = self.management_command(
+            action='run', plugin_type='coverage', dataset_version='d1')
+        self.assertEqual(200, code, first)
+        code, queued = self.management_command(
+            action='run', plugin_type='coverage', dataset_version='d1', force_rerun=True,
+            force_rerun_reason='queue a repeat before the expected program is changed')
+        self.assertEqual(200, code, queued)
+        # Let the existing frozen plan finish while keeping the next one queued.
+        self.manifest.write_text('hold-next-plan.stp,1\n', encoding='utf-8')
+        self.start_client()
+        self.finished(first['run_id'])
+        self.server.crash()
+        self.manifest.write_text(original_manifest, encoding='utf-8')
+        self.server_json['plugins']['coverage']['expected_program_version'] = 'v2'
+        self.write_configs()
+        self.start_server()
+        status = self.management_status()
+        self.assertEqual([], status['active_runs'])
+        self.assertTrue(status['queued_runs'][0]['blocked'])
+        code, cancelled = self.management_command(
+            action='stop', plugin_type='coverage', run_id=queued['run_id'])
+        self.assertEqual(200, code, cancelled)
+        self.assertEqual('cancelled', cancelled['status'])
+        self.assertEqual([], self.management_status()['queued_runs'])
+        self.assertEqual('0', self.sql('SELECT count(*) FROM plugin_runs WHERE run_id='
+                                      + sql_text(queued['run_id'])))
+
+    def test_active_recovery_checks_full_plugin_configuration_snapshot(self):
+        self.configure(delay=100)
+        self.start_server()
+        run_id = self.start_run()
+        identity = self.sql('SELECT execution_fingerprint FROM runs WHERE run_id=' + sql_text(run_id))
+        self.assertEqual(64, len(identity))
+        self.server.crash()
+        self.server_json['plugins']['coverage']['task_size'] = 2
+        self.write_configs()
+        rejected = CapturedProcess(OPTIONS.bin_dir / 'scheduler.exe', self.scheduler_config,
+                                   self.root, 'changed-plugin-configuration', self.pg.env)
+        self.procs.append(rejected)
+        self.assertNotEqual(0, rejected.process.wait(timeout=10))
+        self.assertIn('recovery blocked; original progress retained', rejected.text())
+        self.assertEqual('running', self.sql('SELECT status FROM runs WHERE run_id=' + sql_text(run_id)))
+        self.assertEqual('0', self.sql('SELECT count(*) FROM tasks'))
+        self.server_json['plugins']['coverage']['task_size'] = 1
+        self.write_configs()
+        self.start_server()
+        self.start_client()
+        self.finished(run_id)
+
+    def test_missing_program_identity_does_not_false_positive_as_duplicate(self):
+        self.configure(delay=100)
+        self.server_json['plugins']['coverage'].pop('expected_program_version')
+        self.write_configs()
+        self.start_server()
+        self.start_client()
+        command = {'action': 'run', 'plugin_type': 'coverage', 'dataset_version': 'd1'}
+        code, first = self.management_command(**command)
+        self.assertEqual(200, code, first)
+        self.finished(first['run_id'])
+        code, second = self.management_command(**command)
+        self.assertEqual(200, code, second)
+        self.assertNotEqual(first['run_id'], second['run_id'])
+        self.assertIn('duplicate protection is disabled', self.server.text())
+        self.finished(second['run_id'])
+
+    def _check_program_artifact_versions(self, plugin_type):
+        self.configure(delay=100)
+        if plugin_type == 'stpcompare':
+            self.use_stpcompare()
+        legacy_config = json.dumps(self.client_json)
+        # This is the publisher's identity format, derived from immutable
+        # program artifact bytes, independent of its human version.txt label.
+        versions = ['sha256:' + hashlib.sha256(content).hexdigest()
+                    for content in (b'program artifact A', b'program artifact B',
+                                    b'program artifact C')]
+        combinations = ([(versions[0],), (versions[1],)] if plugin_type == 'coverage'
+                        else [(versions[0], versions[1]), (versions[0], versions[2]),
+                              (versions[2], versions[2]), (versions[1], versions[0])])
+
+        def configure_versions(selected):
+            server_plugin = self.server_json['plugins'][plugin_type]
+            client_plugin = self.client_json['plugins'][plugin_type]
+            if plugin_type == 'coverage':
+                server_plugin['expected_program_version'] = selected[0]
+                client_plugin['program_version'] = selected[0]
+            else:
+                for role, version in zip(('baseline', 'candidate'), selected):
+                    server_plugin[f'expected_{role}_program_version'] = version
+                    client_plugin['programs'][role]['version'] = version
+            self.write_configs()
+
+        command = {'action': 'run', 'plugin_type': plugin_type, 'dataset_version': 'd1'}
+        runs, fingerprints = [], set()
+        for index, selected in enumerate(combinations):
+            with self.subTest(plugin=plugin_type, selected=selected):
+                configure_versions(selected)
+                self.start_server()
+                code, created = self.management_command(**command)
+                self.assertEqual(200, code, created)
+                run = created['run_id']
+                runs.append(run)
+                if index == 0:
+                    legacy_path = self.root / 'legacy-client.json'
+                    legacy_path.write_text(legacy_config, encoding='utf-8')
+                    legacy = CapturedProcess(OPTIONS.bin_dir / 'client.exe', legacy_path,
+                                             self.root, 'legacy-client', self.pg.env)
+                    self.procs.append(legacy)
+                    self.assertNotEqual(0, legacy.process.wait(timeout=10), legacy.text())
+                    self.assertIn('version mismatch', legacy.text())
+                    self.assertEqual('0', self.sql('SELECT count(*) FROM tasks'))
+                    self.assertEqual([], self.management_status()['clients'])
+                self.start_client()
+                self.finished(run)
+                fingerprint = self.sql('SELECT work_fingerprint FROM runs WHERE run_id=' + sql_text(run))
+                self.assertNotIn(fingerprint, fingerprints,
+                                 'each program artifact combination must have a distinct work identity')
+                fingerprints.add(fingerprint)
+                expected = (selected[0] if plugin_type == 'coverage' else
+                            f'baseline={selected[0]};candidate={selected[1]}')
+                self.assertEqual(expected, self.sql(
+                    'SELECT program_version FROM plugin_runs WHERE run_id=' + sql_text(run)))
+                code, duplicate = self.management_command(**command)
+                self.assertEqual(409, code, duplicate)
+                self.assertTrue(duplicate['duplicate'])
+                self.assertEqual(run, duplicate['run_id'])
+                self.client.crash()
+                self.server.crash()
+
+        # Returning to the original immutable artifact also returns to its
+        # persisted success identity; process restarts do not permit repetition.
+        configure_versions(combinations[0])
+        self.start_server()
+        code, duplicate = self.management_command(**command)
+        self.assertEqual(409, code, duplicate)
+        self.assertEqual(runs[0], duplicate['run_id'])
+        self.assertEqual('finished', duplicate['status'])
+        self.assertEqual(str(len(combinations)), self.sql('SELECT count(*) FROM runs'))
+        self.assertEqual('v1', (self.program / 'version.txt').read_text(encoding='utf-8'))
+
+    def test_coverage_program_artifact_identity_gates_clients_and_deduplicates(self):
+        self._check_program_artifact_versions('coverage')
+
+    def test_stp_program_artifact_pair_gates_clients_and_deduplicates(self):
+        self._check_program_artifact_versions('stpcompare')
+
+    def test_manifest_change_changes_the_work_fingerprint_without_restart(self):
+        self.configure(delay=100)
+        self.start_server()
+        self.start_client()
+        command = {'action': 'run', 'plugin_type': 'coverage', 'dataset_version': 'd1'}
+        code, first = self.management_command(**command)
+        self.assertEqual(200, code, first)
+        self.finished(first['run_id'])
+        self.manifest.write_text('different.stp,1\n', encoding='utf-8')
+        code, second = self.management_command(**command)
+        self.assertEqual(200, code, second)
+        self.assertNotEqual(first['run_id'], second['run_id'])
+        fingerprints = self.rows(
+            'SELECT run_id,work_fingerprint FROM runs ORDER BY created_at,run_id')
+        self.assertEqual(2, len({row[1] for row in fingerprints}))
+
+    def test_concurrent_duplicate_submissions_create_one_database_run(self):
+        self.start_server()
+        second_endpoint = f'tcp://127.0.0.1:{unused_port()}'
+        second_management = f'http://127.0.0.1:{unused_port()}'
+        second_config = self.root / 'scheduler-second.json'
+        settings = json.loads(json.dumps(self.server_json))
+        settings['server']['router_endpoint'] = second_endpoint
+        settings['server']['management_endpoint'] = second_management
+        second_config.write_text(json.dumps(settings), encoding='utf-8')
+        second_server = CapturedProcess(
+            OPTIONS.bin_dir / 'scheduler.exe', second_config, self.root,
+            'scheduler-concurrent', self.pg.env)
+        self.procs.append(second_server)
+        self.until(lambda: 'scheduler started' in second_server.text() or
+                   second_server.process.poll() is not None, 'second scheduler startup')
+        self.assertIsNone(second_server.process.poll(), second_server.text())
+
+        command = {'action': 'run', 'plugin_type': 'coverage', 'dataset_version': 'd1'}
+        def submit(url):
+            request = Request(url + '/commands', data=json.dumps(command).encode('utf-8'),
+                              headers={'Content-Type': 'application/json'})
+            try:
+                response = urlopen(request, timeout=10)
+            except HTTPError as error:
+                response = error
+            with response:
+                return response.status, json.load(response)
+
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            results = list(workers.map(submit, (self.management_url, second_management)))
+        self.assertEqual([200, 409], sorted(code for code, _ in results))
+        created = next(body for code, body in results if code == 200)
+        duplicate = next(body for code, body in results if code == 409)
+        self.assertTrue(duplicate['duplicate'])
+        self.assertEqual(created['run_id'], duplicate['run_id'])
+        self.assertEqual('1', self.sql('SELECT count(*) FROM runs'))
+
+    def test_graceful_shutdown_keeps_queued_run_behind_restored_active(self):
+        self.start_server()
+        code, first = self.management_command(
+            action='run', plugin_type='coverage', dataset_version='d1')
+        self.assertEqual(200, code, first)
+        code, second = self.management_command(
+            action='run', plugin_type='coverage', dataset_version='d1', force_rerun=True,
+            force_rerun_reason='repeat the workload after graceful shutdown and recovery')
+        self.assertEqual(200, code, second)
+        self.assertEqual('queued', second['status'])
+        self.server.close()
+        self.assertEqual(
+            self.sql('SELECT status FROM runs WHERE run_id=' + sql_text(first['run_id'])),
+            'stopped')
+        self.assertEqual(
+            self.sql('SELECT status FROM runs WHERE run_id=' + sql_text(second['run_id'])),
+            'queued')
+        self.start_server()
+        self.until(lambda: 'run restored: ' + first['run_id'] in self.server.text(),
+                   'active run restored after graceful shutdown')
+        self.assertEqual(
+            self.sql('SELECT status FROM runs WHERE run_id=' + sql_text(second['run_id'])),
+            'queued')
+        self.start_client()
+        self.finished(first['run_id'])
+        self.finished(second['run_id'])
+
+    def test_stop_then_changed_manifest_run_and_wakeup_follow_command_order(self):
         self.start_server()
         first = self.start_run()
-        self.server.send('stop coverage', 'run coverage d1 second', 'wakeup coverage')
+        self.manifest.write_text('second.stp,1\n', encoding='utf-8')
+        self.server.send('stop coverage', 'run coverage d1', 'wakeup coverage')
         self.until(lambda: self.server.text().count('run started:') == 2, 'second run after stop')
         text = self.server.text()
         self.assertNotIn('run already active', text)
@@ -258,20 +744,20 @@ class RuntimeIntegrationTests(unittest.TestCase):
     def test_failed_replacement_preserves_stopped_run_for_restart_recovery(self):
         original_manifest = self.manifest.read_text(encoding='utf-8')
         self.start_server()
-        old_run = self.start_run('original')
+        old_run = self.start_run()
         self.server.send('stop coverage')
         self.until(lambda: self.sql('SELECT status FROM runs WHERE run_id=' + sql_text(old_run))
                    == 'stopped', 'original run stopped before replacement')
 
         self.manifest.write_text('', encoding='utf-8')
-        self.server.send('run coverage d1 invalid-replacement')
+        self.server.send('run coverage d1')
         self.until(lambda: 'createRun: plan failed for coverage' in self.server.text(),
                    'replacement plan failure')
         self.assertEqual(self.sql('SELECT status FROM runs WHERE run_id=' + sql_text(old_run)),
                          'stopped', 'failed replacement must preserve the resumable run')
         self.assertEqual(
-            self.sql("SELECT count(*) FROM runs WHERE params='invalid-replacement' "
-                     "AND status='failed'"),
+            self.sql("SELECT count(*) FROM runs WHERE run_id<>" + sql_text(old_run) +
+                     " AND params='' AND status='failed'"),
             '1', 'the rejected replacement must be recorded as failed')
 
         self.manifest.write_text(original_manifest, encoding='utf-8')
@@ -283,8 +769,9 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.finished(old_run)
 
     def test_restart_interrupts_unactivated_replacement_and_recovers_stopped_run(self):
+        original_manifest = self.manifest.read_text(encoding='utf-8')
         self.start_server()
-        old_run = self.start_run('original')
+        old_run = self.start_run()
         self.server.send('stop coverage')
         self.until(lambda: self.sql('SELECT status FROM runs WHERE run_id=' + sql_text(old_run))
                    == 'stopped', 'original run stopped before interrupted replacement')
@@ -313,15 +800,16 @@ class RuntimeIntegrationTests(unittest.TestCase):
             self.assertIsNone(
                 lock_process.poll(), lock_log.read_text(encoding='utf-8', errors='replace'))
 
-            self.server.send('run coverage d1 replacement')
+            self.manifest.write_text('replacement.stp,1\n', encoding='utf-8')
+            self.server.send('run coverage d1')
             self.until(
                 lambda: self.sql(
-                    "SELECT count(*) FROM runs WHERE params='replacement' "
-                    "AND status='planning'") == '1',
+                    "SELECT count(*) FROM runs WHERE run_id<>" + sql_text(old_run) +
+                    " AND status='planning'") == '1',
                 'replacement persisted before its coverage plan can commit')
             planning_run = self.sql(
-                "SELECT run_id FROM runs WHERE params='replacement' "
-                "AND status='planning'")
+                "SELECT run_id FROM runs WHERE run_id<>" + sql_text(old_run) +
+                " AND status='planning'")
             self.assertNotIn('run started: ' + planning_run, self.server.text())
             self.server.crash()
         finally:
@@ -350,6 +838,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
                     + sql_text(lock_name)) == '0',
                 'planning lock database session cleanup')
 
+        self.manifest.write_text(original_manifest, encoding='utf-8')
         self.start_server()
 
         self.until(lambda: self.sql('SELECT status FROM runs WHERE run_id=' +
@@ -366,14 +855,14 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.start_server()
         self.start_client()
         self.fault_trigger("TG_OP='INSERT'")
-        self.server.send('run coverage d1 blocked')
+        self.server.send('run coverage d1')
         self.until(lambda: 'runtime injected persistence failure' in self.server.text(), 'SaveRun failure')
         time.sleep(.4)
         self.assertEqual(self.sql('SELECT count(*) FROM runs'), '0')
         self.assertEqual(self.sql('SELECT count(*) FROM tasks'), '0')
         self.assertNotIn('task batch', self.client.text())
         self.sql('UPDATE fault_gate SET enabled=false')
-        run = self.start_run('retry')
+        run = self.start_run()
         self.finished(run)
 
     def test_finish_run_failure_remains_running_and_retries(self):
@@ -399,8 +888,12 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(Path(self.pg.sql('SHOW data_directory')).resolve(), self.pg.data.resolve())
         self.finished(run)
         # Also prove new work can be accepted through the recovered connection.
-        second = self.start_run('after-restart')
-        self.finished(second)
+        code, second = self.management_command(
+            action='run', plugin_type='coverage', dataset_version='d1', force_rerun=True,
+            force_rerun_reason='verify run creation after the database connection recovers')
+        self.assertEqual(200, code, second)
+        self.assertEqual(run, second['rerun_of'])
+        self.finished(second['run_id'])
 
     def test_final_file_commit_failure_is_retried(self):
         self.configure(file_store=True)
@@ -450,10 +943,20 @@ class RuntimeIntegrationTests(unittest.TestCase):
             self.assertEqual(self.sql("SELECT count(*) FROM tasks WHERE status='reported'"), '0')
             self.assertEqual(self.sql('SELECT status FROM runs WHERE run_id=' + sql_text(run)), 'running')
         self.finished(run)
-        self.assertEqual(journal.read_text(), task_id)
+        self.assertEqual(json.loads(journal.read_text()),
+                         {'version': 1, 'task_id': task_id, 'exit_code': 0})
 
     def test_recovery_reconciles_completion_committed_before_framework_report(self):
+        # Existing completion tables are migrated without inventing success for
+        # historical entries that did not record an exit code.
+        self.sql('CREATE TABLE plugin_task_completions('
+                 'run_id text NOT NULL,plugin_type text NOT NULL,task_id text NOT NULL,'
+                 'completed_at timestamptz DEFAULT now(),PRIMARY KEY(run_id,plugin_type,task_id));'
+                 "INSERT INTO plugin_task_completions(run_id,plugin_type,task_id) "
+                 "VALUES('legacy','coverage','unknown');")
         self.start_server()
+        self.assertEqual('t', self.sql("SELECT exit_code IS NULL FROM plugin_task_completions "
+                                      "WHERE run_id='legacy'"))
         self.start_client()
         self.fault_trigger("TG_OP='UPDATE' AND NEW.status='reported'", table='tasks')
         run = self.start_run()
@@ -463,6 +966,10 @@ class RuntimeIntegrationTests(unittest.TestCase):
             'plugin completion before blocked framework report')
         self.until(lambda: 'runtime injected persistence failure' in self.server.text(),
                    'blocked framework report')
+        self.assertEqual('0', self.sql('SELECT exit_code FROM plugin_task_completions WHERE run_id='
+                                      + sql_text(run)))
+        self.assertEqual('t', self.sql('SELECT exit_code IS NULL FROM tasks WHERE run_id='
+                                      + sql_text(run)))
         task_status_before_recovery = self.sql(
             "SELECT status FROM tasks WHERE run_id=" + sql_text(run))
         self.assertNotEqual(task_status_before_recovery, 'reported')
@@ -494,7 +1001,11 @@ class RuntimeIntegrationTests(unittest.TestCase):
                    'run restoration after recovery retry')
         self.finished(run)
         self.assertEqual(
-            self.sql("SELECT status FROM tasks WHERE run_id=" + sql_text(run)), 'reported')
+            self.sql("SELECT status,exit_code FROM tasks WHERE run_id=" + sql_text(run)), 'reported|0')
+        code, duplicate = self.management_command(
+            action='run', plugin_type='coverage', dataset_version='d1')
+        self.assertEqual(409, code, duplicate)
+        self.assertEqual(run, duplicate['run_id'])
 
     def test_throwing_plan_marks_framework_run_failed(self):
         entered = self.root / 'probe-entered'
@@ -516,7 +1027,9 @@ class RuntimeIntegrationTests(unittest.TestCase):
                  "BEGIN RAISE EXCEPTION 'runtime injected recovery read failure'; END $$;"
                  "CREATE VIEW runs AS SELECT reject_recovery_read() AS run_id, 'coverage'::text AS plugin_type,"
                  "'d1'::text AS dataset_version,''::text AS params,'running'::text AS status,"
-                 "now() AS created_at,NULL::timestamptz AS finished_at;")
+                 "now() AS created_at,NULL::timestamptz AS finished_at,NULL::text AS work_fingerprint,"
+                 "false AS force_rerun,NULL::text AS force_rerun_reason,NULL::text AS rerun_of,"
+                 "'[]'::jsonb AS worker_ids,NULL::text AS execution_fingerprint;")
         process = CapturedProcess(OPTIONS.bin_dir / 'scheduler.exe', self.scheduler_config,
                                   self.root, 'recovery-failure', self.pg.env)
         self.procs.append(process)
@@ -620,9 +1133,18 @@ class RuntimeIntegrationTests(unittest.TestCase):
     def use_stpcompare(self, *, task_size=1):
         server_plugin = self.server_json['plugins'].pop('coverage')
         server_plugin.update(dll=str(OPTIONS.bin_dir / 'stpcompare.dll'), task_size=task_size)
+        server_plugin.pop('expected_program_version', None)
+        server_plugin.update(expected_baseline_program_version='v1',
+                             expected_candidate_program_version='v1')
         self.server_json['plugins']['stpcompare'] = server_plugin
         client_plugin = self.client_json['plugins'].pop('coverage')
-        client_plugin.update(dll=str(OPTIONS.bin_dir / 'stpcompare.dll'), table='stp_runtime_results')
+        client_plugin.update(
+            dll=str(OPTIONS.bin_dir / 'stpcompare.dll'), table='stp_runtime_results',
+            programs={
+                'baseline': {'executable': sys.executable, 'version': 'v1',
+                             'arguments': ['--input', '{stp}', '--output-dir', '{outdir}']},
+                'candidate': {'executable': sys.executable, 'version': 'v1',
+                              'arguments': ['--input', '{stp}', '--output-dir', '{outdir}']}})
         self.client_json['plugins']['stpcompare'] = client_plugin
 
     def test_requested_dataset_rejects_conflict_and_is_persisted_without_config_default(self):
@@ -675,7 +1197,9 @@ class RuntimeIntegrationTests(unittest.TestCase):
         plugin = self.server_json['plugins']['stpcompare']
         original_manifest = self.manifest.read_text(encoding='utf-8')
 
-        for field, value in (('expected_program_version', 'v2'), ('expected_dataset_version', 'd2'),
+        for field, value in (('expected_baseline_program_version', 'v2'),
+                             ('expected_candidate_program_version', 'v2'),
+                             ('expected_dataset_version', 'd2'),
                              ('manifest', 'different.stp,1\n')):
             with self.subTest(changed=field):
                 if field == 'manifest':
@@ -693,13 +1217,14 @@ class RuntimeIntegrationTests(unittest.TestCase):
                 if field == 'manifest':
                     self.manifest.write_text(original_manifest, encoding='utf-8')
                 else:
-                    plugin[field] = 'v1' if field == 'expected_program_version' else 'd1'
+                    plugin[field] = 'd1' if field == 'expected_dataset_version' else 'v1'
 
         self.write_configs()
         self.start_server()
         self.start_client()
         self.finished(run)
-        self.assertEqual(self.sql('SELECT program_version,dataset_version FROM plugin_runs'), 'v1|d1')
+        self.assertEqual(self.sql('SELECT program_version,dataset_version FROM plugin_runs'),
+                         'baseline=v1;candidate=v1|d1')
 
     def test_stp_client_crash_reuses_persisted_success_and_reports_consistent_outcomes(self):
         self.use_stpcompare(task_size=2)
@@ -709,16 +1234,21 @@ class RuntimeIntegrationTests(unittest.TestCase):
         converter = self.program / 'converter.py'
         converter.write_text(
             'import sys,time\nfrom pathlib import Path\n'
-            'source=Path(sys.argv[1]); marker=source.parent/"first-success.marker"\n'
+            'role=sys.argv[1]; args=dict(zip(sys.argv[2::2],sys.argv[3::2])); '
+            'source=Path(args["--input"]); out=Path(args["--output-dir"]); '
+            'marker=source.parent/("first-success-"+role+".marker")\n'
             'if source.name=="a.stp":\n'
             ' if marker.exists(): sys.exit(7)\n'
             ' marker.write_text("done")\n'
             'else: time.sleep(2)\n'
-            'Path("info.txt").write_text("current")\n'
-            'Path("info_new.txt").write_text("converted")\n', encoding='utf-8')
-        self.client_json['plugins']['stpcompare'].update(
-            dry_run=False, program_exe=sys.executable, program_args=[str(converter), '{stp}'],
-            work_dir=str(self.root / 'work'))
+            '(out/"info.txt").write_text(role+" current")\n'
+            '(out/"info_new.txt").write_text(role+" converted")\n', encoding='utf-8')
+        plugin = self.client_json['plugins']['stpcompare']
+        plugin.update(dry_run=False, work_dir=str(self.root / 'work'))
+        for role in ('baseline', 'candidate'):
+            plugin['programs'][role].update(
+                executable=sys.executable,
+                arguments=[str(converter), role, '--input', '{stp}', '--output-dir', '{outdir}'])
         self.write_configs()
         self.start_server()
         self.start_client()
@@ -734,6 +1264,73 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(self.sql('SELECT file,status FROM plugin_file_outcomes ORDER BY file'),
                          'a.stp|success\nb.stp|success')
         self.assertNotIn('converter failed', self.client.text())
+
+    def assert_plugin_read_failures_preserve_progress(self, plugin_type):
+        self.configure(delay=1800)
+        self.manifest.write_text('one.stp,1\ntwo.stp,1\n', encoding='utf-8')
+        if plugin_type == 'stpcompare':
+            self.use_stpcompare()
+        self.write_configs()
+        self.start_server()
+        code, started = self.management_command(
+            action='run', plugin_type=plugin_type, dataset_version='d1')
+        self.assertEqual(200, code, started)
+        run = started['run_id']
+        self.start_client()
+        self.until(lambda: self.sql("SELECT count(*) FROM tasks WHERE status='reported'") == '1',
+                   'one committed task before recovery read failures')
+        self.server.crash()
+        self.client.crash()
+        committed = self.sql("SELECT task_id,attempt_id FROM tasks WHERE status='reported'")
+        self.assertEqual(1, len(committed.splitlines()))
+        self.sql("CREATE FUNCTION reject_plugin_recovery_read(value anyelement) RETURNS anyelement "
+                 "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected plugin recovery read failure'; END $$;")
+        checkpoint_table = ('coverage_checkpoints' if plugin_type == 'coverage'
+                            else 'stp_compare_checkpoints')
+        projections = (
+            (checkpoint_table, 'run_id,reject_plugin_recovery_read(blob) AS blob,updated_at',
+             'cannot read checkpoint'),
+            ('plugin_task_completions',
+             'run_id,plugin_type,reject_plugin_recovery_read(task_id) AS task_id,exit_code,completed_at',
+             'cannot read completion journal'))
+        for table, projection, expected_error in projections:
+            with self.subTest(plugin=plugin_type, failing_read=table):
+                # Initialization still sees the relation and its complete schema;
+                # only SELECT of the durable checkpoint/journal fails.
+                saved = table + '_recovery_saved'
+                self.sql(f'ALTER TABLE {table} RENAME TO {saved}; '
+                         f'CREATE VIEW {table} AS SELECT {projection} FROM {saved};')
+                try:
+                    self.server_number += 1
+                    failed = CapturedProcess(
+                        OPTIONS.bin_dir / 'scheduler.exe', self.scheduler_config, self.root,
+                        f'scheduler-{self.server_number}', self.pg.env)
+                    self.procs.append(failed)
+                    self.assertNotEqual(0, failed.process.wait(timeout=10), failed.text())
+                    self.assertIn('recovery blocked; original progress retained', failed.text())
+                    self.assertIn(expected_error, failed.text())
+                    self.assertNotIn('scheduler started', failed.text())
+                    self.assertEqual('running', self.sql(
+                        'SELECT status FROM runs WHERE run_id=' + sql_text(run)))
+                    self.assertEqual(committed, self.sql(
+                        "SELECT task_id,attempt_id FROM tasks WHERE status='reported'"))
+                finally:
+                    self.sql(f'DROP VIEW {table}; ALTER TABLE {saved} RENAME TO {table};')
+        self.sql('DROP FUNCTION reject_plugin_recovery_read(anyelement);')
+        self.start_server()
+        self.assertIn('run restored: ' + run, self.server.text())
+        self.start_client()
+        self.finished(run)
+        task_id, attempt = committed.split('|')
+        self.assertEqual(attempt, self.sql(
+            'SELECT attempt_id FROM tasks WHERE task_id=' + sql_text(task_id)))
+        self.assertEqual('2', self.sql("SELECT count(*) FROM tasks WHERE status='reported'"))
+
+    def test_coverage_recovery_read_failures_preserve_committed_progress(self):
+        self.assert_plugin_read_failures_preserve_progress('coverage')
+
+    def test_stpcompare_recovery_read_failures_preserve_committed_progress(self):
+        self.assert_plugin_read_failures_preserve_progress('stpcompare')
 
     def test_unrestorable_run_is_closed_instead_of_blocking_startup(self):
         self.sql("CREATE TABLE IF NOT EXISTS runs (run_id text PRIMARY KEY, plugin_type text,"
@@ -753,7 +1350,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
 
     def test_newer_unrestorable_run_does_not_hide_older_stopped_run(self):
         self.start_server()
-        old_run = self.start_run('recoverable')
+        old_run = self.start_run()
         self.server.send('stop coverage')
         self.until(lambda: self.sql('SELECT status FROM runs WHERE run_id=' + sql_text(old_run))
                    == 'stopped', 'older run stopped before recovery ordering test')

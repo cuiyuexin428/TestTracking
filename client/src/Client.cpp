@@ -1,7 +1,9 @@
 #include "client/Client.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <ctime>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -90,10 +92,10 @@ std::string GenerateRegistrationId() {
 #ifdef _WIN32
 int SampleProcessCpuPercent() {
     // Process CPU usage since the previous heartbeat, clamped to [0, 100].
-    static FILETIME last_kernel{};
-    static FILETIME last_user{};
-    static ULONGLONG last_wall_100ns = 0;
-    static bool has_last = false;
+    thread_local FILETIME last_kernel{};
+    thread_local FILETIME last_user{};
+    thread_local ULONGLONG last_wall_100ns = 0;
+    thread_local bool has_last = false;
 
     FILETIME creation{};
     FILETIME exit{};
@@ -142,13 +144,20 @@ int SampleProcessCpuPercent() {
 
 }  // namespace
 
-Client::Client(common::Config& config, std::shared_ptr<std::atomic<bool>> stop_signal)
+Client::Client(common::Config& config, std::shared_ptr<std::atomic<bool>> stop_signal,
+               std::string selected_plugin, bool qualify_worker_id,
+               std::shared_ptr<std::atomic<bool>> drain_signal,
+               std::function<void()> on_registered)
     : config_(config),
       dealer_(config.get("scheduler.endpoint", std::string("tcp://127.0.0.1:5555"))),
       stop_requested_(stop_signal ? std::move(stop_signal)
                                   : std::make_shared<std::atomic<bool>>(false)),
+      drain_requested_(drain_signal ? std::move(drain_signal)
+                                    : std::make_shared<std::atomic<bool>>(false)),
+      on_registered_(std::move(on_registered)),
       task_slots_(std::max(1, config.get("client.task_threads", 1))),
       worker_id_(config.get("client.worker_id", std::string("worker-1"))),
+      selected_plugin_(std::move(selected_plugin)),
       ip_(config.get("client.ip", std::string())),
       heartbeat_interval_(std::max(1, config.get("client.heartbeat_interval_ms", 1000))),
       poll_timeout_(std::clamp(config.get("scheduler.poll_timeout_ms", 50), 1, 100)),
@@ -160,6 +169,7 @@ Client::Client(common::Config& config, std::shared_ptr<std::atomic<bool>> stop_s
       report_retry_ms_(std::max(50, config.get("client.report_retry_ms", 500))),
       outgoing_limit_(static_cast<size_t>(task_slots_) * 4 + 32) {
     request_backoff_max_ = std::max(request_backoff_initial_, request_backoff_max_);
+    if (qualify_worker_id && !selected_plugin_.empty()) worker_id_ += "/" + selected_plugin_;
 }
 
 Client::~Client() {
@@ -197,7 +207,7 @@ void Client::stop() {
 bool Client::LoadPlugins() {
     const auto* entries = config_.find("plugins");
     if (!entries || !entries->is_object()) {
-        LOG_ERROR("client requires exactly one enabled plugin");
+        LOG_ERROR("client requires at least one enabled plugin");
         return false;
     }
     int enabled = 0;
@@ -205,11 +215,19 @@ bool Client::LoadPlugins() {
         if (entry.value().is_object() && entry.value().value("enabled", false)) ++enabled;
     }
     if (enabled != 1) {
-        LOG_ERROR("client requires exactly one enabled plugin; configured " << enabled);
+        LOG_ERROR("Client: exactly one enabled plugin is required; multi-plugin scheduling is deferred");
+        return false;
+    }
+    if (!selected_plugin_.empty() &&
+         (!entries->contains(selected_plugin_) || !(*entries)[selected_plugin_].is_object() ||
+          !(*entries)[selected_plugin_].value("enabled", false))) {
+        LOG_ERROR("client plugin selection is invalid; configured " << enabled
+                                                                     << " enabled plugins");
         return false;
     }
     for (const auto& entry : entries->items()) {
         if (!entry.value().is_object() || !entry.value().value("enabled", false)) continue;
+        if (!selected_plugin_.empty() && entry.key() != selected_plugin_) continue;
         const auto dll = entry.value().value("dll", std::string());
         auto library = common::DynamicLibrary::load(dll);
         if (!library) {
@@ -232,6 +250,52 @@ bool Client::LoadPlugins() {
                                           << " plugin_type=" << plugin_->pluginType());
     }
     return plugin_ != nullptr;
+}
+
+bool Client::ExecutionWindowOpen() const {
+    const auto* windows = config_.find("client.execution_windows");
+    if (windows == nullptr || !windows->is_array() || windows->empty()) return true;
+    const auto now = std::time(nullptr);
+    std::tm local{};
+#ifdef _WIN32
+    if (localtime_s(&local, &now) != 0) return false;
+#else
+    if (localtime_r(&now, &local) == nullptr) return false;
+#endif
+    const int minute = local.tm_hour * 60 + local.tm_min;
+    const int iso_day = local.tm_wday == 0 ? 7 : local.tm_wday;
+    const int previous_day = iso_day == 1 ? 7 : iso_day - 1;
+    const auto day_allowed = [](const nlohmann::json& window, int day) {
+        const auto found = window.find("days");
+        if (found == window.end() || !found->is_array() || found->empty()) return true;
+        return std::find(found->begin(), found->end(), day) != found->end();
+    };
+    const auto parse = [](const nlohmann::json& value) -> int {
+        if (!value.is_string()) return -1;
+        const auto text = value.get<std::string>();
+        if (text.size() != 5 || text[2] != ':' ||
+            !std::isdigit(static_cast<unsigned char>(text[0])) ||
+            !std::isdigit(static_cast<unsigned char>(text[1])) ||
+            !std::isdigit(static_cast<unsigned char>(text[3])) ||
+            !std::isdigit(static_cast<unsigned char>(text[4])))
+            return -1;
+        const int hour = (text[0] - '0') * 10 + text[1] - '0';
+        const int minute = (text[3] - '0') * 10 + text[4] - '0';
+        return hour < 24 && minute < 60 ? hour * 60 + minute : -1;
+    };
+    for (const auto& window : *windows) {
+        if (!window.is_object()) continue;
+        const int start = parse(window.value("start", nlohmann::json()));
+        const int end = parse(window.value("end", nlohmann::json()));
+        if (start < 0 || end < 0) continue;
+        if (start == end && day_allowed(window, iso_day)) return true;
+        if (start < end && day_allowed(window, iso_day) && minute >= start && minute < end)
+            return true;
+        if (start > end && ((day_allowed(window, iso_day) && minute >= start) ||
+                            (day_allowed(window, previous_day) && minute < end)))
+            return true;
+    }
+    return false;
 }
 
 void Client::PrepareRegistration() {
@@ -319,6 +383,7 @@ void Client::HandleRegistration(const common::Envelope& envelope) {
     backoff_ = request_backoff_initial_;
     LOG_INFO("registered: plugin_type=" << plugin_->pluginType());
     PollExecutor();
+    if (on_registered_) on_registered_();
 }
 
 void Client::CancelExecution() {
@@ -378,6 +443,8 @@ void Client::RunStateMachine() {
         PollExecutor();
         const auto now = std::chrono::steady_clock::now();
         if (!registered_) {
+            if (drain_requested_->load() && active_tasks_.empty() && outgoing_.empty() &&
+                !draining_executor_) break;
             SendRegistration(now);
             continue;
         }
@@ -399,7 +466,12 @@ void Client::RunStateMachine() {
             outstanding_requests_ = 0;
         }
         const int free_slots = task_slots_ - static_cast<int>(active_tasks_.size());
-        if (!silent_ && !draining_executor_ && executor_started_ && outgoing_.empty() &&
+        if (drain_requested_->load() && active_tasks_.empty() && pending_reports_.empty() &&
+            outgoing_.empty() && outstanding_requests_ == 0 && !draining_executor_) {
+            LOG_INFO("client: deployment drain complete");
+            break;
+        }
+        if (!silent_ && !drain_requested_->load() && ExecutionWindowOpen() && !draining_executor_ && executor_started_ && outgoing_.empty() &&
             free_slots > 0 && outstanding_requests_ == 0 && now >= next_request_) {
             if (SendRequestTask(free_slots)) {
                 outstanding_requests_ = 1;
@@ -481,7 +553,7 @@ void Client::HandleTask(const common::TaskCommand& command, const std::string& p
         const TaskKey key{task.task_id(), task.attempt_id()};
         const bool duplicate = active_tasks_.count(key) != 0;
         const bool acceptable =
-            plugin_type == plugin_->pluginType() && !silent_ && !draining_executor_ &&
+            plugin_type == plugin_->pluginType() && !silent_ && !drain_requested_->load() && !draining_executor_ &&
             executor_started_ && !task.attempt_id().empty() && task.run_id() == command.run_id() &&
             (duplicate || active_tasks_.size() < static_cast<size_t>(task_slots_));
         common::Envelope response;

@@ -1,5 +1,6 @@
 add_executable(client
     src/main.cpp
+    src/ProcessAgent.cpp
     src/Client.cpp
     src/TaskExecutor.cpp
 )
@@ -20,5 +21,9 @@ add_custom_target(client_config ALL
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         ${CMAKE_CURRENT_SOURCE_DIR}/client.stpcompare.json
         ${CMAKE_BINARY_DIR}/bin/$<CONFIG>/config/client.stpcompare.json
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/bin/$<CONFIG>/tools
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${CMAKE_SOURCE_DIR}/tools/client_update.ps1
+        ${CMAKE_BINARY_DIR}/bin/$<CONFIG>/tools/client_update.ps1
 )
 add_dependencies(client client_config)
