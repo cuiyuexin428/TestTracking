@@ -36,8 +36,8 @@ def run_case(executable, config, expected, command=None):
 
 
 def test_update_without_scheduler(executable, directory, config):
-    """Real PowerShell invocation/report retries do not depend on worker registration."""
-    state = {"desired": None, "gets": 0, "reports": []}
+    """The Agent remains repairable after restoring an unregistered old config."""
+    state = {"desired": None, "gets": 0, "reports": [], "heartbeats": []}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -47,6 +47,10 @@ def test_update_without_scheduler(executable, directory, config):
         def do_PUT(self):
             state["reports"].append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
             self.reply({"ok": True})
+
+        def do_POST(self):
+            state['heartbeats'].append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
+            self.reply({'ok': True})
 
         def reply(self, value):
             data = json.dumps(value).encode()
@@ -87,13 +91,19 @@ def test_update_without_scheduler(executable, directory, config):
             state["desired"] = {"revision": "a" * 64, "components": [],
                                   "config_patch": {"client": {"task_threads": 2}}}
             deadline = time.monotonic() + 10
+            failed_path = directory / 'deployments/failed.json'
             while time.monotonic() < deadline:
-                if any(report["state"] == "failed" for report in state["reports"]):
+                if (failed_path.is_file()
+                        and any(heartbeat['state'] == 'error' for heartbeat in state['heartbeats'])
+                        and any(report['state'] == 'failed' for report in state['reports'])):
                     break
                 assert process.poll() is None, log.read_text(errors="replace")
                 time.sleep(.05)
             else:
-                raise AssertionError("activation failure report did not reach HTTP server:\n" + log.read_text(errors="replace"))
+                raise AssertionError("restored configuration did not report failure while remaining repairable:\n" + log.read_text(errors="replace"))
+            assert json.loads(failed_path.read_text())['revision'] == 'a' * 64
+            assert any(report['state'] == 'failed' and report['desired_revision'] == 'a' * 64
+                       for report in state['reports']), 'restored but unregistered workers must not hold the update forever'
             assert not (directory / "deployments/active.json").exists(), "unregistered release was activated"
             process.stdin.write(b"quit\n")
             process.stdin.flush()
@@ -136,6 +146,11 @@ def main():
         path.write_text(json.dumps(config), encoding="utf-8")
         output = run_case(arguments.client.resolve(), path, 1)
         assert "registration failed" in output, output
+        config["plugins"]["demo"]["enabled"] = False
+        path.write_text(json.dumps(config), encoding="utf-8")
+        output = run_case(arguments.client.resolve(), path, 1)
+        assert "no enabled plugin" in output, output
+        config["plugins"]["demo"]["enabled"] = True
         config["client"]["register_timeout_ms"] = 3000
         path.write_text(json.dumps(config), encoding="utf-8")
         for _ in range(3):

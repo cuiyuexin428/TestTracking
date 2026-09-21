@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 from .artifacts import ArtifactError, ArtifactStore
 from .config import ServiceConfig
 from .deployments import DeploymentError, DeploymentStore
+from .fleet import ClientFleet
 from .dsh_proxy import DSH_PROXY_PATH, http_origin, proxy_request
 from .management import ManagementError, ManagementService
 from .plugins import (PluginAIContextStore, ResultPluginError, default_plugins,
@@ -96,6 +97,7 @@ class ResultService:
         self.plugin_views = PluginViewStore(config.plugin_views_dir)
         self.repository = create_repository(config.db_conn, self.plugins)
         self.deployments = DeploymentStore(self.artifacts.root / "deployments.json", self.artifacts)
+        self.fleet = ClientFleet(self.deployments, self.management)
         self.reports = ReportStore(
             config.analysis_scripts_dir or runtime / "analysis_scripts",
             config.analysis_reports_dir or runtime / "reports",
@@ -109,6 +111,10 @@ class ResultService:
     def payload(self, path: str, query: dict[str, list[str]]) -> tuple[int, Any]:
         if path == "/api/scheduler":
             return self.management_request(self.management.get_status)
+        if path == "/api/agents":
+            return self.fleet_request(self.fleet.agents)
+        if path == "/api/deployments/batch/defaults":
+            return self.fleet_request(self.fleet.defaults)
         if path == "/api/logs":
             return self.management_request(self.management.logs, query)
         if path.startswith("/api/config/"):
@@ -151,7 +157,7 @@ class ResultService:
             if len(parts) != 1:
                 return 404, {"error": "not found"}
             try:
-                return 200, self.deployments.get(unquote(parts[0]))
+                return self.fleet_request(self.fleet.get, unquote(parts[0]))
             except (DeploymentError, ArtifactError) as exc:
                 return exc.status, {"error": str(exc)}
         if path.startswith("/api/artifacts/"):
@@ -281,16 +287,19 @@ class ResultService:
         parts = path.removeprefix("/api/deployments/").split("/")
         if len(parts) != 2 or parts[1] not in {"desired", "reported"}:
             return 404, {"error": "not found"}
+        operation = self.fleet.publish_single if parts[1] == "desired" else self.fleet.report
+        return self.fleet_request(operation, unquote(parts[0]), body)
+
+    @staticmethod
+    def fleet_request(operation, *args):
         try:
-            operation = (self.deployments.put_desired if parts[1] == "desired"
-                         else self.deployments.put_reported)
-            value, _changed = operation(unquote(parts[0]), body)
-            return 200, value
-        except (DeploymentError, ArtifactError) as exc:
-            result = {"error": str(exc)}
+            return 200, operation(*args)
+        except (DeploymentError, ArtifactError, ManagementError) as exc:
+            value = {"error": str(exc)}
+            if isinstance(exc, ManagementError): value.update(exc.details)
             if isinstance(exc, DeploymentError) and exc.status == 409:
-                result["current_revision"] = exc.current_revision
-            return exc.status, result
+                value["current_revision"] = exc.current_revision
+            return exc.status, value
 
     def preview_deployment(self, body: Any) -> dict[str, Any]:
         if not isinstance(body, dict):
@@ -313,9 +322,12 @@ class ResultService:
                 "scheduler_restart_required": scheduler["restart_required"], "warnings": warnings}
 
     def bind_deployment_scheduler(self, body: Any) -> dict[str, Any]:
+        if not isinstance(body, dict):
+            raise ManagementError("request body must be an object")
         # Serialize against config edits, plugin installation and UI task creation.
         with self.management._lock:
-            prepared = self.preview_deployment(body)
+            prepared = (self.fleet.preview(body) if "client_ids" in body
+                        else self.preview_deployment(body))
             if body.get("scheduler_revision") != prepared["scheduler_revision"]:
                 raise ManagementError("服务端配置已改变，请重新预览后再保存", 409)
             expected = prepared["scheduler_plugins"]
@@ -343,7 +355,7 @@ class ResultService:
         if path == "/api/deployments/preview":
             return self.management_request(self.preview_deployment, body)
         if path == "/api/deployments/bind-scheduler":
-            return self.management_request(self.bind_deployment_scheduler, body)
+            return self.fleet_request(self.bind_deployment_scheduler, body)
         if path in {"/api/server-plugins/preview", "/api/server-plugins/install"}:
             def install_operation():
                 installer = ServerPluginInstaller(self.config, self.artifacts, self.management)
@@ -570,6 +582,28 @@ class Handler(BaseHTTPRequestHandler):
             self._send(status, value)
             return
         report_plugin = _plugin_resource_name(parsed.path, "reports")
+        if parsed.path in {"/api/deployments/batch", "/api/deployments/batch/preview"} or parsed.path.startswith("/api/agents/"):
+            if not self._allow_json_body():
+                return
+            try:
+                body = self._read_json_body()
+                if parsed.path == "/api/deployments/batch":
+                    status, value = self.service.fleet_request(self.service.fleet.publish, body)
+                elif parsed.path == "/api/deployments/batch/preview":
+                    status, value = self.service.fleet_request(self.service.fleet.preview, body)
+                else:
+                    parts = parsed.path.removeprefix("/api/agents/").split("/")
+                    if len(parts) != 2 or parts[1] != "heartbeat":
+                        status, value = 404, {"error": "not found"}
+                    else:
+                        status, value = self.service.fleet_request(self.service.fleet.heartbeat, unquote(parts[0]), body)
+            except (ValueError, json.JSONDecodeError) as exc:
+                status, value = 400, {"error": str(exc)}
+            except (RuntimeError, OSError) as exc:
+                LOG.exception("fleet operation failed")
+                status, value = 500, {"error": str(exc)}
+            self._send(status, value)
+            return
         if parsed.path in {"/api/deployments/preview", "/api/deployments/bind-scheduler",
                             "/api/server-plugins/preview", "/api/server-plugins/install"}:
             if not self._allow_json_body():

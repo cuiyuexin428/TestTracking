@@ -93,6 +93,12 @@ async function createConsole({
   catalogs = null,
   latestReports = null,
   scheduler = { online: false, plugins: [], clients: [], active_runs: [], in_flight: 0 },
+  agents = null,
+  agentsError = null,
+  batchPreviewResult = null,
+  batchPreviewGate = null,
+  batchPublishError = null,
+  batchPublishGate = null,
   commandGate = null,
   commandError = null,
   logs = { files: [], selected: null, lines: [], truncated: false },
@@ -138,6 +144,8 @@ async function createConsole({
   const deploymentPreviews = [];
   const schedulerBindings = [];
   const serverPluginInstalls = [];
+  const batchPreviews = [], batchPublishes = [];
+  const publishedDeployments = new Map();
   const navButtons = ['overview', 'results', 'clients', 'history', 'plugins', 'logs'].map((page) => {
     const button = element(); button.dataset.page = page; return button;
   });
@@ -209,8 +217,36 @@ async function createConsole({
           break;
         case '/api/plugin-view-schema': data = pluginViewSchema; break;
         case '/api/scheduler': data = typeof scheduler === 'function' ? scheduler() : scheduler; break;
+        case '/api/agents': {
+          status = agentsError ? 503 : 200;
+          const snapshot = typeof scheduler === 'function' ? scheduler() : scheduler;
+          const current = typeof agents === 'function' ? agents() : agents;
+          const grouped = new Map();
+          for (const worker of snapshot.clients || []) {
+            const id = worker.physical_client_id || worker.worker_id;
+            if (!grouped.has(id)) grouped.set(id, { client_id: id, hostname: id, state: 'ready', online: snapshot.online, busy: false, plugin_keys: [], workers: [] });
+            const agent = grouped.get(id); agent.workers.push(worker); agent.plugin_keys.push(worker.plugin_key || worker.plugin_type);
+          }
+          data = agentsError ? { error: agentsError } : { agents: current || [...grouped.values()] };
+          break;
+        }
+        case '/api/deployments/batch/preview': {
+          const payload = JSON.parse(options.body); batchPreviews.push(payload);
+          if (batchPreviewGate) await batchPreviewGate;
+          data = batchPreviewResult ? batchPreviewResult(payload) : { clients: payload.client_ids.map((client_id, index) => ({ client_id, revision: `revision-${index}`, components: payload.components, config_patch: payload.config_patch })), program_bindings: [], scheduler_plugins: {}, warnings: [] };
+          break;
+        }
+        case '/api/deployments/batch': {
+          const payload = JSON.parse(options.body); batchPublishes.push(payload);
+          if (batchPublishGate) await batchPublishGate;
+          const failure = typeof batchPublishError === 'function' ? batchPublishError() : batchPublishError;
+          status = failure ? 409 : 200;
+          data = failure ? { error: failure } : { batch_id: 'batch-fixture', clients: payload.targets.map((target) => ({ client_id: target.client_id, state: 'pending', desired: { ...payload, revision: `new-${target.client_id}` } })) };
+          if (!failure) for (const client of data.clients) publishedDeployments.set(client.client_id, client);
+          break;
+        }
         case '/api/artifacts': data = { artifacts }; break;
-        case '/api/deployments': data = { clients: deployments }; break;
+        case '/api/deployments': data = { clients: [...deployments.filter((client) => !publishedDeployments.has(client.client_id)), ...publishedDeployments.values()] }; break;
         case '/api/scheduler/commands':
           commands.push(JSON.parse(options.body));
           if (commandGate) await commandGate;
@@ -363,7 +399,8 @@ async function createConsole({
   // handler finish before inspecting the visible controls.
   await new Promise(setImmediate);
   return { get, posts, requests, clipboardWrites, puts, reportPosts, scriptPuts, scriptSaveRequests, intervals, storage, windowListeners, documentElement, window: browserWindow,
-    commands, logRequests, configSaves, configGets, artifactUploads, deploymentSaves, deploymentPreviews, schedulerBindings, serverPluginInstalls,
+    commands, logRequests, configSaves, configGets, artifactUploads, deploymentSaves, deploymentPreviews, schedulerBindings, serverPluginInstalls, batchPreviews, batchPublishes,
+    openLegacyDeployment: (client = '') => context.openDeploymentEditor(client),
     workspaceTabs, workspacePanels, deploymentSteps, deploymentStages,
     wizard: {
       read: (...args) => JSON.parse(JSON.stringify(context.readDeploymentWizard(...args))),
@@ -522,6 +559,439 @@ test('deployment cannot reuse another client revision after changing client inpu
 
 const wizardArtifact = (id, kind, name = id, version = 'v1') => ({ artifact_id: id.repeat(32), kind, name, version, size_bytes: 10, sha256: 'a'.repeat(64) });
 
+const fleetAgent = (client_id, changes = {}) => ({ client_id, hostname: client_id, state: 'ready', online: true, configurable: true, workers: [], plugin_keys: [], ...changes });
+async function selectFleet(ui) {
+  await ui.navigate('clients');
+  ui.get('clients-select-all').checked = true;
+  ui.get('clients-select-all').listeners.change();
+  await ui.get('clients-configure').listeners.click();
+}
+async function reviewFleet(ui) {
+  for (let step = 0; step < 4; step += 1) await ui.get('deployment-next').listeners.click();
+  assert.equal(ui.get('deployment-save').hidden, false, ui.get('deployment-preview-status').textContent || ui.get('deployment-status').textContent);
+}
+const submitFleet = (ui) => ui.get('deployment-form').listeners.submit({ preventDefault() {} });
+
+test('independent Agents are visible without plugins and only wholly idle online machines can be selected', async () => {
+  const agents = [fleetAgent('blank', { state: 'unconfigured' }), fleetAgent('idle'),
+    fleetAgent('busy', { workers: [{ status: 'idle', plugin_key: 'coverage' }, { status: 'busy', plugin_key: 'stpcompare' }] }),
+    fleetAgent('submitting', { workers: [{ status: 'idle', tasks: [{ task_id: 'ack-pending' }] }] }),
+    fleetAgent('offline', { online: false }), fleetAgent('starting', { state: 'starting' }),
+    fleetAgent('updating', { state: 'updating' }), fleetAgent('reserved', { reservation_id: 'reserved-elsewhere' }),
+    fleetAgent('unmanaged', { configurable: false })];
+  const ui = await createConsole({ agents });
+  await selectFleet(ui);
+  assert.equal(ui.get('client-count').textContent, '9 台');
+  assert.match(ui.get('client-list').innerHTML, /Agent 已连接/);
+  for (const id of ['busy', 'submitting', 'offline', 'updating', 'reserved', 'unmanaged']) {
+    assert.match(ui.get('client-list').innerHTML.match(new RegExp(`<input[^>]*data-agent-select="${id}"[^>]*>`))[0], /disabled/);
+  }
+  assert.match(ui.get('deployment-batch-targets').innerHTML, /已选 3 台/);
+  assert.match(ui.get('deployment-batch-targets').innerHTML, /blank/);
+  assert.match(ui.get('deployment-batch-targets').innerHTML, /idle/);
+  assert.match(ui.get('deployment-batch-targets').innerHTML, /starting/);
+  assert.equal(ui.get('batch-scope-plugins').checked, true);
+  assert.equal(ui.get('batch-scope-resources').checked, true);
+  assert.equal(ui.get('batch-scope-schedule').checked, false);
+  assert.equal(ui.get('deployment-single-target').hidden, true);
+});
+
+test('an idle starting Agent can receive corrective configuration while starting Agents with work or reservations remain blocked', async () => {
+  const ui = await createConsole({ agents: [
+    fleetAgent('version-mismatch', { state: 'starting', workers: [{ status: 'idle', registered: false, plugin_key: 'coverage' }] }),
+    fleetAgent('starting-busy', { state: 'starting', busy: true }),
+    fleetAgent('starting-inflight', { state: 'starting', workers: [{ status: 'idle', tasks: [{ task_id: 'not-yet-acked' }] }] }),
+    fleetAgent('starting-reserved', { state: 'starting', reservation_id: 'upgrade-reservation' }),
+  ] });
+  await ui.navigate('clients');
+  const markup = ui.get('client-list').innerHTML;
+  const firstCard = markup.slice(0, markup.indexOf('</article>'));
+  assert.doesNotMatch(firstCard.match(/<input[^>]*data-agent-select="version-mismatch"[^>]*>/)[0], /disabled/);
+  assert.match(firstCard, /class="chip amber">正在启动/);
+  assert.match(firstCard, /可修改配置以修正程序版本等问题/);
+  assert.doesNotMatch(firstCard, /已就绪/);
+  for (const id of ['starting-busy', 'starting-inflight', 'starting-reserved']) {
+    assert.match(markup.match(new RegExp(`<input[^>]*data-agent-select="${id}"[^>]*>`))[0], /disabled/);
+  }
+  await selectFleet(ui);
+  assert.match(ui.get('deployment-batch-targets').innerHTML, /已选 1 台/);
+  assert.match(ui.get('deployment-batch-targets').innerHTML, /version-mismatch/);
+  ui.get('deployment-field-coverage-target_exe').value = 'D:/new-version.exe';
+  await reviewFleet(ui);
+  await submitFleet(ui);
+  assert.deepEqual(ui.batchPublishes[0].targets, [{ client_id: 'version-mismatch', revision: 'revision-0' }]);
+});
+
+test('single machine configure uses the selected Agent and deploy entry redirects to the Clients page', async () => {
+  const ui = await createConsole({ agents: [fleetAgent('standalone', { state: 'unconfigured' })] });
+  await ui.workspace('deployments');
+  assert.equal(ui.get('page-clients').hidden, false);
+  await ui.get('client-list').listeners.click({ target: { closest: () => ({ dataset: { configureAgent: 'standalone' }, disabled: false }) } });
+  assert.match(ui.get('deployment-batch-targets').innerHTML, /standalone/);
+  assert.equal(ui.get('deployment-editor').hidden, false);
+  assert.equal(ui.get('deployment-rollback-section').hidden, false);
+  assert.equal(ui.get('deployment-rollback-button').disabled, true);
+  const html = fs.readFileSync(path.join(__dirname, '../result_service/web/index.html'), 'utf8');
+  const clientsMarkup = html.slice(html.indexOf('id="page-clients"'), html.indexOf('id="page-history"'));
+  assert.match(clientsMarkup, /id="deployment-editor"/);
+  assert.match(clientsMarkup, /id="deployment-list"/);
+});
+
+test('shared modal dialogs are body children and cannot inherit hidden page visibility', () => {
+  const html = fs.readFileSync(path.join(__dirname, '../result_service/web/index.html'), 'utf8').replace(/<!--[\s\S]*?-->/g, '');
+  const voidTags = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
+  const ancestors = [];
+  const dialogs = [];
+  // Inspect ancestry in the real markup, which the behavior tests' flat DOM
+  // stub cannot model. showModal() does not rescue a hidden ancestor.
+  for (const tag of html.matchAll(/<\/?([a-z][a-z0-9-]*)\b[^>]*>/gi)) {
+    const name = tag[1].toLowerCase();
+    if (tag[0].startsWith('</')) { ancestors.pop(); continue; }
+    if (name === 'dialog') {
+      const id = tag[0].match(/\bid="([^"]+)"/)?.[1];
+      dialogs.push(id);
+      assert.deepEqual(ancestors.map((parent) => parent.name), ['html', 'body'], `${id} must not be nested inside a page or sidebar`);
+      assert.ok(ancestors.every((parent) => !/\bhidden\b/.test(parent.markup)), `${id} has a hidden ancestor`);
+    }
+    if (!voidTags.has(name) && !tag[0].endsWith('/>')) ancestors.push({ name, markup: tag[0] });
+  }
+  assert.deepEqual(dialogs, ['workspace-drawer', 'report-editor-dialog', 'view-editor-dialog']);
+});
+
+test('client deployment details open and close while the plugin page is hidden', async () => {
+  const ui = await createConsole({ agents: [fleetAgent('bootstrap-01')], deployments: [{
+    client_id: 'bootstrap-01', state: 'current', desired: { revision: 'current-revision', components: [], config_patch: {} },
+    reported: { state: 'ready', desired_revision: 'current-revision' },
+  }] });
+  await ui.navigate('clients');
+  assert.equal(ui.get('page-plugins').hidden, true);
+  const dialog = ui.get('workspace-drawer');
+  dialog.showModal = () => { assert.equal(dialog.hidden, false); dialog.open = true; };
+  dialog.close = () => { dialog.open = false; };
+  const trigger = element(); trigger.dataset.deploymentDetail = 'bootstrap-01';
+  await ui.get('deployment-list').listeners.click({ target: { closest: (selector) => selector === '[data-deployment-detail]' ? trigger : null } });
+  assert.equal(dialog.open, true);
+  assert.equal(dialog.hidden, false);
+  assert.match(ui.get('workspace-drawer-title').textContent, /bootstrap-01/);
+  assert.match(ui.get('workspace-drawer-content').innerHTML, /current-revision/);
+  assert.match(ui.get('workspace-drawer-content').innerHTML, /客户端已确认回报版本就绪/);
+  assert.match(ui.get('workspace-drawer-content').innerHTML, /目标部署已生效，客户端已确认此版本/);
+  assert.doesNotMatch(ui.get('workspace-drawer-content').innerHTML, /尚未收到客户端回报|客户端将在/);
+  assert.equal(ui.get('page-plugins').hidden, true);
+  ui.get('workspace-drawer-close').listeners.click();
+  assert.equal(dialog.open, false);
+  assert.equal(dialog.hidden, true);
+  assert.equal(trigger.focused, true);
+});
+
+test('batch resource edits start blank and never copy one machines full config or unrelated defaults', async () => {
+  const ui = await createConsole({ agents: [fleetAgent('A'), fleetAgent('B')], deployments: [
+    { client_id: 'A', state: 'current', desired: { revision: 'A-old', components: [], config_patch: { client: { task_threads: 2 }, plugins: { coverage: { enabled: true, target_exe: 'C:/A.exe', store_cov: true } } } } },
+    { client_id: 'B', state: 'current', desired: { revision: 'B-old', components: [], config_patch: { client: { task_threads: 6 }, plugins: { coverage: { enabled: false, target_exe: 'C:/B.exe', store_cov: false } } } } },
+  ] });
+  await selectFleet(ui);
+  assert.equal(ui.get('deployment-patch').value, '{}');
+  assert.equal(ui.get('deployment-field-coverage-target_exe').value, '');
+  assert.equal(ui.get('deployment-threads').value, '');
+  assert.equal(ui.get('deployment-store-cov').value, 'inherit');
+  assert.equal(ui.get('batch-scope-plugins').checked, false);
+  ui.get('deployment-field-coverage-target_exe').value = 'D:/updated.exe';
+  ui.get('deployment-threads').value = '9';
+  await reviewFleet(ui);
+  assert.deepEqual(ui.batchPreviews[0], { client_ids: ['A', 'B'], components: [], config_patch: { plugins: { coverage: { target_exe: 'D:/updated.exe' } } } });
+  assert.equal(ui.get('deployment-schedule-fields').disabled, true);
+  assert.equal(ui.get('deployment-schedule-inherit').hidden, false);
+  assert.match(ui.get('deployment-plugin-scope-help').textContent, /启用状态保持原值/);
+});
+
+test('batch STP resource edits inherit unspecified role arguments and versions', async () => {
+  const ui = await createConsole({ agents: [fleetAgent('A')] });
+  await selectFleet(ui);
+  ui.get('deployment-enabled-plugins').listeners.change({ target: { dataset: { deploymentEnable: 'coverage' }, checked: false } });
+  ui.get('deployment-enabled-plugins').listeners.change({ target: { dataset: { deploymentEnable: 'stpcompare' }, checked: true } });
+  ui.get('deployment-plugin').value = 'stpcompare'; ui.get('deployment-plugin').listeners.change();
+  assert.equal(ui.get('deployment-field-baseline-programs-baseline-arguments').value, '');
+  ui.get('deployment-field-baseline-programs-baseline-executable').value = 'D:/updated-old.exe';
+  await reviewFleet(ui);
+  assert.deepEqual(ui.batchPreviews[0].config_patch, { plugins: { stpcompare: { programs: { baseline: { executable: 'D:/updated-old.exe' } } } } });
+});
+
+test('batch schedule-only updates omit resources and enable states', async () => {
+  const ui = await createConsole({ agents: [fleetAgent('A'), fleetAgent('B')] });
+  await selectFleet(ui);
+  ui.get('batch-scope-resources').checked = false;
+  ui.get('batch-scope-schedule').checked = true;
+  ui.get('batch-scope-schedule').listeners.change();
+  ui.get('deployment-threads').value = '3';
+  ui.get('deployment-wizard').listeners.change({ target: { dataset: { windowMode: 'execution' }, value: 'all' } });
+  await reviewFleet(ui);
+  assert.deepEqual(ui.batchPreviews[0].config_patch, { client: { task_threads: 3, execution_windows: [] } });
+  assert.deepEqual(ui.batchPreviews[0].components, []);
+  assert.equal(ui.get('deployment-schedule-fields').disabled, false);
+});
+
+test('batch preview and publication use each revision and only the original patch, with one in-flight publish', async () => {
+  let finish;
+  const gate = new Promise((resolve) => { finish = resolve; });
+  const ui = await createConsole({ agents: [fleetAgent('A'), fleetAgent('B')], batchPublishGate: gate,
+    batchPreviewResult: (payload) => ({ clients: payload.client_ids.map((client_id, index) => ({ client_id, revision: index ? null : 'A-old', components: [], config_patch: { ...payload.config_patch, private: `machine-${client_id}`, db: { password: '***' } } })), program_bindings: [], scheduler_plugins: {} }),
+  });
+  await selectFleet(ui);
+  ui.get('deployment-field-coverage-target_exe').value = 'D:/updated.exe';
+  ui.get('deployment-reason').value = 'shared update';
+  await reviewFleet(ui);
+  assert.match(ui.get('deployment-batch-review').innerHTML, /machine-A/);
+  assert.match(ui.get('deployment-batch-review').innerHTML, /machine-B/);
+  assert.match(ui.get('deployment-batch-review').innerHTML, /\*\*\*/);
+  const pending = submitFleet(ui);
+  assert.equal(ui.get('clients-configure').disabled, true);
+  assert.equal(ui.get('deployment-close').disabled, true);
+  await submitFleet(ui);
+  assert.equal(ui.batchPublishes.length, 1);
+  assert.deepEqual(ui.batchPublishes[0].targets, [{ client_id: 'A', revision: 'A-old' }, { client_id: 'B', revision: null }]);
+  assert.deepEqual(ui.batchPublishes[0].config_patch, ui.batchPreviews[0].config_patch);
+  assert.doesNotMatch(JSON.stringify(ui.batchPublishes[0]), /machine-|\*\*\*/);
+  assert.equal(ui.batchPublishes[0].reason, 'shared update');
+  assert.ok(ui.batchPublishes[0].operator_id);
+  finish(); await pending;
+  assert.match(ui.get('deployment-status').textContent, /已发布 2 台/);
+  assert.match(ui.get('deployment-list').innerHTML, /A/);
+  assert.match(ui.get('deployment-list').innerHTML, /B/);
+  assert.equal(ui.get('deployment-batch-review').hidden, true);
+});
+
+test('batch revision conflict retains draft and requires a fresh per-machine review', async () => {
+  let conflict = 'A changed by another operator';
+  const ui = await createConsole({ agents: [fleetAgent('A')], batchPublishError: () => conflict });
+  await selectFleet(ui);
+  ui.get('deployment-field-coverage-target_exe').value = 'D:/unsaved.exe';
+  await reviewFleet(ui);
+  const draft = ui.get('deployment-patch').value;
+  await submitFleet(ui);
+  assert.match(ui.get('deployment-status').textContent, /another operator/);
+  assert.equal(ui.get('deployment-patch').value, draft);
+  assert.equal(ui.get('deployment-field-coverage-target_exe').value, 'D:/unsaved.exe');
+  conflict = null;
+  await submitFleet(ui);
+  assert.equal(ui.batchPublishes.length, 1);
+  assert.match(ui.get('deployment-status').textContent, /先核对/);
+  await ui.get('deployment-preview').listeners.click();
+  await submitFleet(ui);
+  assert.equal(ui.batchPublishes.length, 2);
+});
+
+test('a machine becoming busy after preview blocks publication and keeps draft', async () => {
+  const agent = fleetAgent('A');
+  const ui = await createConsole({ agents: () => [agent] });
+  await selectFleet(ui);
+  ui.get('deployment-field-coverage-target_exe').value = 'D:/unsaved.exe';
+  await reviewFleet(ui);
+  agent.busy = true;
+  await ui.get('clients-refresh').listeners.click();
+  assert.equal(ui.get('clients-configure').disabled, true);
+  await submitFleet(ui);
+  assert.equal(ui.batchPublishes.length, 0);
+  assert.match(ui.get('deployment-status').textContent, /正在执行任务/);
+  assert.equal(ui.get('deployment-field-coverage-target_exe').value, 'D:/unsaved.exe');
+});
+
+test('collapsed batch drafts survive navigation and reopening the same selection', async () => {
+  const ui = await createConsole({ agents: [fleetAgent('A'), fleetAgent('B')] });
+  await selectFleet(ui);
+  ui.get('deployment-field-coverage-target_exe').value = 'D:/draft.exe';
+  await ui.get('deployment-next').listeners.click();
+  ui.get('deployment-close').listeners.click();
+  await ui.navigate('plugins');
+  await ui.workspace('deployments');
+  await ui.get('clients-configure').listeners.click();
+  assert.equal(ui.get('deployment-field-coverage-target_exe').value, 'D:/draft.exe');
+  assert.equal(ui.get('deployment-editor').hidden, false);
+  assert.equal(ui.deploymentSteps[1].attributes['aria-current'], 'step');
+  assert.equal(ui.batchPreviews.length, 0);
+});
+
+test('closed update windows remain selectable and clearly explain the waiting reservation', async () => {
+  const ui = await createConsole({ agents: [fleetAgent('waiting-machine', { update_window_open: false })] });
+  await selectFleet(ui);
+  assert.match(ui.get('clients-selected-count').textContent, /暂停领取任务/);
+  assert.match(ui.get('deployment-batch-targets').innerHTML, /等待窗口期间不再领取任务/);
+  ui.get('deployment-field-coverage-target_exe').value = 'D:/update.exe';
+  await reviewFleet(ui);
+  assert.match(ui.get('deployment-summary').innerHTML, /waiting-machine/);
+  assert.match(ui.get('deployment-summary').innerHTML, /预占/);
+});
+
+test('batch scheduler binding sends original incremental input for server-side merging, never masked previews', async () => {
+  const ui = await createConsole({ agents: [fleetAgent('A'), fleetAgent('B')], batchPreviewResult: (payload) => ({
+    clients: payload.client_ids.map((client_id) => ({ client_id, revision: `${client_id}-old`, components: [], config_patch: { plugins: { coverage: { target_exe: 'C:/old.exe', db_conn: 'password=***', dry_run: false } } } })),
+    program_bindings: [{ plugin: 'coverage', role: 'program', version: 'sha256:program', executable: 'run.exe' }],
+    scheduler_plugins: { coverage: { program_version: 'sha256:program' } }, scheduler_revision: 'scheduler-old',
+  }) });
+  await selectFleet(ui);
+  ui.get('deployment-field-coverage-target_exe').value = 'D:/update.exe';
+  await reviewFleet(ui);
+  assert.equal(ui.get('deployment-bind-scheduler').disabled, false);
+  await ui.get('deployment-bind-scheduler').listeners.click();
+  const sent = ui.schedulerBindings[0];
+  assert.deepEqual(sent.client_ids, ['A', 'B']);
+  assert.deepEqual(sent.config_patch, ui.batchPreviews[0].config_patch);
+  assert.deepEqual(sent.components, ui.batchPreviews[0].components);
+  assert.equal(sent.scheduler_revision, 'scheduler-old');
+  assert.doesNotMatch(JSON.stringify(sent), /\*\*\*|C:\/old/);
+  assert.match(ui.get('deployment-preview-status').textContent, /重新生成逐台配置预览/);
+  assert.equal(ui.get('deployment-bind-scheduler').disabled, true);
+  await submitFleet(ui);
+  assert.equal(ui.batchPublishes.length, 0);
+  await ui.get('deployment-preview').listeners.click();
+  await submitFleet(ui);
+  assert.equal(ui.batchPublishes.length, 1);
+});
+
+test('conflicting batch program identities cannot save a partial scheduler plugin binding', async () => {
+  const ui = await createConsole({ agents: [fleetAgent('A'), fleetAgent('B')], batchPreviewResult: (payload) => ({
+    clients: payload.client_ids.map((client_id) => ({ client_id, revision: null, components: [], config_patch: payload.config_patch })),
+    program_bindings: [{ plugin: 'stpcompare', role: 'baseline', version: 'sha256:same', executable: 'old.exe' }],
+    scheduler_plugins: {}, warnings: ['不同客户端的程序内容身份不同，请分批核对服务端程序匹配。'],
+  }) });
+  await selectFleet(ui);
+  ui.get('deployment-field-coverage-target_exe').value = 'D:/update.exe';
+  await reviewFleet(ui);
+  assert.equal(ui.get('deployment-bind-scheduler').disabled, true);
+  await ui.get('deployment-bind-scheduler').listeners.click();
+  assert.equal(ui.schedulerBindings.length, 0);
+  assert.match(ui.get('deployment-binding-status').textContent, /分批配置/);
+});
+
+test('batch advanced JSON publishes only reviewed explicit values and ignores form scopes', async () => {
+  const ui = await createConsole({ agents: [fleetAgent('A')] });
+  await selectFleet(ui);
+  ui.get('deployment-field-coverage-target_exe').value = 'D:/initial.exe';
+  ui.get('deployment-editor-mode').value = 'json';
+  ui.get('deployment-editor-mode').listeners.change();
+  const patch = { custom: { requested: true }, plugins: { stpcompare: { programs: { baseline: { version: '' } } } } };
+  ui.get('deployment-patch').value = JSON.stringify(patch);
+  assert.equal(ui.get('deployment-batch-scopes').hidden, true);
+  await submitFleet(ui);
+  assert.equal(ui.batchPublishes.length, 0);
+  await ui.get('deployment-next').listeners.click();
+  assert.deepEqual(ui.batchPreviews[0].config_patch, patch);
+  await submitFleet(ui);
+  assert.deepEqual(ui.batchPublishes[0].config_patch, patch);
+});
+
+test('single Agent retains history rollback without importing its full configuration into the incremental draft', async () => {
+  const ui = await createConsole({ agents: [fleetAgent('A')], deployments: [{ client_id: 'A', state: 'current',
+    desired: { revision: 'A-current', components: [], config_patch: { secret_path: 'C:/machine-A', plugins: { coverage: { target_exe: 'C:/old.exe' } } } },
+    history: [{ revision: 'A-history', updated_at: '2026-09-20T12:00:00Z', reason: 'known good release' }],
+  }] });
+  await selectFleet(ui);
+  assert.equal(ui.get('deployment-patch').value, '{}');
+  assert.equal(ui.get('deployment-rollback-section').hidden, false);
+  assert.equal(ui.get('deployment-rollback-button').disabled, false);
+  assert.match(ui.get('deployment-rollback').innerHTML, /known good release/);
+  ui.get('deployment-field-coverage-target_exe').value = 'D:/unpublished-draft.exe';
+  ui.get('deployment-rollback').value = 'A-history';
+  await ui.get('deployment-rollback-button').listeners.click();
+  assert.equal(ui.deploymentSaves.length, 1);
+  assert.equal(ui.deploymentSaves[0].client, 'A');
+  assert.equal(ui.deploymentSaves[0].revision, 'A-current');
+  assert.equal(ui.deploymentSaves[0].action, 'rollback');
+  assert.equal(ui.deploymentSaves[0].target_revision, 'A-history');
+  assert.equal(ui.get('deployment-field-coverage-target_exe').value, 'D:/unpublished-draft.exe');
+  assert.equal(ui.get('deployment-patch').value, '{}');
+  assert.match(ui.get('deployment-status').textContent, /回滚期望已发布/);
+});
+
+test('single Agent rollback conflict keeps the incremental draft and supports history refresh', async () => {
+  const deployment = { client_id: 'A', state: 'current', desired: { revision: 'A-current', components: [], config_patch: {} }, history: [{ revision: 'A-history', reason: 'known good' }] };
+  const ui = await createConsole({ agents: [fleetAgent('A')], deployments: [deployment], deploymentError: 'changed by another operator' });
+  await selectFleet(ui);
+  ui.get('deployment-field-coverage-target_exe').value = 'D:/draft.exe';
+  ui.get('deployment-rollback').value = 'A-history';
+  await ui.get('deployment-rollback-button').listeners.click();
+  assert.match(ui.get('deployment-status').textContent, /another operator/);
+  assert.equal(ui.get('deployment-field-coverage-target_exe').value, 'D:/draft.exe');
+  deployment.desired.revision = 'A-new';
+  await ui.get('deployment-history-refresh').listeners.click();
+  ui.get('deployment-rollback').value = 'A-history';
+  await ui.get('deployment-rollback-button').listeners.click();
+  assert.equal(ui.deploymentSaves[1].revision, 'A-new');
+  assert.equal(ui.get('deployment-field-coverage-target_exe').value, 'D:/draft.exe');
+});
+
+test('batch history rollback cannot accidentally target one machine in a multiple selection', async () => {
+  const ui = await createConsole({ agents: [fleetAgent('A'), fleetAgent('B')] });
+  await selectFleet(ui);
+  assert.equal(ui.get('deployment-rollback-section').hidden, true);
+  assert.equal(ui.get('deployment-rollback-button').disabled, true);
+  ui.get('deployment-rollback').value = 'old-A';
+  await ui.get('deployment-rollback-button').listeners.click();
+  assert.equal(ui.deploymentSaves.length, 0);
+});
+
+test('batch edits during an in-flight preview cannot publish a stale review', async () => {
+  let finish;
+  const gate = new Promise((resolve) => { finish = resolve; });
+  const ui = await createConsole({ agents: [fleetAgent('A')], batchPreviewGate: gate });
+  await selectFleet(ui);
+  ui.get('deployment-field-coverage-target_exe').value = 'D:/first.exe';
+  const pending = ui.get('deployment-preview').listeners.click();
+  ui.get('deployment-field-coverage-target_exe').value = 'D:/edited.exe';
+  finish(); await pending;
+  assert.match(ui.get('deployment-preview-status').textContent, /草稿已变化/);
+  assert.equal(ui.get('deployment-field-coverage-target_exe').value, 'D:/edited.exe');
+  assert.equal(ui.batchPublishes.length, 0);
+});
+
+test('removing a busy machine retains incremental edits and invalidates the previous target review', async () => {
+  const agentA = fleetAgent('A'), agentB = fleetAgent('B');
+  const ui = await createConsole({ agents: () => [agentA, agentB] });
+  await selectFleet(ui);
+  ui.get('deployment-field-coverage-target_exe').value = 'D:/retained.exe';
+  await reviewFleet(ui);
+  agentB.busy = true;
+  await ui.get('clients-refresh').listeners.click();
+  const selectedBusy = ui.get('client-list').innerHTML.match(/<input[^>]*data-agent-select="B"[^>]*>/)[0];
+  assert.doesNotMatch(selectedBusy, /disabled/);
+  ui.get('client-list').listeners.change({ target: { dataset: { agentSelect: 'B' }, checked: false } });
+  assert.equal(ui.get('clients-configure').disabled, false);
+  await ui.get('clients-configure').listeners.click();
+  assert.equal(ui.get('deployment-field-coverage-target_exe').value, 'D:/retained.exe');
+  assert.match(ui.get('deployment-batch-targets').innerHTML, /已选 1 台/);
+  assert.match(ui.get('deployment-status').textContent, /增量草稿已保留/);
+  assert.equal(ui.get('deployment-batch-review').hidden, true);
+  await reviewFleet(ui);
+  await submitFleet(ui);
+  assert.deepEqual(ui.batchPreviews[1].client_ids, ['A']);
+  assert.deepEqual(ui.batchPublishes[0].targets, [{ client_id: 'A', revision: 'revision-0' }]);
+  assert.equal(ui.batchPublishes[0].config_patch.plugins.coverage.target_exe, 'D:/retained.exe');
+});
+
+test('explicit clear resets the batch patch while retaining chosen machines', async () => {
+  const ui = await createConsole({ agents: [fleetAgent('A'), fleetAgent('B')] });
+  await selectFleet(ui);
+  ui.get('deployment-field-coverage-target_exe').value = 'D:/discarded.exe';
+  ui.get('deployment-reason').value = 'discarded reason';
+  await reviewFleet(ui);
+  await ui.get('deployment-reset').listeners.click();
+  assert.equal(ui.get('deployment-field-coverage-target_exe').value, '');
+  assert.equal(ui.get('deployment-reason').value, '');
+  assert.equal(ui.get('deployment-patch').value, '{}');
+  assert.match(ui.get('deployment-batch-targets').innerHTML, /已选 2 台/);
+  assert.equal(ui.get('deployment-batch-review').hidden, true);
+  assert.equal(ui.batchPublishes.length, 0);
+});
+
+test('plugin enable scope can disable all execution plugins while leaving the Agent online', async () => {
+  const ui = await createConsole({ agents: [fleetAgent('A')] });
+  await selectFleet(ui);
+  ui.get('batch-scope-plugins').checked = true;
+  ui.get('deployment-enabled-plugins').listeners.change({ target: { dataset: { deploymentEnable: 'coverage' }, checked: false } });
+  await reviewFleet(ui);
+  assert.deepEqual(ui.batchPreviews[0].config_patch, { plugins: { coverage: { enabled: false }, stpcompare: { enabled: false } } });
+  assert.deepEqual(ui.batchPreviews[0].components, []);
+});
+
 test('workspace tabs preserve both deployment and service drafts while showing one panel at a time', async () => {
   const ui = await createConsole({ configs: { scheduler: {
     available: true, config: { server: { port: 5555 } }, revision: 'original', fields: [],
@@ -556,7 +1026,7 @@ test('guided deployment validates each step, previews before confirmation and pu
   const program = wizardArtifact('a', 'program', 'coverage-tool');
   const ui = await createConsole({ artifacts: [program], deploymentSaveGate: saveGate });
   await ui.navigate('plugins');
-  await ui.get('deployment-new').listeners.click();
+  await ui.openLegacyDeployment();
   const next = () => ui.get('deployment-next').listeners.click();
   const currentStep = () => ui.deploymentSteps.findIndex((button) => button.attributes['aria-current'] === 'step');
   await next();
@@ -598,7 +1068,7 @@ test('guided deployment validates each step, previews before confirmation and pu
   assert.equal(ui.get('deployment-new').disabled, true);
   assert.equal(ui.get('deployment-close').disabled, true);
   await ui.get('deployment-form').listeners.submit({ preventDefault() {} });
-  await ui.get('deployment-new').listeners.click();
+  await ui.openLegacyDeployment();
   assert.equal(ui.deploymentSaves.length, 1);
   assert.equal(ui.get('deployment-client').value, 'worker-guided');
   finishSave();
@@ -669,9 +1139,7 @@ test('reopening the same deployment preserves advanced edits and imports them wh
     },
   }] });
   await ui.navigate('plugins');
-  const open = () => ui.get('deployment-list').listeners.click({ target: {
-    closest: (selector) => selector === '[data-edit-deployment]' ? { dataset: { editDeployment: 'worker-1' } } : null,
-  } });
+  const open = () => ui.openLegacyDeployment('worker-1');
   await open();
   assert.equal(ui.get('deployment-advanced').open, false);
   ui.get('deployment-editor-mode').value = 'json';
@@ -699,9 +1167,7 @@ test('switching to advanced JSON publishes current form edits and preserves unre
     },
   }] });
   await ui.navigate('plugins');
-  await ui.get('deployment-list').listeners.click({ target: {
-    closest: (selector) => selector === '[data-edit-deployment]' ? { dataset: { editDeployment: 'worker-1' } } : null,
-  } });
+  await ui.openLegacyDeployment('worker-1');
   await ui.get('deployment-next').listeners.click();
   await ui.get('deployment-next').listeners.click();
   ui.get('deployment-artifact-coverage').value = program.artifact_id;
@@ -731,7 +1197,7 @@ test('invalid form values cannot switch into advanced mode and publish an older 
   const program = wizardArtifact('a', 'program', 'runner');
   const ui = await createConsole({ artifacts: [program] });
   await ui.navigate('plugins');
-  await ui.get('deployment-new').listeners.click();
+  await ui.openLegacyDeployment();
   ui.get('deployment-client').value = 'worker-1';
   await ui.get('deployment-next').listeners.click();
   await ui.get('deployment-next').listeners.click();
@@ -862,7 +1328,7 @@ test('new deployments inherit execution mode and require an explicit mode before
   const model = ui.wizard.read({}, []);
   assert.equal(model.dryRun, null);
   assert.equal(ui.wizard.build({}, [], model, []).config_patch.plugins.coverage.dry_run, undefined);
-  assert.equal(ui.wizard.build({}, [], model, []).config_patch.plugins.coverage.store_cov, false);
+  assert.equal(ui.wizard.build({}, [], model, []).config_patch.plugins.coverage.store_cov, undefined);
   const program = wizardArtifact('a', 'program');
   model.groups.coverage.artifactId = program.artifact_id;
   assert.throws(() => ui.wizard.build({}, [], model, [program]), /明确选择/);
@@ -921,7 +1387,7 @@ test('deployment wizard previews canonical program identity and preserves drafts
   ui.get('deployment-field-coverage-target_exe').value = 'run.exe';
   ui.get('deployment-field-collector-opencppcoverage').value = 'C:/tools/coverage.exe';
   ui.get('deployment-dry-run').value = 'real';
-  ui.get('deployment-store-cov').checked = true;
+  ui.get('deployment-store-cov').value = 'keep';
   await ui.get('deployment-form').listeners.submit({ preventDefault() {} });
   assert.equal(ui.deploymentSaves.length, 0);
   await ui.get('deployment-preview').listeners.click();
@@ -1019,7 +1485,7 @@ test('delayed scheduler snapshot is labelled as cached while its clients and com
   assert.equal(ui.get('run-start').disabled, false);
   snapshot.snapshot_age_ms = 100;
   await ui.get('clients-refresh').listeners.click();
-  assert.match(ui.get('clients-status').textContent, /实时状态/);
+  assert.match(ui.get('clients-status').textContent, /Agent 独立上线/);
   assert.doesNotMatch(ui.get('scheduler-status').textContent, /延迟/);
 });
 

@@ -83,9 +83,9 @@ public:
         result->set_task_id(task.task_id()); result->set_run_id(task.run_id());
         result->set_attempt_id(attempt); result->set_exit_code(exit_code); SendAs(report, session_id);
     }
-    void Heartbeat() {
+    void Heartbeat(common::Heartbeat::Status status = common::Heartbeat::IDLE) {
         common::Envelope message; message.set_type(common::HEARTBEAT);
-        message.mutable_heartbeat(); Send(message);
+        message.mutable_heartbeat()->set_status(status); Send(message);
     }
     std::string session;
 private:
@@ -318,10 +318,135 @@ void TestParallelPlugins(const std::filesystem::path& bin) {
             "single worker result after multi-plugin deployment was rejected");
     server->stop();
 }
+
+void TestClientControl(const std::filesystem::path& bin) {
+    Workspace workspace;
+    auto& config = common::Config::instance();
+    const auto config_file = workspace.root / "scheduler.json";
+    const auto state_file = workspace.root / "runtime" / "client_control.json";
+    std::unique_ptr<scheduler::Scheduler> server;
+    std::string endpoint;
+    for (int attempt = 0; attempt < 50; ++attempt) {
+        const auto port = 30000 + (std::chrono::steady_clock::now().time_since_epoch().count() % 20000);
+        endpoint = "tcp://127.0.0.1:" + std::to_string(port);
+        nlohmann::json settings = {
+            {"server", {{"router_endpoint", endpoint}, {"poll_timeout_ms", 5},
+                        {"client_timeout_ms", 0}, {"task_ack_timeout_ms", 10000},
+                        {"deployment_reservation_timeout_ms", 1000}}},
+            {"plugins", nlohmann::json::object()}};
+        for (const std::string type : {"scheduler-probe", "other-probe"})
+            settings["plugins"][type] = {{"enabled", true},
+                {"dll", (bin / "scheduler_probe.dll").string()}, {"plugin_type", type},
+                {"entered_file", (workspace.root / (type + ".entered")).string()}};
+        std::ofstream(config_file) << settings.dump();
+        config.load(config_file.string());
+        server = std::make_unique<scheduler::Scheduler>(config, config_file.string());
+        try { server->start(); break; } catch (...) { server.reset(); }
+    }
+    Require(server != nullptr, "could not bind client control scheduler test port");
+    const auto heartbeat = [&](const char* id, const char* state = "ready", bool update_window_open = true) {
+        return server->managementCommand({{"action", "agent_heartbeat"}, {"client_id", id},
+            {"instance_id", "agent-instance"}, {"hostname", "test-host"}, {"state", state},
+            {"plugin_keys", nlohmann::json::array()}, {"agent_version", "test"},
+            {"active_revision", ""}, {"update_window_open", update_window_open}});
+    };
+    const auto control = [&](const char* action, const char* token, nlohmann::json ids) {
+        return server->managementCommand({{"action", action}, {"reservation_id", token}, {"client_ids", ids}});
+    };
+    const auto agent = [&](const char* id) -> nlohmann::json {
+        const auto status = server->managementStatus();
+        for (const auto& item : status["agents"])
+            if (item["client_id"] == id) return item;
+        throw std::runtime_error("agent missing from management status");
+    };
+    Require(heartbeat("empty", "unconfigured").value("ok", false), "empty agent registration failed");
+    Require(server->clients().empty() && agent("empty")["online"] == true &&
+            agent("empty")["state"] == "unconfigured", "empty agent was not independently discoverable");
+    Require(server->managementStatus()["client_control_path"] == state_file.string(),
+            "client control state did not use the config directory");
+    Require(server->managementCommand({{"action", "agent_heartbeat"}, {"client_id", "bad"}})
+                .value("http_status", 0) == 400, "malformed agent heartbeat accepted");
+    Require(control("reserve_clients", "token", {"unknown"}).value("http_status", 0) == 409,
+            "unknown agent reserved");
+
+    Peer first(endpoint, "machine/first"), second(endpoint, "machine/second", "other-probe");
+    first.Register("first", common::kProtocolVersion, true, "machine", "first");
+    second.Register("second", common::kProtocolVersion, true, "machine", "second");
+    Require(heartbeat("machine").value("ok", false), "configured agent registration failed");
+    first.Heartbeat(common::Heartbeat::BUSY);
+    first.Wait(common::HEARTBEAT_ACK);
+    const auto heartbeat_busy = control("reserve_clients", "token", {"empty", "machine"});
+    Require(heartbeat_busy.value("http_status", 0) == 409 &&
+            heartbeat_busy["unavailable"][0]["reason"] == "busy" && agent("empty")["reservation_id"] == "",
+            "busy worker heartbeat did not atomically reject the whole batch");
+    first.Heartbeat(); first.Wait(common::HEARTBEAT_ACK);
+    Require(server->createRun("scheduler-probe", "control-first", ""), "control first run failed");
+    const auto task = first.Request();
+    first.AckAs(task, task.attempt_id(), first.session);
+    Require(control("reserve_clients", "token", {"empty", "machine"}).value("http_status", 0) == 409,
+            "in-flight task did not block physical client reservation");
+    Require(server->stopRun("scheduler-probe"), "control task did not stop");
+
+    Require(heartbeat("machine", "starting", false).value("ok", false), "startup repair heartbeat rejected");
+    Require(control("reserve_clients", "token", {"empty", "machine"}).value("ok", false),
+            "idle starting clients could not receive a repairing deployment outside their update window");
+    Require(control("reserve_clients", "other-token", {"empty", "machine"}).value("http_status", 0) == 409,
+            "another publisher replaced reservations");
+    Require(heartbeat("machine", "updating", false).value("ok", false), "update heartbeat rejected");
+    Require(control("reserve_clients", "token", {"empty", "machine"}).value("ok", false),
+            "same-token recovery was blocked by its own updating state");
+    Require(control("commit_reservation", "token", {"empty", "machine"}).value("ok", false),
+            "reservation commit failed");
+    Require(control("release_clients", "wrong-token", {"machine"}).value("http_status", 0) == 409,
+            "wrong token released a deployment reservation");
+    Require(server->createRun("scheduler-probe", "blocked-first", "") &&
+            server->createRun("other-probe", "blocked-second", ""), "reserved run planning failed");
+    common::Envelope request; request.set_type(common::REQUEST_TASK);
+    request.mutable_request_task()->set_count(1);
+    first.Send(request); first.Wait(common::NO_TASK);
+    second.Send(request); second.Wait(common::NO_TASK);
+    Require(server->inFlightCount() == 0 && agent("machine")["update_window_open"] == false,
+            "machine awaiting its update window received plugin tasks");
+    std::this_thread::sleep_for(1050ms);
+    Require(control("reserve_clients", "token", {"machine"}).value("ok", false) &&
+            agent("machine")["reservation_committed"] == true,
+            "committed reservation expired with its pending lease");
+    server->stop();
+    server.reset();
+
+    server = std::make_unique<scheduler::Scheduler>(config, config_file.string());
+    server->start();
+    Require(agent("empty")["online"] == false && agent("empty")["state"] == "unconfigured" &&
+            agent("machine")["reservation_id"] == "token",
+            "restart lost offline agent registry or committed reservations");
+    first.Register("first-restarted", common::kProtocolVersion, true, "machine", "first");
+    second.Register("second-restarted", common::kProtocolVersion, true, "machine", "second");
+    Require(server->createRun("scheduler-probe", "restart-first", "") &&
+            server->createRun("other-probe", "restart-second", ""), "restart runs failed");
+    first.Send(request); first.Wait(common::NO_TASK);
+    second.Send(request); second.Wait(common::NO_TASK);
+    Require(control("release_clients", "token", {"empty", "machine"}).value("ok", false),
+            "offline reservation recovery could not release clients");
+    first.Wait(common::WAKE); second.Wait(common::WAKE);
+    Require(!first.Request().task_id().empty() && !second.Request().task_id().empty(),
+            "released plugin workers did not resume task execution");
+    Require(control("release_clients", "token", {"empty", "machine"}).value("ok", false),
+            "reservation release retry was not idempotent");
+    Require(control("reserve_clients", "new-token", {"empty"}).value("http_status", 0) == 409,
+            "persisted agent was online before a fresh heartbeat");
+    Require(heartbeat("empty", "unconfigured").value("ok", false), "empty agent did not reconnect");
+    Require(control("reserve_clients", "expiring", {"empty"}).value("ok", false), "pending reserve failed");
+    std::this_thread::sleep_for(1050ms);
+    Require(control("commit_reservation", "expiring", {"empty"}).value("http_status", 0) == 409,
+            "expired pending reservation was committed");
+    Require(control("reserve_clients", "replacement", {"empty"}).value("ok", false),
+            "expired pending reservation blocked another deployment");
+    server->stop();
+}
 }
 int main(int argc,char** argv) {
-    try { const auto bin = std::filesystem::absolute(argv[0]).parent_path(); Test(bin); TestParallelPlugins(bin);
-        std::cout<<"PASS: session takeover, durable report identity, command barrier, independent heartbeat, business outcome deduplication, parallel plugin queues and physical client targeting\n";
+    try { const auto bin = std::filesystem::absolute(argv[0]).parent_path(); Test(bin); TestParallelPlugins(bin); TestClientControl(bin);
+        std::cout<<"PASS: session takeover, durable report identity, command barrier, independent heartbeat, business outcome deduplication, parallel plugin queues, physical client targeting, empty agent registry and durable deployment reservations\n";
         return 0;
     } catch(const std::exception& e) { std::cerr<<e.what()<<'\n';return 1; }
 }

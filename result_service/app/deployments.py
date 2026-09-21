@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 import os
 import re
@@ -53,6 +54,19 @@ class DeploymentStore:
         with self._lock:
             value = self._read()["clients"].get(client, {})
             return self._expand(client, value)
+
+    def historical(self, client_id: Any, revision: Any) -> dict[str, Any]:
+        client = self._client_id(client_id)
+        target = self._required_revision(revision, "target_revision")
+        with self._lock:
+            entry = self._read()["clients"].get(client, {})
+            if entry.get("desired", {}).get("revision") == target:
+                raise DeploymentError("rollback target_revision must be a previous deployment")
+            previous = next((item for item in reversed(entry.get("desired_history", []))
+                             if item.get("revision") == target), None)
+            if previous is None:
+                raise DeploymentError("rollback target_revision was not found for this client", 404)
+            return copy.deepcopy(previous)
 
     def put_desired(self, client_id: Any, body: Any) -> tuple[dict[str, Any], bool]:
         client = self._client_id(client_id)
@@ -181,6 +195,46 @@ class DeploymentStore:
             }
             self._write(state)
             return self._expand(client, entry), True
+
+    def put_batch(self, plans: list[dict[str, Any]], reservation_id: str,
+                  *, operator_id: Any = None, reason: Any = None) -> list[dict[str, Any]]:
+        """Publish all client revisions in one atomic file replacement.
+
+        The coordinator reserves the physical machines before this operation.
+        Recheck every revision here so a concurrent editor cannot publish a
+        partial batch or overwrite another operator's plan.
+        """
+        operator = self._optional_identifier(operator_id, "operator_id")
+        explanation = self._optional_text(reason, "reason", 4096)
+        token = self._identifier(reservation_id, "reservation_id")
+        with self._lock:
+            state = self._read()
+            prepared = []
+            for plan in plans:
+                client = self._client_id(plan.get("client_id"))
+                expected = self._optional_revision(plan.get("revision"), "revision")
+                current = state["clients"].get(client, {}).get("desired")
+                revision = current.get("revision") if current else None
+                if expected != revision:
+                    raise DeploymentError(f"{client} 的部署已被其他使用者修改，请重新预览", 409,
+                                          current_revision=revision)
+                value = self.prepare(plan.get("components"), plan.get("config_patch", {}))
+                prepared.append((client, revision, value, plan))
+            for client, previous, value, plan in prepared:
+                entry = state["clients"].setdefault(client, {})
+                desired = {
+                    "revision": self._next_revision(previous, value["components"], value["config_patch"]),
+                    "previous_revision": previous, "components": value["components"],
+                    "config_patch": value["config_patch"], "reservation_id": token,
+                    "batch_id": token, "updated_at": self._now(), "updated_by": operator,
+                    "reason": explanation, "action": plan.get("action", "deploy"),
+                    "rollback_of": plan.get("rollback_of"),
+                }
+                entry["desired"] = desired
+                entry.setdefault("desired_history", []).append(copy.deepcopy(desired))
+                del entry["desired_history"][:-_HISTORY_LIMIT]
+            self._write(state)
+            return [self._expand(client, state["clients"][client]) for client, *_ in prepared]
 
     def _expand(self, client_id: str, value: dict[str, Any]) -> dict[str, Any]:
         desired = self._expand_state(value.get("desired"))

@@ -278,11 +278,11 @@ int RunMain(int argc, char* argv[]) {
                     enabled_plugins.push_back(item.key());
             }
         }
-        if (enabled_plugins.empty()) throw std::runtime_error("Client: no enabled plugin");
 #ifdef _WIN32
         const int result = client::RunProcessAgent(ExecutablePath(), std::filesystem::u8path(options.config_path), stop_signal);
         if (result != 0) return result;
 #else
+        if (enabled_plugins.empty()) throw std::runtime_error("Client: no enabled plugin");
         if (enabled_plugins.size() != 1)
             throw std::runtime_error("Client: multi-plugin process isolation requires the Windows client package");
         client::Client worker(config, stop_signal, enabled_plugins.front());

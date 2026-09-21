@@ -35,11 +35,27 @@ class ClientUpdateTests(unittest.TestCase):
             workspace=str(self.root), artifact_store_dir=str(self.root / "repository"), providers={},
         ))
         self.requests = []
+        self.deployment_status = None
+        self.reservation_id = ''
         requests = self.requests
+        fixture = self
 
         class CountingHandler(Handler):
             def do_GET(handler):
                 requests.append(handler.path)
+                if handler.path == '/api/deployments/test-worker':
+                    if fixture.deployment_status is not None:
+                        handler._send(fixture.deployment_status, {'error': 'deployment reservation unavailable'})
+                        return
+                    # These tests exercise the PowerShell staging protocol.
+                    # Scheduler reservation enforcement is covered by the
+                    # real Agent integration suite; artifact downloads remain
+                    # the production HTTP implementation here.
+                    state = fixture.service.deployments.get('test-worker')
+                    if fixture.reservation_id and state.get('desired'):
+                        state['desired']['reservation_id'] = fixture.reservation_id
+                    handler._send(200, state)
+                    return
                 super().do_GET()
 
             def do_PUT(handler):
@@ -94,11 +110,7 @@ class ClientUpdateTests(unittest.TestCase):
         body = {"revision": revision,
                 "components": [{"slot": "dataset", "artifact_id": artifact["artifact_id"]}],
                 "config_patch": patch or {"plugins": {"custom": {"data_root": "{artifact:dataset}"}}}}
-        request = Request(self.endpoint + "/api/deployments/test-worker/desired",
-                          data=json.dumps(body).encode(), method="PUT",
-                          headers={"Content-Type": "application/json"})
-        with urlopen(request, timeout=5) as response:
-            return json.load(response)["desired"]
+        return self.service.deployments.put_desired('test-worker', body)[0]['desired']
 
     def run_update(self, *, expected=0, report=None, effective=None, current=None, prepared=None):
         command = [shutil.which("powershell"), "-NoLogo", "-NoProfile", "-NonInteractive",
@@ -175,6 +187,35 @@ class ClientUpdateTests(unittest.TestCase):
         self.assertEqual(old_bytes, old_config.read_bytes())
         self.assertFalse((self.client / "deployments" / "objects" / second["sha256"] / "archive").exists())
 
+    def test_nested_program_bundle_uses_short_staging_path_and_reuses_full_sha_cache(self):
+        # This is the actual nested OpenCppCoverage template path that failed
+        # Bootstrap deployment at an ordinary 64-character client root.
+        name = "opencppcoverage/Template/third-party/google-code-prettify/prettify-CppCoverage.css"
+        contents = b"/* bundled OpenCppCoverage template */"
+        artifact = self.artifact([(name, contents)], filename="coverage-program.zip")
+        self.plan(artifact)
+        object_root = self.client / "deployments" / "objects" / artifact["sha256"]
+        old_stage_file = object_root / ("content-" + "0" * 32 + ".tmp") / name
+        self.assertGreaterEqual(len(str(self.client)), 64)
+        self.assertGreaterEqual(len(str(old_stage_file)), 260)
+        content = object_root / "content"
+        self.assertLess(len(str(content / name)), 260)
+
+        staged = self.run_update()
+        self.assertEqual("staged", staged["status"])
+        prepared = json.loads(Path(staged["config_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(str(content), prepared["plugins"]["custom"]["data_root"])
+        self.assertEqual(contents, (content / name).read_bytes())
+        manifest = json.loads((object_root / "content.json").read_text(encoding="utf-8"))
+        self.assertEqual(artifact["sha256"], manifest["sha256"])
+        self.assertEqual([name], [entry["path"] for entry in manifest["files"]])
+        self.assertEqual([], list(object_root.parent.glob("stage-*.tmp")))
+
+        reused = self.run_update()
+        self.assertEqual(staged["config_path"], reused["config_path"])
+        self.assertEqual(1, len(self.downloads()))
+        self.assertEqual(contents, (content / name).read_bytes())
+
     def test_merged_multi_plugin_deployment_stages_without_disabling_existing_plugin(self):
         first = self.plan(self.artifact())
         staged = self.run_update()
@@ -208,12 +249,12 @@ class ClientUpdateTests(unittest.TestCase):
         self.assertEqual(next_stage["config_path"], cached["config_path"])
         self.assertEqual([], self.downloads())
 
-    def test_deployment_with_no_enabled_plugin_is_rejected_before_download(self):
+    def test_managed_deployment_can_disable_all_plugins(self):
         self.plan(self.artifact(), patch={"plugins": {"custom": {"enabled": False}}})
-        failed = self.run_update(expected=1)
-        self.assertEqual("failed", failed["status"])
-        self.assertIn("at least one enabled plugin; found 0", failed["message"])
-        self.assertEqual([], self.downloads())
+        staged = self.run_update()
+        self.assertEqual("staged", staged["status"])
+        prepared = json.loads(Path(staged['config_path']).read_text(encoding='utf-8'))
+        self.assertFalse(prepared['plugins']['custom']['enabled'])
         self.assertTrue(json.loads(self.config.read_text(encoding="utf-8"))["plugins"]["custom"]["enabled"])
 
     def test_switching_plugins_explicitly_disables_previous_plugin(self):
@@ -253,17 +294,71 @@ class ClientUpdateTests(unittest.TestCase):
         self.assertIn("Plugin enabled must be a boolean: other", failed["message"])
         self.assertEqual([], self.downloads())
 
-    def test_prepared_release_requires_at_least_one_enabled_plugin(self):
+    def test_managed_prepared_release_accepts_empty_plugin_configuration(self):
         desired = self.plan(self.artifact())
         staged = self.run_update()
         prepared = Path(staged["config_path"])
         config = json.loads(prepared.read_text(encoding="utf-8"))
-        config["plugins"]["custom"]["enabled"] = False
+        config["plugins"] = {}
         prepared.write_text(json.dumps(config), encoding="utf-8")
         self.requests.clear()
-        failed = self.run_update(expected=1, prepared=desired["revision"])
-        self.assertIn("at least one enabled plugin; found 0", failed["message"])
+        reused = self.run_update(prepared=desired["revision"])
+        self.assertEqual('staged', reused['status'])
         self.assertEqual([], self.downloads())
+
+    def test_reservation_is_retained_for_stage_failure_and_blocked_get_keeps_active_files(self):
+        first = self.plan(self.artifact())
+        self.reservation_id = 'reservation-first'
+        staged = self.run_update()
+        self.assertEqual('reservation-first', staged['reservation_id'])
+        prepared = Path(staged['config_path'])
+        before = prepared.read_bytes()
+        base = self.config.read_bytes()
+        self.requests.clear()
+        for status in (409, 503):
+            self.deployment_status = status
+            blocked = self.run_update(current=first['revision'])
+            self.assertEqual('waiting_reservation', blocked['status'])
+            self.assertIsNone(blocked['revision'])
+            self.assertEqual(before, prepared.read_bytes())
+            self.assertEqual(base, self.config.read_bytes())
+            self.assertEqual([], self.downloads())
+        self.deployment_status = None
+        corrupt = self.artifact(raw=b'new content', filename='tool.exe', version='2')
+        self.plan(corrupt, revision=first['revision'])
+        self.service.artifacts.object_path(corrupt['sha256']).write_bytes(b'corrupt')
+        self.reservation_id = 'reservation-second'
+        failed = self.run_update(expected=1)
+        self.assertEqual('failed', failed['status'])
+        self.assertEqual('reservation-second', failed['reservation_id'])
+        self.assertEqual(before, prepared.read_bytes())
+
+    def test_failed_download_revision_does_not_retry_after_source_is_repaired(self):
+        contents = b'expected program bytes'
+        artifact = self.artifact(raw=contents, filename='tool.exe')
+        desired = self.plan(artifact)
+        source = self.service.artifacts.object_path(artifact['sha256'])
+        source.write_bytes(b'broken download')
+        failed = self.run_update(expected=1)
+        self.assertEqual('failed', failed['status'])
+        self.service.deployments.put_reported('test-worker', {
+            'desired_revision': desired['revision'], 'state': 'failed',
+            'components': [{'slot': 'dataset', 'artifact_id': artifact['artifact_id'], 'state': 'failed'}]})
+        source.write_bytes(contents)
+        self.requests.clear()
+        # Each invocation is a fresh PowerShell process, including after Agent
+        # restart. Durable server failure must prevent download/activation.
+        for _ in range(2):
+            rejected = self.run_update()
+            self.assertEqual('rejected', rejected['status'])
+            self.assertEqual(desired['revision'], rejected['revision'])
+        self.assertEqual([], self.downloads())
+        self.assertFalse((self.client / 'deployments/releases' / desired['revision']).exists())
+        changed = self.plan(artifact, revision=desired['revision'], patch={
+            'client': {'task_threads': 3}, 'plugins': {'custom': {'data_root': '{artifact:dataset}'}}})
+        staged = self.run_update()
+        self.assertEqual('staged', staged['status'])
+        self.assertEqual(changed['revision'], staged['revision'])
 
     def test_outside_window_polls_and_reports_but_never_downloads(self):
         artifact = self.artifact()

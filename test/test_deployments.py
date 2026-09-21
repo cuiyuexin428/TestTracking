@@ -11,11 +11,13 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from result_service.app.artifacts import ArtifactStore
 from result_service.app.config import ServiceConfig
 from result_service.app.deployments import DeploymentError, DeploymentStore
 from result_service.app.server import Handler, ResultHTTPServer, ResultService
+from fleet_fixture import FleetManagement
 
 
 class DeploymentStoreTests(unittest.TestCase):
@@ -334,6 +336,9 @@ class DeploymentHTTPTests(unittest.TestCase):
         self.service = ResultService(ServiceConfig(
             workspace=str(root), artifact_store_dir=str(root / "artifacts"), providers={},
         ))
+        self.control = FleetManagement()
+        self.control.register("worker-1")
+        self.service.fleet.management = self.control
         content = b"coverage plugin"
         self.artifact, _ = self.service.artifacts.upload(
             io.BytesIO(content), len(content), kind="plugin", name="coverage", version="1",
@@ -419,10 +424,14 @@ class DeploymentHTTPTests(unittest.TestCase):
             }}},
         })
         self.assertEqual(200, status)
+        self.service.fleet.report("worker-1", {"desired_revision": first["desired"]["revision"],
+            "state": "ready", "components": [{**item, "state": "active"} for item in components]})
         _, second = self.request("/api/deployments/worker-1/desired", "PUT", {
             "revision": first["desired"]["revision"], "components": components,
             "config_patch": {"plugins": {"custom": {"enabled": False}}},
         })
+        self.service.fleet.report("worker-1", {"desired_revision": second["desired"]["revision"],
+            "state": "ready", "components": [{**item, "state": "active"} for item in components]})
         status, rollback = self.request("/api/deployments/worker-1/desired", "PUT", {
             "revision": second["desired"]["revision"], "action": "rollback",
             "target_revision": first["desired"]["revision"], "reason": "restore plugin",

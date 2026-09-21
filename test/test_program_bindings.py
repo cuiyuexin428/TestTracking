@@ -47,6 +47,7 @@ class ProgramBindingTests(unittest.TestCase):
         status = {'online': True, 'instance_id': 'original-scheduler',
                   'config_path': str(self.scheduler_path),
                   'configuration': copy.deepcopy(self.scheduler_config),
+                  'agents': [{'client_id': 'worker-http', 'online': True, 'state': 'ready', 'busy': False}],
                   'active_runs': [], 'queued_runs': []}
         mocked = patch.object(self.service.management, 'get_status', return_value=status)
         mocked.start()
@@ -290,6 +291,24 @@ class ProgramBindingTests(unittest.TestCase):
         self.assertEqual(original, self.scheduler_path.read_bytes())
         self.assertFalse(self.store.path.exists())
 
+    def test_batch_binding_derives_identity_from_each_merged_configuration(self):
+        base = self.coverage_body()
+        base['config_patch']['plugins']['coverage']['dll'] = 'coverage.dll'
+        self.store.put_desired('worker-http', {'revision': None, **base})
+        request = {'client_ids': ['worker-http'], 'components': [],
+                   'config_patch': {'plugins': {'coverage': {'store_cov': True}}}}
+        preview = self.service.fleet.preview(request)
+        with patch.object(self.service.management, 'require_plugin_idle'):
+            saved = self.service.bind_deployment_scheduler({**request, 'scheduler_revision': preview['scheduler_revision']})
+        self.assertEqual(preview['scheduler_plugins'], saved['scheduler_plugins'])
+        self.assertNotEqual(self.coverage_version(base), saved['scheduler_plugins']['coverage']['expected_program_version'])
+        self.assertFalse(self.store.get('worker-http')['desired']['config_patch']['plugins']['coverage']['store_cov'])
+
+    def test_invalid_batch_binding_returns_validation_error(self):
+        status, _ = self.service.deployment_operation('/api/deployments/bind-scheduler',
+            {'client_ids': [], 'components': [], 'config_patch': {}})
+        self.assertEqual(400, status)
+
     def test_http_preview_bind_and_desired_share_canonical_identity(self):
         handler = type('ProgramBindingHandler', (Handler,), {
             'service': self.service, 'log_message': lambda *args: None})
@@ -319,8 +338,9 @@ class ProgramBindingTests(unittest.TestCase):
                 status, stale = request('/api/deployments/bind-scheduler', 'POST', {
                     **body, 'scheduler_revision': preview['scheduler_revision']})
                 self.assertEqual(409, status, stale)
-            status, published = request('/api/deployments/worker-http/desired', 'PUT', {
-                'revision': None, **body})
+            with patch.object(self.service.management, 'client_control', return_value={'ok': True}):
+                status, published = request('/api/deployments/worker-http/desired', 'PUT', {
+                    'revision': None, **body})
             self.assertEqual(200, status, published)
             desired = published['desired']
             self.assertEqual(preview['config_patch'], desired['config_patch'])

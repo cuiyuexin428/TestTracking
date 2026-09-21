@@ -36,6 +36,7 @@ param(
     [switch]$OnlyClient,
     [switch]$OnlyProgram,
     [switch]$OnlyDataset,
+    [switch]$Bootstrap,
     [string]$ProgramVersion = '1.0',
     [string]$BaselineProgramVersion = '1.0',
     [string]$CandidateProgramVersion = '1.0',
@@ -69,11 +70,70 @@ function Resolve-ProjectPath([string]$Path) {
 if (@($OnlyClient, $OnlyProgram, $OnlyDataset).Where({ $_ }).Count -gt 1) {
     throw 'Choose at most one of -OnlyClient, -OnlyProgram, -OnlyDataset'
 }
+if ($Bootstrap -and ($OnlyClient -or $OnlyProgram -or $OnlyDataset)) {
+    throw '-Bootstrap creates a fresh base client; do not combine it with component update switches.'
+}
 if ($Config -ne 'Release') {
     throw 'Deployment packages require -Config Release; Debug runtimes cannot be redistributed'
 }
 
 $OutDir = if ($OutDir) { Resolve-ProjectPath $OutDir } else { Join-Path $root 'dist\client_package' }
+if ($Bootstrap) {
+    $serviceUri = $null
+    if (-not [Uri]::TryCreate($DeploymentEndpoint, [UriKind]::Absolute, [ref]$serviceUri) -or
+        $serviceUri.Scheme -notin @('http', 'https')) {
+        throw '-Bootstrap requires -DeploymentEndpoint with the HTTP(S) result service address.'
+    }
+    if ((Test-Path -LiteralPath $OutDir) -and @(Get-ChildItem -LiteralPath $OutDir -Force).Count -gt 0) {
+        throw '-Bootstrap requires an empty output directory; existing client configurations must be preserved.'
+    }
+    $BinDir = Resolve-PackageBinaryDir -ProjectRoot $root -Explicit $BinDir -Executable 'client.exe' -Config $Config
+    if (-not (Test-Path -LiteralPath (Join-Path $BinDir 'common.dll') -PathType Leaf)) {
+        throw "Client framework runtime not found: $BinDir\common.dll"
+    }
+    $VCRuntimeDir = Resolve-ProjectPath $VCRuntimeDir
+    New-Item -ItemType Directory -Force (Join-Path $OutDir 'config'), (Join-Path $OutDir 'tools') | Out-Null
+    Copy-Item -LiteralPath (Join-Path $BinDir 'client.exe') -Destination $OutDir
+    # Bootstrap contains framework dependencies only. Business plugin DLLs and
+    # programs arrive through the deployment service after client registration.
+    Get-ChildItem -LiteralPath $BinDir -File -Filter '*.dll' | Where-Object {
+        $_.Name -match '^(common|libprotobuf|abseil_dll|libpq|libssl-.*|libcrypto-.*|libiconv.*|libintl.*|libwinpthread.*|libzmq.*|zlib.*)\.dll$'
+    } | Copy-Item -Destination $OutDir
+    Copy-VCRuntime -Destination $OutDir -RuntimeDir $VCRuntimeDir | Out-Null
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'client_update.ps1') -Destination (Join-Path $OutDir 'tools')
+    $bootstrapHost = if ($ServerIp) { $ServerIp } else { $serviceUri.Host }
+    if ($bootstrapHost.Contains(':') -and -not $bootstrapHost.StartsWith('[')) { $bootstrapHost = '[' + $bootstrapHost + ']' }
+    $bootstrapEndpoint = if ($Endpoint) { $Endpoint } else { "tcp://${bootstrapHost}:$ServerPort" }
+    $bootstrapId = if ($PSBoundParameters.ContainsKey('WorkerId')) { $WorkerId } else { 'auto' }
+    $bootstrapConfig = @{
+        scheduler = @{ endpoint = $bootstrapEndpoint; poll_timeout_ms = 50 }
+        client = @{ worker_id = $bootstrapId; deployment_endpoint = $DeploymentEndpoint.TrimEnd('/');
+                    deployment_poll_seconds = 3; deployment_stage_timeout_seconds = 0;
+                    heartbeat_interval_ms = 1000; task_threads = $TaskThreads;
+                    execution_windows = @(); update_windows = @() }
+        plugins = @{}
+    }
+    Write-AtomicText (Join-Path $OutDir 'config\client.json') ($bootstrapConfig | ConvertTo-Json -Depth 10)
+    @"
+@echo off
+cd /d "%~dp0"
+client.exe config\client.json
+pause
+"@ | Set-Content -LiteralPath (Join-Path $OutDir 'start_client.bat') -Encoding ASCII
+    @"
+# Bootstrap client
+
+Copy this directory before first startup to each client and run start_client.bat.
+The first startup replaces worker_id=auto with a persistent identity unique to that copy.
+The Agent is initially online without plugins; configure its plugins and data from the server interface.
+
+The scheduler address defaults to the DeploymentEndpoint host with TCP port $ServerPort.
+For a custom scheduler router port, build with -ServerPort <port>; -Endpoint overrides the complete address.
+The deployment service address and scheduler address remain editable in config/client.json.
+"@ | Set-Content -LiteralPath (Join-Path $OutDir 'README.md') -Encoding UTF8
+    Write-Host "built bootstrap client: $OutDir; first start creates a persistent client identity"
+    return
+}
 $clientConfigPath = Join-Path $OutDir 'config\client.json'
 $previousConfig = $null
 if (($OnlyClient -or $OnlyProgram -or $OnlyDataset) -and (Test-Path -LiteralPath $clientConfigPath)) {

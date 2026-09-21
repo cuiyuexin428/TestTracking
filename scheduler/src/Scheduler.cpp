@@ -40,6 +40,7 @@ Scheduler::~Scheduler() {
 }
 
 void Scheduler::start() {
+    LoadClientControl();
     if (!LoadPlugins()) throw std::runtime_error("Scheduler: plugin loading failed");
     const auto connection = config_.get("server.db_conn", std::string());
     if (!connection.empty()) {
@@ -255,6 +256,8 @@ void Scheduler::RunProcessing() {
 }
 
 nlohmann::json Scheduler::HandleCommand(const ControlCommand& command) {
+    if (command.kind == ControlCommand::Kind::ClientControl)
+        return HandleClientControl(command.client_control);
     const auto reject = [](const std::string& error) -> nlohmann::json {
         return {{"ok", false}, {"error", error}, {"http_status", 409}};
     };
@@ -294,6 +297,8 @@ nlohmann::json Scheduler::HandleCommand(const ControlCommand& command) {
             if (!ok) LOG_WARN("shutdown: incomplete persistence retained for recovery");
             return {{"ok", ok}};
         }
+        case ControlCommand::Kind::ClientControl:
+            break;
     }
     return reject("unknown command");
 }
@@ -641,6 +646,7 @@ void Scheduler::ReclaimClientTasks(const std::string& identity, const std::strin
 }
 
 void Scheduler::RunTimeoutChecks() {
+    ExpireClientReservations();
     std::vector<std::string> received;
     for (const auto& pair : in_flight_)
         if (pair.second.received) received.push_back(pair.first);

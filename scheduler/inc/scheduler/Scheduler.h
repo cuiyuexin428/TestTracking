@@ -63,6 +63,20 @@ class Scheduler {
         Clock::time_point sent_at;
         bool acked = false, received = false;
         common::TaskResult result;
+        std::string physical_client_id;
+    };
+    struct AgentEntry {
+        std::string instance_id, hostname, state, agent_version, active_revision;
+        std::vector<std::string> plugin_keys;
+        Clock::time_point last_seen{};
+        bool update_window_open = false;
+        long long last_seen_at_ms = 0;
+        bool seen_since_start = true;
+    };
+    struct ClientReservation {
+        std::string reservation_id;
+        bool committed = false;
+        long long expires_at_ms = 0;
     };
     struct RunContext {
         std::string run_id, plugin_type;
@@ -87,7 +101,7 @@ class Scheduler {
         std::unique_ptr<common::TaskPlugin, PluginDeleter> instance;
     };
     struct ControlCommand {
-        enum class Kind { Run, Stop, Wake, Shutdown };
+        enum class Kind { Run, Stop, Wake, Shutdown, ClientControl };
         Kind kind;
         std::string plugin_type, dataset_version, params;
         std::shared_ptr<std::promise<nlohmann::json>> completion;
@@ -96,6 +110,7 @@ class Scheduler {
         bool force_rerun = false;
         std::string force_rerun_reason;
         std::vector<std::string> worker_ids;
+        nlohmann::json client_control;
     };
     struct AcceptedReport {
         std::string identity, session_id, plugin_type, task_id, run_id, attempt_id;
@@ -104,6 +119,13 @@ class Scheduler {
     bool Submit(ControlCommand command);
     nlohmann::json SubmitDetailed(ControlCommand command, bool bounded = false);
     nlohmann::json BuildStatus() const;
+    nlohmann::json HandleClientControl(const nlohmann::json&);
+    void LoadClientControl();
+    bool SaveClientControl(const std::unordered_map<std::string, ClientReservation>&) const;
+    void ExpireClientReservations();
+    bool PhysicalClientBusy(const std::string&) const;
+    void WakePhysicalClients(const std::vector<std::string>&);
+    void AppendAgentStatus(nlohmann::json&) const;
     void PublishStatus();
     bool LoadPlugins();
     void RestoreRuns();
@@ -162,6 +184,9 @@ class Scheduler {
     nlohmann::json status_snapshot_;
     Clock::time_point status_updated_;
     std::unordered_map<std::string, ClientEntry> clients_;
+    std::unordered_map<std::string, AgentEntry> agents_;
+    std::unordered_map<std::string, ClientReservation> client_reservations_;
+    std::string client_control_path_;
     std::unordered_map<std::string, InFlight> in_flight_;
     std::unordered_map<common::TaskPlugin*, RunContext> active_runs_;
     std::unordered_map<common::TaskPlugin*, std::deque<RunDefinition>> queued_runs_;

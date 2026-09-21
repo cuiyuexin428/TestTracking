@@ -45,12 +45,15 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME test_plugin_views COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/test_plugin_views.py -v)
     set_tests_properties(test_plugin_views PROPERTIES TIMEOUT 30)
-    foreach(name dsh_proxy reports analysis_catalog python_analysis_dependencies ai_providers management management_http artifacts deployments program_bindings server_plugins)
+    foreach(name dsh_proxy reports analysis_catalog python_analysis_dependencies ai_providers management management_http artifacts deployments fleet program_bindings server_plugins)
         add_test(NAME test_${name} COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/test_${name}.py -v)
         set_tests_properties(test_${name} PROPERTIES TIMEOUT 90)
     endforeach()
     if(WIN32)
+        add_test(NAME test_client_bootstrap COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_client_bootstrap.py --client $<TARGET_FILE:client> -v)
+        set_tests_properties(test_client_bootstrap PROPERTIES TIMEOUT 90)
         add_test(NAME test_client_deployment_integration COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/test_client_deployment_integration.py
             --bin-dir $<TARGET_FILE_DIR:client> -v)

@@ -171,6 +171,16 @@ void Scheduler::SendNoTask(const IncomingMessage& msg) {
 
 void Scheduler::HandleRequestTask(const IncomingMessage& msg) {
     if (!IsCurrentSession(msg)) return;
+    ExpireClientReservations();
+    std::string physical_client_id;
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex_);
+        physical_client_id = clients_.at(msg.identity).physical_client_id;
+    }
+    if (client_reservations_.count(physical_client_id)) {
+        SendNoTask(msg);
+        return;
+    }
     auto* plugin = plugins_by_type_.at(msg.envelope.plugin_type());
     const auto active = active_runs_.find(plugin);
     if (active == active_runs_.end() || active->second.stopping) {
@@ -215,6 +225,7 @@ void Scheduler::HandleRequestTask(const IncomingMessage& msg) {
         }
         InFlight attempt;
         attempt.identity = msg.identity;
+        attempt.physical_client_id = physical_client_id;
         attempt.session_id = msg.envelope.session_id();
         attempt.plugin_type = msg.envelope.plugin_type();
         attempt.run_id = task.run_id();

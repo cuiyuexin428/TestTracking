@@ -54,7 +54,7 @@ _LABELS = {
     "server.management_endpoint": ("本机管理地址", "必须与结果服务 scheduler_management_url 一致，例如 http://127.0.0.1:5556。"),
     "scheduler.endpoint": ("服务端地址", "客户端连接的 ZeroMQ 地址，如 tcp://192.168.1.10:5555。"),
     "client.worker_id": ("客户端标识", "每台运行中的客户端必须使用不同标识。"),
-    "client.task_threads": ("并行任务数", "单台客户端同时执行的任务数。"),
+    "client.task_threads": ("每插件并行任务数", "每个启用插件分别使用此数量的执行槽。"),
     "client.execution_windows": ("任务执行时间窗", "只在时间窗内领取新任务，已开始任务继续完成。"),
     "client.update_windows": ("部署更新时间窗", "供客户端制品更新使用，与任务执行时间窗独立。"),
     "host": ("网页监听地址", "0.0.0.0 允许局域网访问。"),
@@ -259,7 +259,8 @@ def _validate(kind: str, value: dict[str, Any]) -> None:
             if plugin.get("enabled") and not plugin.get("dll"):
                 raise ManagementError(f"plugins.{name}.dll 不能为空")
         if kind == "client":
-            if not any(item.get("enabled", False) is True for item in value["plugins"].values()):
+            if (not value["client"].get("deployment_endpoint") and
+                    not any(item.get("enabled", False) is True for item in value["plugins"].values())):
                 raise ManagementError("客户端至少启用一个执行插件")
             settings = value["client"]
             validate_windows(settings, "execution_windows")
@@ -356,6 +357,10 @@ class ManagementService:
                             details[key] = rejection[key]
                     if isinstance(rejection.get("force_rerun_available"), bool):
                         details["force_rerun_available"] = rejection["force_rerun_available"]
+                if isinstance(rejection, dict) and isinstance(rejection.get("unavailable"), list):
+                    details["unavailable"] = [
+                        {key: item[key] for key in ("client_id", "reason") if isinstance(item.get(key), str)}
+                        for item in rejection["unavailable"] if isinstance(item, dict)]
             except (ValueError, UnicodeError):
                 error = str(exc)
             raise ManagementError(str(error), exc.code if 400 <= exc.code < 600 else 502,
@@ -368,12 +373,21 @@ class ManagementService:
     def get_status(self) -> dict[str, Any]:
         try:
             result = self._request("/status")
-            return {"online": True, "clients": [], "plugins": [], "active_runs": [],
+            return {"online": True, "clients": [], "agents": [], "plugins": [], "active_runs": [],
                     "queued_runs": [], "in_flight": 0,
                     **result}
         except ManagementError as exc:
-            return {"online": False, "reason": str(exc), "clients": [], "plugins": [],
+            return {"online": False, "reason": str(exc), "clients": [], "agents": [], "plugins": [],
                     "active_runs": [], "queued_runs": [], "in_flight": 0}
+
+    def client_control(self, action: str, **values: Any) -> dict[str, Any]:
+        if action not in {"agent_heartbeat", "reserve_clients", "commit_reservation", "release_clients"}:
+            raise ManagementError("unknown client control action")
+        result = self._request("/commands", {**values, "action": action})
+        if result.get("ok") is not True:
+            raise ManagementError(result.get("error", "客户端管理操作失败"), 409,
+                                  details={"unavailable": result.get("unavailable", [])})
+        return result
 
     def command(self, body: dict[str, Any]) -> dict[str, Any]:
         # Installation/binding and UI task submission share the same lock.

@@ -37,6 +37,10 @@ class Peer {
             try {
                 endpoint = "tcp://127.0.0.1:" + std::to_string(port);
                 auto candidate = std::make_unique<common::ZmqRouter>(endpoint);
+                // Match the production server: an Agent restart must replace
+                // the old connection with the same stable worker identity.
+                const int handover = 1;
+                candidate->setOption(ZMQ_ROUTER_HANDOVER, &handover, sizeof(handover));
                 candidate->bind();
                 socket = std::move(candidate);
                 return;
@@ -94,7 +98,9 @@ class Peer {
     common::Envelope Wait(common::MessageType type, std::chrono::milliseconds timeout = 3s) {
         auto envelope =
             Receive([&](const common::Envelope& e) { return e.type() == type; }, timeout);
-        Require(envelope.type() == type, "timed out waiting for expected protocol message");
+        if (envelope.type() != type)
+            throw std::runtime_error("timed out waiting for " + common::MessageType_Name(type) +
+                                     " from " + identity + " at " + endpoint);
         return envelope;
     }
 
@@ -123,6 +129,19 @@ class Peer {
         response.mutable_register_result()->set_plugin_found(true);
         response.mutable_register_result()->set_registration_id(
             request.register_().registration_id());
+        Send(response);
+    }
+
+    void RejectRegistration(const common::Envelope& request, const std::string& reason) {
+        common::Envelope response;
+        response.set_type(common::REGISTER_RESULT);
+        auto* reply = response.mutable_register_result();
+        reply->set_accepted(false);
+        reply->set_plugin_found(true);
+        reply->set_reason(reason);
+        reply->set_registration_id(request.register_().registration_id());
+        reply->set_protocol_version(common::kProtocolVersion);
+        reply->add_capabilities(common::kAttemptIdsCapability);
         Send(response);
     }
 
@@ -419,10 +438,20 @@ public:
         if (output_ && output_ != INVALID_HANDLE_VALUE) CloseHandle(output_);
     }
     void Kill() { Require(TerminateProcess(process_.hProcess, 9), "cannot kill test agent"); WaitForSingleObject(process_.hProcess, 2000); }
-    void Quit() {
+    void Quit(const std::function<void()>& pump = {}) {
         DWORD written = 0;
         Require(WriteFile(input_, "quit\n", 5, &written, nullptr), "cannot request agent quit");
-        Require(WaitForSingleObject(process_.hProcess, 3000) == WAIT_OBJECT_0, "agent quit did not finish");
+        // The real scheduler continues serving the worker until Agent shutdown
+        // completes, including while its HTTP heartbeat thread is joining. If
+        // this in-process peer stops replying here, the old worker re-registers
+        // and leaves a stale nonce for the next Agent's registration handshake.
+        const auto deadline = std::chrono::steady_clock::now() + 3s;
+        while (WaitForSingleObject(process_.hProcess, 0) == WAIT_TIMEOUT &&
+               std::chrono::steady_clock::now() < deadline) {
+            if (pump) pump();
+            else WaitForSingleObject(process_.hProcess, 10);
+        }
+        Require(WaitForSingleObject(process_.hProcess, 0) == WAIT_OBJECT_0, "agent quit did not finish");
         DWORD code = 1;
         GetExitCodeProcess(process_.hProcess, &code);
         Require(code == 0, "agent quit returned a failure");
@@ -546,6 +575,8 @@ void TestAgentMultiplePlugins(const std::filesystem::path& binaries) {
         try {
             endpoint = "tcp://127.0.0.1:" + std::to_string(port);
             auto candidate = std::make_unique<common::ZmqRouter>(endpoint);
+            const int handover = 1;
+            candidate->setOption(ZMQ_ROUTER_HANDOVER, &handover, sizeof(handover));
             candidate->bind(); socket = std::move(candidate); break;
         } catch (const std::exception&) {}
     }
@@ -703,7 +734,7 @@ void TestAgentMultiplePlugins(const std::filesystem::path& binaries) {
          "multi-plugin deployment did not wait for all new workers to register");
     auto workers = agent.Workers();
     Require(workers.size() == 2, "multi-plugin deployment did not activate two isolated workers");
-    agent.Quit();
+    agent.Quit(poll);
     for (const auto handle : workers) {
         Require(WaitForSingleObject(handle, 1000) == WAIT_OBJECT_0, "client exit left a plugin worker running");
         CloseHandle(handle);
@@ -728,10 +759,10 @@ void TestAgentDeployment(const std::filesystem::path& binaries) {
     auto broken = config;
     broken["plugins"]["demo"]["dll"] = "missing-plugin.dll";
     std::ofstream(bad_path) << broken.dump();
-    const auto empty_path = directory / "no-enabled-plugins.json";
-    auto empty = config;
-    empty["plugins"]["demo"]["enabled"] = false;
-    std::ofstream(empty_path) << empty.dump();
+    const auto invalid_path = directory / "invalid-plugin-enabled.json";
+    auto invalid = config;
+    invalid["plugins"]["demo"]["enabled"] = "true";
+    std::ofstream(invalid_path) << invalid.dump();
     const auto active_file = directory / "deployments/active.json";
     const auto await_file = [&](const std::filesystem::path& file, const std::string& revision) {
         const auto deadline = std::chrono::steady_clock::now() + 6s;
@@ -767,13 +798,15 @@ void TestAgentDeployment(const std::filesystem::path& binaries) {
         await_file(active_file, std::string(64, 'a'));
         // An invalid prepared release must be rejected before draining or
         // replacing the healthy single-plugin worker, even if a helper stages it.
-        offer('b', empty_path);
+        // Managed clients now legitimately accept zero enabled plugins; an
+        // invalid flag still must not replace the healthy active generation.
+        offer('b', invalid_path);
         await_file(directory / "deployments/failed.json", std::string(64, 'b'));
         await_file(active_file, std::string(64, 'a'));
         const auto changed = peer.Receive([](const common::Envelope& envelope) {
             return envelope.type() == common::REGISTER;
         }, 200ms);
-        Require(changed.type() != common::REGISTER, "empty plugin release replaced the healthy worker");
+        Require(changed.type() != common::REGISTER, "invalid plugin release replaced the healthy worker");
         offer('c', bad_path);
         registration = peer.Wait(common::REGISTER, 6s);
         peer.Register(registration, "deployment-session");
@@ -781,7 +814,7 @@ void TestAgentDeployment(const std::filesystem::path& binaries) {
         await_file(active_file, std::string(64, 'a'));
         const auto repeated = peer.Receive([](const common::Envelope& envelope) { return envelope.type() == common::REGISTER; }, 2200ms);
         Require(repeated.type() != common::REGISTER, "failed generation was repeatedly retried");
-        agent.Quit();
+        agent.Quit([&] { peer.Pump(10ms); });
     }
     // Restart must select the committed active config rather than the now-invalid base.
     std::ofstream(path) << broken.dump();
@@ -796,7 +829,103 @@ void TestAgentDeployment(const std::filesystem::path& binaries) {
                     report.value("desired_revision", std::string()) == std::string(64, 'c'),
                 "Agent restart discarded the failed deployment report awaiting delivery");
     }
-    restarted.Quit();
+    restarted.Quit([&] { peer.Pump(10ms); });
+}
+
+void TestAgentRejectedRollback(const std::filesystem::path& binaries) {
+    Peer peer;
+    const auto directory = std::filesystem::temp_directory_path() /
+        (L"agent-rejected-rollback-" + std::to_wstring(std::chrono::steady_clock::now().time_since_epoch().count()));
+    CopyAgentPackage(binaries, directory);
+    const auto config_path = directory / "client.json";
+    const nlohmann::json config = {
+        {"scheduler", {{"endpoint", peer.endpoint}, {"poll_timeout_ms", 5}}},
+        {"client", {{"worker_id", "rollback-agent"}, {"heartbeat_interval_ms", 40},
+                    {"request_timeout_ms", 500}, {"deployment_endpoint", "http://fixture"},
+                    {"deployment_poll_seconds", 1}}},
+        {"plugins", {{"demo", {{"enabled", true}, {"dll", "demo.dll"}}}}}};
+    std::ofstream(config_path) << config.dump();
+    auto broken = config;
+    broken["plugins"]["demo"]["dll"] = "missing.dll";
+    const auto broken_path = directory / "broken.json";
+    std::ofstream(broken_path) << broken.dump();
+    auto repaired = config;
+    repaired["plugins"]["demo"]["enabled"] = false;
+    repaired["plugins"]["repaired"] = {{"enabled", true}, {"dll", "demo.dll"}};
+    const auto repaired_path = directory / "repaired.json";
+    std::ofstream(repaired_path) << repaired.dump();
+    const auto read = [&](const char* name) {
+        try { std::ifstream input(directory / "deployments" / name); return nlohmann::json::parse(input); }
+        catch (const std::exception&) { return nlohmann::json::object(); }
+    };
+    const auto offer = [&](char generation, const std::filesystem::path& path) {
+        const nlohmann::json staged = {{"status", "staged"}, {"revision", std::string(64, generation)},
+            {"config_path", path.u8string()}, {"reservation_id", "reservation-" + std::string(1, generation)},
+            {"components", nlohmann::json::array()}};
+        const auto temporary = directory / "inbox.tmp";
+        std::ofstream(temporary) << staged.dump();
+        Require(MoveFileExW(temporary.c_str(), (directory / "inbox.json").c_str(),
+                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH), "cannot publish rollback fixture");
+        return staged;
+    };
+    bool reject_old = false;
+    int rejected = 0;
+    const auto poll = [&] {
+        peer.Receive([&](const common::Envelope& envelope) {
+            if (envelope.type() == common::REGISTER) {
+                if (reject_old && envelope.register_().plugin_key() != "repaired") {
+                    ++rejected;
+                    peer.RejectRegistration(envelope, "server now requires the replacement program version");
+                } else peer.Register(envelope, "rollback-session");
+            }
+            return false;
+        }, 20ms);
+    };
+    const auto wait = [&](const std::function<bool()>& condition, const char* reason) {
+        const auto deadline = std::chrono::steady_clock::now() + 6s;
+        while (!condition() && std::chrono::steady_clock::now() < deadline) poll();
+        Require(condition(), reason);
+    };
+    const auto failed = [&] {
+        const auto report = read("agent_report.json");
+        return report.value("state", "") == "failed" &&
+               report.value("desired_revision", "") == std::string(64, 'b') &&
+               report.value("reservation_id", "") == "reservation-b";
+    };
+    nlohmann::json failed_deployment;
+    {
+        AgentProcess agent(directory, config_path.filename());
+        wait([&] { return peer.requests > 0; }, "initial worker did not become ready");
+        offer('a', config_path);
+        wait([&] { return read("active.json").value("revision", "") == std::string(64, 'a'); },
+             "initial managed release did not activate");
+        reject_old = true;
+        failed_deployment = offer('b', broken_path);
+        wait([&] { return rejected > 0 && failed(); },
+             "rollback waited for rejected old workers before reporting terminal failure");
+        Require(read("active.json").value("revision", "") == std::string(64, 'a'),
+                "rejected rollback replaced the committed configuration");
+        agent.Quit(poll);
+    }
+    // Reproduce interruption after restoring the old configuration but before
+    // its failure report was delivered. Recovery must also work while the old
+    // program can no longer register against the updated scheduler contract.
+    std::ofstream(directory / "deployments/failed.json") << nlohmann::json({
+        {"revision", std::string(64, 'b')}, {"reason", "replacement failed to start"},
+        {"deployment", failed_deployment}}).dump();
+    std::ofstream(directory / "deployments/agent_report.json") << nlohmann::json({
+        {"state", "applying"}, {"desired_revision", std::string(64, 'b')}}).dump();
+    AgentProcess restarted(directory, config_path.filename());
+    const auto before_restart = rejected;
+    wait([&] { return rejected > before_restart && failed(); },
+         "restart could not finish a rollback report while old registration was rejected");
+    offer('c', repaired_path);
+    wait([&] { return read("active.json").value("revision", "") == std::string(64, 'c') &&
+                     read("agent_report.json").value("state", "") == "ready"; },
+         "Agent could not apply a repaired generation after rejected rollback registration");
+    Require(!std::filesystem::exists(directory / "deployments/failed.json"),
+            "successful repair retained the old rejection marker");
+    restarted.Quit(poll);
 }
 
 void TestAgentLateUpdaterResults(const std::filesystem::path& binaries) {
@@ -887,7 +1016,7 @@ void TestAgentLateUpdaterResults(const std::filesystem::path& binaries) {
         Require(nlohmann::json::parse(input).at("revision") == previous,
                 "unactivated desired generation replaced the running deployment");
     }
-    agent.Quit();
+    agent.Quit([&] { peer.Pump(10ms); });
 }
 #endif
 }  // namespace
@@ -903,14 +1032,22 @@ int main(int argc, char** argv) {
 #else
         const auto demo_guard = common::DynamicLibrary::load((binary_directory / "libdemo.so").u8string());
 #endif
-        TestClient(binary_directory);
-        TestInitialRegistrationRetryLimit(binary_directory);
-        TestDeploymentDrain(binary_directory);
+        const auto run = [&](const char* name, void (*test)(const std::filesystem::path&)) {
+            std::cout << "RUN: " << name << std::endl;
+            try { test(binary_directory); }
+            catch (const std::exception& error) {
+                throw std::runtime_error(std::string(name) + ": " + error.what());
+            }
+        };
+        run("client protocol", TestClient);
+        run("registration retry limit", TestInitialRegistrationRetryLimit);
+        run("deployment drain", TestDeploymentDrain);
 #ifdef _WIN32
-        TestAgentProcesses(binary_directory);
-        TestAgentMultiplePlugins(binary_directory);
-        TestAgentDeployment(binary_directory);
-        TestAgentLateUpdaterResults(binary_directory);
+        run("Agent processes", TestAgentProcesses);
+        run("Agent multiple plugins", TestAgentMultiplePlugins);
+        run("Agent deployment", TestAgentDeployment);
+        run("Agent rejected rollback", TestAgentRejectedRollback);
+        run("Agent late updater results", TestAgentLateUpdaterResults);
 #endif
         std::cout << "PASS: report retries, stale ACK, STOP heartbeat, re-registration, protocol "
                      "rejection, registration retry limit, graceful deployment drain, Agent process "

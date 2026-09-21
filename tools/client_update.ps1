@@ -23,6 +23,7 @@ Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $script:Utf8 = New-Object System.Text.UTF8Encoding($false)
 $script:Revision = $null
+$script:ReservationId = ''
 $script:Components = @()
 $script:Endpoint = $null
 $script:WorkerId = $null
@@ -195,7 +196,7 @@ function Assert-EnabledPlugins($Config) {
         }
         if ($plugin.enabled -eq $true) { $enabledCount++ }
     }
-    if ($enabledCount -lt 1) {
+    if ($enabledCount -lt 1 -and -not $Config.client.deployment_endpoint) {
         throw "Client deployment requires at least one enabled plugin; found $enabledCount."
     }
 }
@@ -355,8 +356,13 @@ function Stage-Artifact($Artifact) {
         return $content
     }
     if ([IO.Directory]::Exists($content)) { throw "Incomplete cached artifact content: $sha" }
+    # Keep temporary extraction outside the 64-character cache identity. Nesting
+    # another GUID below it exceeds Windows PowerShell's path limit for ordinary
+    # program bundles such as OpenCppCoverage. Both directories remain on the
+    # same volume, so publication below the full SHA identity is still atomic.
     # Only this newly allocated staging directory can be recursively cleaned.
-    $stage = Join-Path $cacheRoot ('content-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    $stage = Join-Path $script:ObjectsRoot ('stage-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    if (Test-Path -LiteralPath $stage) { throw 'Staging directory already exists' }
     New-SafeDirectory $stage
     try {
         if ($isZip) { Expand-SafeZip $archive $stage }
@@ -370,8 +376,8 @@ function Stage-Artifact($Artifact) {
     } finally {
         if ([IO.Directory]::Exists($stage)) {
             $resolved = [IO.Path]::GetFullPath($stage)
-            if ([IO.Path]::GetDirectoryName($resolved) -ne $cacheRoot -or
-                [IO.Path]::GetFileName($resolved) -notmatch '^content-[0-9a-f]{32}\.tmp$') { throw 'Unsafe staging cleanup path' }
+            if ([IO.Path]::GetDirectoryName($resolved) -ne $script:ObjectsRoot -or
+                [IO.Path]::GetFileName($resolved) -notmatch '^stage-[0-9a-f]{32}\.tmp$') { throw 'Unsafe staging cleanup path' }
             Assert-NoLink $resolved
             Remove-Item -LiteralPath $resolved -Recurse -Force
         }
@@ -406,14 +412,36 @@ try {
     New-SafeDirectory $deploymentRoot
     $script:Lock = [IO.File]::Open((Join-Path $deploymentRoot 'update.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
     Send-PendingReport
-    $state = Invoke-Json ($script:Endpoint + '/api/deployments/' + $script:WorkerId)
+    try {
+        $state = Invoke-Json ($script:Endpoint + '/api/deployments/' + $script:WorkerId)
+    } catch [Net.WebException] {
+        $response = $_.Exception.Response
+        if ($null -ne $response -and [int]$response.StatusCode -in @(409, 503)) {
+            $status = [int]$response.StatusCode
+            $response.Dispose()
+            Write-AtomicJson $ResultPath @{ status = 'waiting_reservation'; revision = $null; components = @();
+                message = "Deployment reservation unavailable (HTTP $status); keeping the active configuration" }
+            exit 0
+        }
+        throw
+    }
     if (-not $state.desired) {
         Write-AtomicJson $ResultPath @{ status = 'current'; revision = $null; components = @() }
         exit 0
     }
     $desired = $state.desired
     $script:Revision = [string]$desired.revision
+    $script:ReservationId = [string]$desired.reservation_id
     if ($script:Revision -cnotmatch '^[0-9a-f]{64}$') { throw 'Deployment revision is invalid' }
+    # A terminal failure releases the scheduler reservation. Even if a broken
+    # download later becomes available, retrying this generation could activate
+    # it without a reservation. Only a newly published revision may retry.
+    if ($state.state -eq 'failed') {
+        Write-AtomicJson $ResultPath @{ status = 'rejected'; revision = $script:Revision;
+            reservation_id = $script:ReservationId; components = @();
+            message = 'This deployment revision failed; publish a new desired revision to retry' }
+        exit 0
+    }
     $script:ObjectsRoot = Join-Path $deploymentRoot 'objects'
     New-SafeDirectory $script:ObjectsRoot
     $slots = @{}
@@ -435,7 +463,7 @@ try {
     # Polling a large current dataset must not re-hash all of its files every time.
     if ($CurrentRevision -and $CurrentRevision -ceq $script:Revision) {
         foreach ($component in $script:Components) { $component.state = 'active' }
-        Write-AtomicJson $ResultPath @{ status = 'current'; revision = $script:Revision; components = $script:Components }
+        Write-AtomicJson $ResultPath @{ status = 'current'; revision = $script:Revision; reservation_id = $script:ReservationId; components = $script:Components }
         exit 0
     }
     # The Agent also retains a verified staging generation while draining long
@@ -450,18 +478,18 @@ try {
         Assert-EnabledPlugins $prepared
         foreach ($component in $script:Components) { $component.state = 'staged' }
         $status = if (Test-UpdateWindow $effectiveWindows) { 'staged' } else { 'waiting_window' }
-        Write-AtomicJson $ResultPath @{ status = $status; revision = $script:Revision; config_path = $preparedConfig; components = $script:Components }
+        Write-AtomicJson $ResultPath @{ status = $status; revision = $script:Revision; reservation_id = $script:ReservationId; config_path = $preparedConfig; components = $script:Components }
         exit 0
     }
     # Management heartbeat and reports remain available outside download windows.
     if (-not (Test-UpdateWindow $effectiveWindows)) {
-        Write-AtomicJson $ResultPath @{ status = 'waiting_window'; revision = $script:Revision; components = $script:Components }
+        Write-AtomicJson $ResultPath @{ status = 'waiting_window'; revision = $script:Revision; reservation_id = $script:ReservationId; components = $script:Components }
         exit 0
     }
     $index = 0
     foreach ($component in $desired.components) {
         if (-not (Test-UpdateWindow $effectiveWindows)) {
-            Write-AtomicJson $ResultPath @{ status = 'waiting_window'; revision = $script:Revision; components = $script:Components }
+            Write-AtomicJson $ResultPath @{ status = 'waiting_window'; revision = $script:Revision; reservation_id = $script:ReservationId; components = $script:Components }
             exit 0
         }
         $script:Components[$index].state = 'downloading'
@@ -483,14 +511,14 @@ try {
         if ($actual -cne $expected) { throw 'An immutable release already exists with different base configuration; publish a new desired revision' }
     } else { Write-AtomicJson $releaseConfig $config }
     $status = if (Test-UpdateWindow $effectiveWindows) { 'staged' } else { 'waiting_window' }
-    Write-AtomicJson $ResultPath @{ status = $status; revision = $script:Revision; config_path = $releaseConfig; components = $script:Components }
+    Write-AtomicJson $ResultPath @{ status = $status; revision = $script:Revision; reservation_id = $script:ReservationId; config_path = $releaseConfig; components = $script:Components }
     exit 0
 } catch {
     $message = $_.Exception.Message
     foreach ($component in $script:Components) {
         if ($component.state -eq 'downloading') { $component.state = 'failed'; $component.error = $message }
     }
-    Write-AtomicJson $ResultPath @{ status = 'failed'; revision = $script:Revision; message = $message; components = $script:Components }
+    Write-AtomicJson $ResultPath @{ status = 'failed'; revision = $script:Revision; reservation_id = $script:ReservationId; message = $message; components = $script:Components }
     Write-Error $message -ErrorAction Continue
     exit 1
 } finally {

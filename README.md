@@ -1,6 +1,6 @@
 # TestTracking
 
-TestTracking 把 STP 文件分发到多个客户端执行，并把原始结果保存到 PostgreSQL。服务端插件生成业务任务，客户端插件执行任务，独立工具在运行结束后生成覆盖率精简集合或比较报告。
+TestTracking 把 STP 文件分发到多个客户端执行，并把原始结果保存到 PostgreSQL。服务端插件生成业务任务，客户端插件执行任务，独立分析脚本直接读取数据库生成覆盖率精简集合或自定义报告。
 
 ```mermaid
 flowchart LR
@@ -16,7 +16,9 @@ flowchart LR
 当前主要使用两个插件：
 
 - `coverage`：客户端运行 OpenCppCoverage，`coverage_settle` 从数据库生成贪心精简集合。
-- `stpcompare`：客户端运行转换程序，`settle_stpcompare.ps1` 生成文本差异报告。
+- `stpcompare`：客户端分别运行新老转换程序，每份 STP 的四份 info 原始结果入库，比较方式由后续分析脚本决定。
+
+新机器可先安装不带插件的基础客户端，在服务端页面批量选择空闲机器，下发插件、程序和数据。每个插件使用独立 Worker，更新时由基础 Agent 自动切换和重启；结果展示与 DSH 原生助手集中在服务端界面。
 
 恢复路径以 PostgreSQL 为基础。scheduler 异常退出后可恢复原 run；客户端在心跳超时前或超时后重启，都可以重新注册并领取未完成任务。前提和暂缓边界见已知限制。
 
@@ -27,6 +29,7 @@ flowchart LR
 3. [开发说明](docs/开发说明.md)
 4. [部署与运行](docs/部署与运行.md)
 5. [已知限制](docs/已知限制.md)
+6. [基础客户端与批量部署](docs/基础客户端与批量部署.md)
 
 ## 构建与测试
 

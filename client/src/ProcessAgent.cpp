@@ -5,11 +5,17 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <winhttp.h>
 
 #include <algorithm>
 #include <chrono>
 #include <ctime>
+#include <condition_variable>
 #include <fstream>
+#include <iomanip>
+#include <mutex>
+#include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -17,6 +23,7 @@
 
 #include <json.hpp>
 #include "common/Logger.h"
+#include "common/Config.h"
 
 namespace client {
 namespace {
@@ -64,12 +71,71 @@ std::vector<std::string> EnabledPlugins(const std::filesystem::path& config) {
     std::vector<std::string> result;
     if (value.contains("plugins") && value["plugins"].is_object()) {
         for (const auto& item : value["plugins"].items()) {
-            if (item.value().is_object() && item.value().value("enabled", false))
+            if (!item.value().is_object() || (item.value().contains("enabled") && !item.value()["enabled"].is_boolean()))
+                throw std::runtime_error("Client: plugin configuration requires a boolean enabled: " + item.key());
+            if (item.value().value("enabled", false))
                 result.push_back(item.key());
         }
     }
-    if (result.empty()) throw std::runtime_error("Client: no enabled plugin");
+    if (result.empty() && value.value("client", Json::object()).value("deployment_endpoint", std::string()).empty())
+        throw std::runtime_error("Client: no enabled plugin");
     return result;
+}
+
+std::string NewIdentity() {
+    std::random_device random;
+    std::ostringstream output;
+    output << std::hex << std::setfill('0');
+    for (int index = 0; index < 4; ++index) output << std::setw(8) << static_cast<uint32_t>(random());
+    return output.str();
+}
+
+std::string Hostname() {
+    wchar_t hostname[MAX_COMPUTERNAME_LENGTH + 1]{};
+    DWORD count = MAX_COMPUTERNAME_LENGTH + 1;
+    if (!GetComputerNameW(hostname, &count)) return "unknown";
+    const int size = WideCharToMultiByte(CP_UTF8, 0, hostname, count, nullptr, 0, nullptr, nullptr);
+    std::string result(static_cast<size_t>(size), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, hostname, count, result.data(), size, nullptr, nullptr);
+    return result;
+}
+
+struct HttpHandle {
+    HINTERNET value = nullptr;
+    explicit HttpHandle(HINTERNET handle) : value(handle) {}
+    ~HttpHandle() { if (value) WinHttpCloseHandle(value); }
+    HttpHandle(const HttpHandle&) = delete;
+    HttpHandle& operator=(const HttpHandle&) = delete;
+};
+
+bool SendAgentHeartbeat(const std::string& endpoint, const std::string& worker, const Json& body) {
+    auto url = std::filesystem::u8path(endpoint + "/api/agents/" + worker + "/heartbeat").wstring();
+    URL_COMPONENTS parts{};
+    parts.dwStructSize = sizeof(parts);
+    parts.dwHostNameLength = static_cast<DWORD>(-1);
+    parts.dwUrlPathLength = static_cast<DWORD>(-1);
+    parts.dwExtraInfoLength = static_cast<DWORD>(-1);
+    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &parts) ||
+        (parts.nScheme != INTERNET_SCHEME_HTTP && parts.nScheme != INTERNET_SCHEME_HTTPS)) return false;
+    HttpHandle session(WinHttpOpen(L"TestTracking-Agent/2", WINHTTP_ACCESS_TYPE_NO_PROXY,
+                                  WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
+    if (!session.value) return false;
+    WinHttpSetTimeouts(session.value, 1000, 1000, 1000, 1000);
+    const std::wstring host(parts.lpszHostName, parts.dwHostNameLength);
+    std::wstring path(parts.lpszUrlPath, parts.dwUrlPathLength);
+    if (parts.dwExtraInfoLength) path.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
+    HttpHandle connection(WinHttpConnect(session.value, host.c_str(), parts.nPort, 0));
+    if (!connection.value) return false;
+    HttpHandle request(WinHttpOpenRequest(connection.value, L"POST", path.c_str(), nullptr,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, parts.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0));
+    if (!request.value) return false;
+    const auto data = body.dump();
+    if (!WinHttpSendRequest(request.value, L"Content-Type: application/json\r\n", static_cast<DWORD>(-1),
+                            const_cast<char*>(data.data()), static_cast<DWORD>(data.size()),
+                            static_cast<DWORD>(data.size()), 0) || !WinHttpReceiveResponse(request.value, nullptr)) return false;
+    DWORD status = 0, size = sizeof(status);
+    return WinHttpQueryHeaders(request.value, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                               WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX) && status == 200;
 }
 
 bool UpdateWindowOpen(const std::filesystem::path& config) {
@@ -113,9 +179,21 @@ public:
                  std::shared_ptr<std::atomic<bool>> stop)
         : executable_(std::move(executable)), base_config_(std::filesystem::absolute(config)),
           config_(base_config_), root_(std::filesystem::current_path()), stop_(std::move(stop)) {
-        const auto base = ReadJson(base_config_);
-        const auto settings = base.value("client", Json::object());
-        updates_enabled_ = !settings.value("deployment_endpoint", std::string()).empty();
+        auto base = ReadJson(base_config_);
+        auto settings = base.value("client", Json::object());
+        worker_id_ = settings.value("worker_id", std::string());
+        if (worker_id_.empty() || worker_id_ == "auto") {
+            worker_id_ = "client-" + NewIdentity();
+            base["client"]["worker_id"] = worker_id_;
+            WriteJson(base_config_, base);
+            common::Config::instance().load(base_config_.u8string());
+            settings = base["client"];
+        }
+        instance_id_ = NewIdentity();
+        hostname_ = Hostname();
+        deployment_endpoint_ = settings.value("deployment_endpoint", std::string());
+        while (!deployment_endpoint_.empty() && deployment_endpoint_.back() == '/') deployment_endpoint_.pop_back();
+        updates_enabled_ = !deployment_endpoint_.empty();
         update_interval_ = std::chrono::seconds(std::clamp(settings.value("deployment_poll_seconds", 30), 1, 3600));
         updater_timeout_ = std::chrono::seconds(std::max(0, settings.value("deployment_stage_timeout_seconds", 0)));
         const auto timeout = std::max(1, settings.value("register_timeout_ms", 5000));
@@ -130,8 +208,14 @@ public:
                 config_ = std::filesystem::u8path(active_.at("config_path").get<std::string>());
                 (void)EnabledPlugins(config_);
             }
-            if (std::filesystem::exists(state_dir_ / "failed.json"))
-                failed_revision_ = ReadJson(state_dir_ / "failed.json").value("revision", std::string());
+            if (std::filesystem::exists(state_dir_ / "failed.json")) {
+                const auto failure = ReadJson(state_dir_ / "failed.json");
+                failed_revision_ = failure.value("revision", std::string());
+                if (failed_revision_ != active_.value("revision", std::string())) {
+                    pending_failure_ = failure.value("deployment", Json::object());
+                    pending_failure_reason_ = failure.value("reason", std::string());
+                }
+            }
             prepared_revision_ = failed_revision_;
         }
         job_ = CreateJobObjectW(nullptr, nullptr);  // Never inherited by children.
@@ -146,6 +230,9 @@ public:
     }
 
     ~ProcessAgent() {
+        heartbeat_finished_.store(true);
+        heartbeat_wake_.notify_all();
+        if (heartbeat_thread_.joinable()) heartbeat_thread_.join();
         StopWorkers();
         if (updater_.handle) {
             TerminateProcess(updater_.handle, 1);
@@ -157,9 +244,13 @@ public:
 
     int Run() {
         StartWorkers();
+        ReportRestoredFailure();
+        RefreshHeartbeat();
+        if (updates_enabled_) heartbeat_thread_ = std::thread([this] { HeartbeatLoop(); });
         while (!stop_->load()) {
             PollUpdater();
             Supervise();
+            RefreshHeartbeat();
             if (exit_code_ != 0) return exit_code_;
             std::this_thread::sleep_for(20ms);
         }
@@ -176,6 +267,50 @@ private:
         bool registered = false;
         Clock::time_point started{}, restart_at{};
     };
+
+    void RefreshHeartbeat() {
+        if (!updates_enabled_) return;
+        const auto now = Clock::now();
+        if (now >= next_window_check_) {
+            try { update_window_open_ = UpdateWindowOpen(config_); }
+            catch (const std::exception& error) {
+                update_window_open_ = false;
+                LOG_WARN("cannot read agent update window: " << error.what());
+            }
+            next_window_check_ = now + 1s;
+        }
+        Json keys = Json::array();
+        bool all_ready = true;
+        for (const auto& worker : workers_) {
+            keys.push_back(worker.plugin);
+            all_ready = all_ready && worker.registered && worker.process.handle;
+        }
+        const std::string status = mode_ == Mode::Draining || mode_ == Mode::Activating ? "updating" :
+            (mode_ == Mode::RollingBack ? "error" : (workers_.empty() ? "unconfigured" : (all_ready ? "ready" : "starting")));
+        Json heartbeat = {{"instance_id", instance_id_}, {"hostname", hostname_}, {"state", status},
+            {"plugin_keys", std::move(keys)}, {"agent_version", "2"},
+            {"active_revision", active_.value("revision", std::string())}, {"update_window_open", update_window_open_}};
+        std::lock_guard<std::mutex> lock(heartbeat_mutex_);
+        heartbeat_snapshot_ = std::move(heartbeat);
+    }
+
+    void HeartbeatLoop() {
+        while (!heartbeat_finished_.load()) {
+            Json snapshot;
+            {
+                std::lock_guard<std::mutex> lock(heartbeat_mutex_);
+                snapshot = heartbeat_snapshot_;
+            }
+            try {
+                if (!SendAgentHeartbeat(deployment_endpoint_, worker_id_, snapshot))
+                    LOG_WARN("agent heartbeat could not reach deployment service");
+            } catch (const std::exception& error) {
+                LOG_WARN("agent heartbeat failed: " << error.what());
+            }
+            std::unique_lock<std::mutex> lock(heartbeat_mutex_);
+            heartbeat_wake_.wait_for(lock, 3s, [this] { return heartbeat_finished_.load(); });
+        }
+    }
 
     Process Launch(const std::filesystem::path& executable, std::wstring command,
                    const std::vector<HANDLE>& signals = {}, bool share_output = false,
@@ -283,12 +418,23 @@ private:
         }
     }
 
+    void StartSupervisedWorker(Worker& worker) {
+        try { StartWorker(worker); }
+        catch (const std::exception& error) {
+            if (!updates_enabled_ || mode_ == Mode::Activating) throw;
+            // The independent Agent must remain available for a repair even
+            // when the restored worker process cannot be created right now.
+            worker.restart_at = Clock::now() + 1s;
+            LOG_ERROR("client worker " << worker.plugin << " could not start; will retry: " << error.what());
+        }
+    }
+
     void StartWorkers() {
         workers_.clear();
         const auto plugins = EnabledPlugins(config_);
         for (const auto& plugin : plugins) { Worker worker; worker.plugin = plugin; workers_.push_back(worker); }
         LOG_INFO("client agent starting " << workers_.size() << " plugin worker" << (workers_.size() == 1 ? "" : "s"));
-        for (auto& worker : workers_) StartWorker(worker);
+        for (auto& worker : workers_) StartSupervisedWorker(worker);
     }
 
     static void CloseWorker(Worker& worker) {
@@ -328,29 +474,44 @@ private:
                 {"state", std::string(state) == "ready" ? "active" : std::string(state) == "failed" ? "failed" : component.value("state", "staged")}});
         }
         WriteJson(state_dir_ / "agent_report.json", {{"desired_revision", deployment.at("revision")},
-            {"state", state}, {"components", components}, {"agent_version", "1"}, {"message", message}});
+            {"reservation_id", deployment.value("reservation_id", std::string())},
+            {"state", state}, {"components", components}, {"agent_version", "2"}, {"message", message}});
         next_update_ = Clock::now();
+    }
+
+    void ReportRestoredFailure() {
+        if (pending_failure_.empty()) return;
+        // Call only after the replacement workers have stopped and config_ is
+        // restored to the committed/base generation. Its workers need not be
+        // registered: a scheduler already requiring the new program version
+        // may reject the old one until the user publishes a corrected release.
+        Report(pending_failure_, "failed", pending_failure_reason_);
+        WriteJson(state_dir_ / "failed.json", {{"revision", failed_revision_}, {"reason", pending_failure_reason_}});
+        pending_failure_ = Json::object();
+        pending_failure_reason_.clear();
     }
 
     void ActivationFailed(const std::string& reason) {
         LOG_ERROR("deployment activation failed; restoring previous configuration: " << reason);
         StopWorkers();
         failed_revision_ = staged_.value("revision", std::string());
-        WriteJson(state_dir_ / "failed.json", {{"revision", failed_revision_}, {"reason", reason}});
-        Report(staged_, "failed", reason);
+        pending_failure_ = staged_;
+        pending_failure_reason_ = reason;
+        WriteJson(state_dir_ / "failed.json", {{"revision", failed_revision_}, {"reason", reason}, {"deployment", staged_}});
         staged_ = Json();
         config_ = active_.contains("config_path") ? std::filesystem::u8path(active_.at("config_path").get<std::string>()) : base_config_;
         mode_ = Mode::RollingBack;
         StartWorkers();
+        ReportRestoredFailure();
     }
 
     void Supervise() {
         const auto now = Clock::now();
-        bool all_ready = !workers_.empty(), all_exited = true;
+        bool all_ready = true, all_exited = true;
         for (auto& worker : workers_) {
             if (!worker.process.handle) {
                 all_ready = false;
-                if (mode_ != Mode::Draining && now >= worker.restart_at) StartWorker(worker);
+                if (mode_ != Mode::Draining && now >= worker.restart_at) StartSupervisedWorker(worker);
                 if (worker.process.handle) all_exited = false;
                 continue;
             }
@@ -403,6 +564,9 @@ private:
                 } catch (const std::exception& error) { ActivationFailed(error.what()); return; }
                 active_ = staged_;
                 staged_ = Json();
+                failed_revision_.clear();
+                std::error_code ignored;
+                std::filesystem::remove(state_dir_ / "failed.json", ignored);
                 Report(active_, "ready");
                 LOG_INFO("deployment activated: " << active_.at("revision"));
             } else if (mode_ == Mode::Starting && active_.contains("revision")) {
@@ -450,18 +614,28 @@ private:
                     if (status == "failed")
                         LOG_WARN("ignoring preparation failure for active deployment " << revision
                                  << ": " << result.value("message", std::string()));
+                } else if (status == "rejected") {
+                    // The service already has this terminal failure. Leave its
+                    // durable report intact and wait for a newly reserved revision.
+                    next_update_ = now + update_interval_;
                 } else if (!revision.empty() && revision == failed_revision_) {
                     // failed.json may survive a crash before its failure report.
                     // The updater has confirmed this is still the desired
                     // generation and supplies its complete component list.
                     const auto failure = ReadJson(state_dir_ / "failed.json");
-                    Report(result, "failed", failure.value("reason", std::string("deployment activation failed")));
+                    if (pending_failure_.empty() && mode_ != Mode::Draining && mode_ != Mode::Activating)
+                        Report(result, "failed", failure.value("reason", std::string("deployment activation failed")));
                     next_update_ = now + update_interval_;
                 } else if (status == "waiting_window" && !revision.empty()) {
                     Report(result, "waiting_window");
                     next_update_ = now + update_interval_;
                 } else if (status == "failed") {
-                    if (!revision.empty()) Report(result, "failed", result.value("message", std::string("staging failed")));
+                    if (!revision.empty()) {
+                        failed_revision_ = revision;
+                        const auto reason = result.value("message", std::string("staging failed"));
+                        WriteJson(state_dir_ / "failed.json", {{"revision", revision}, {"reason", reason}});
+                        Report(result, "failed", reason);
+                    }
                     LOG_WARN("client deployment staging failed: " << result.value("message", std::string()));
                     next_update_ = now + update_interval_;
                 } else if (code == 0 && status == "staged" && !revision.empty() &&
@@ -515,8 +689,16 @@ private:
     HANDLE job_ = nullptr;
     std::vector<Worker> workers_;
     Process updater_;
-    Json active_ = Json::object(), staged_;
-    std::string failed_revision_, prepared_revision_;
+    Json active_ = Json::object(), staged_, pending_failure_ = Json::object();
+    std::string failed_revision_, prepared_revision_, pending_failure_reason_;
+    std::string deployment_endpoint_, worker_id_, instance_id_, hostname_;
+    std::mutex heartbeat_mutex_;
+    std::condition_variable heartbeat_wake_;
+    std::thread heartbeat_thread_;
+    std::atomic<bool> heartbeat_finished_{false};
+    Json heartbeat_snapshot_ = Json::object();
+    bool update_window_open_ = true;
+    Clock::time_point next_window_check_{};
     Mode mode_ = Mode::Starting;
     bool updates_enabled_ = false;
     int exit_code_ = 0;

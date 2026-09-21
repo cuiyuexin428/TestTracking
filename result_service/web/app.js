@@ -51,6 +51,8 @@ const state = {
   historyRuns: [], historyOffset: 0, historySearch: '', historyHasMore: false,
   historyRequest: 0, historyBusy: false,
   scheduler: null, schedulerRequest: 0, schedulerBusy: false, commandBusy: false,
+  agents: null, agentsBusy: false, agentsLoad: null, agentsError: '', selectedAgentIds: [],
+  deploymentBatchTargets: null, deploymentBatchReview: null, deploymentBatchHistory: null,
   selectedWorkerIds: [],
   artifacts: [], deployments: [], artifactBusy: false, deploymentBusy: false,
   workspaceTab: 'plugins', artifactSearch: '', artifactFilter: '', workspaceDrawerTrigger: null,
@@ -66,7 +68,7 @@ const $ = (id) => document.getElementById(id);
 const pages = {
   overview: ['运行总览', '查看持久化任务进度；记录状态不代表调度进程当前在线。'],
   results: ['结果分析', '从已入库结果生成可替换的 Python 交互报告。'],
-  clients: ['客户端', '查看实时连接、心跳、资源和正在处理的任务。'],
+  clients: ['客户端', '选择空闲机器，配置插件和资源，追踪每台机器的执行与部署。'],
   history: ['历史运行', '查看长期保存的运行记录。'],
   plugins: ['插件与部署', '管理插件和制品，按步骤配置客户端部署。'],
   logs: ['运行日志', '查询服务器日志，按级别和内容筛选。']
@@ -194,6 +196,7 @@ function navigate(page) {
   $('crumb').textContent = pages[page][0];
   if (page === 'history') loadHistory().catch(showHistoryError);
   if (page === 'clients' || page === 'overview' || page === 'plugins') loadScheduler();
+  if (page === 'clients') { loadAgents(); loadArtifacts(); }
   if (page === 'logs') loadLogs();
   if (page === 'plugins') loadConfig($('config-kind').value || state.configKind);
   if (page === 'plugins') loadArtifacts();
@@ -247,6 +250,7 @@ function renderScheduler() {
 }
 
 function renderClients() {
+  if (state.agents !== null) return renderAgentClients();
   const online = Boolean(state.scheduler?.online);
   const delayed = Number(state.scheduler?.snapshot_age_ms || 0) > 5000;
   const clients = online ? (state.scheduler.clients || []) : [];
@@ -263,6 +267,52 @@ function renderClients() {
     const heartbeat = Number.isFinite(Number(client.last_seen_age_ms)) ? `${(Number(client.last_seen_age_ms) / 1000).toFixed(1)} 秒前` : '--';
     return `<section class="client-plugin"><div class="panel-head"><h3>${escapeHtml(client.plugin_key || client.plugin_type)}</h3><span class="chip ${client.registered ? (client.status === 'busy' ? 'blue' : 'green') : 'amber'}">${client.registered ? (client.status === 'busy' ? '处理中' : '空闲') : '尚未注册'}</span></div><div class="client-facts"><span>插件 <b>${escapeHtml(client.plugin_type)}</b></span><span>心跳 <b>${heartbeat}</b></span><span>地址 <b>${escapeHtml(client.ip || client.peer_address || '--')}</b></span><span>内存 <b>${formatBytes(client.memory_bytes)}</b></span><span>可用磁盘 <b>${formatBytes(client.disk_free_bytes)}</b></span><span>CPU <b>${client.cpu_percent === null || client.cpu_percent === undefined ? '--' : `${Number(client.cpu_percent).toFixed(0)}%`}</b></span></div><p class="client-info">${escapeHtml(client.worker_id)} · ${escapeHtml(client.plugin_info || '')}</p>${tasks.length ? `<div class="table-wrap"><table><thead><tr><th>当前任务</th><th>运行</th><th>尝试</th><th>状态</th></tr></thead><tbody>${tasks.map((task) => `<tr><td>${escapeHtml(task.task_id)}</td><td>${escapeHtml(task.run_id)}</td><td>${escapeHtml(task.attempt_id)}</td><td>${task.acked ? '客户端已确认' : '等待确认'}</td></tr>`).join('')}</tbody></table></div>` : '<p class="management-status">当前没有分配的任务</p>'}</section>`;
   }).join('')}</article>`).join('') : `<div class="empty-panel"><h2>${online ? '暂无客户端连接' : '调度器离线'}</h2><p>${online ? '启动客户端后，这里会显示连接、心跳和任务。' : '恢复调度服务后会自动更新。'}</p></div>`;
+}
+
+function agentUnavailableReason(agent) {
+  if (state.agentsError) return '无法确认在线状态';
+  if (!agent?.online) return '离线';
+  if (agent.busy || (agent.workers || []).some((worker) => worker.status === 'busy' || (worker.tasks || []).length)) return '正在执行任务';
+  if (agent.state === 'updating' || agent.reservation_id) return '正在更新';
+  if (agent.configurable === false || !['ready', 'unconfigured', 'starting', 'error'].includes(agent.state)) return '管理进程尚未就绪';
+  return '';
+}
+
+function renderAgentClients() {
+  const agents = state.agents || [];
+  const labels = { unconfigured: '待配置', ready: '已就绪', starting: '正在启动', updating: '正在更新', error: '需要处理' };
+  $('client-count').textContent = `${agents.length} 台`;
+  $('clients-status').textContent = state.agentsError ? `客户端状态读取失败：${state.agentsError}。状态恢复后可配置。` : '客户端 Agent 独立上线；仅整机空闲时可以配置。每 5 秒刷新。';
+  $('client-list').innerHTML = agents.map((agent) => {
+    const reason = agentUnavailableReason(agent);
+    const workers = agent.workers || [];
+    const status = !agent.online ? '离线' : agent.busy || workers.some((item) => item.status === 'busy' || item.tasks?.length) ? '处理中' : agent.reservation_id ? '等待更新' : labels[agent.state] || agent.state;
+    const deployment = state.deployments.find((item) => item.client_id === agent.client_id);
+    const configHint = reason ? `${reason}，暂不能配置。` : agent.state === 'starting' ? '插件正在启动或等待注册，当前整机空闲，可修改配置以修正程序版本等问题。' : agent.state === 'unconfigured' ? 'Agent 已连接，选择插件、程序和数据后即可开始执行。' : '';
+    return `<article class="client-card ${state.selectedAgentIds.includes(agent.client_id) ? 'selected' : ''}"><div class="panel-head"><label class="client-select"><input type="checkbox" data-agent-select="${escapeHtml(agent.client_id)}" aria-label="选择 ${escapeHtml(agent.client_id)}" ${state.selectedAgentIds.includes(agent.client_id) ? 'checked' : ''} ${(reason && !state.selectedAgentIds.includes(agent.client_id)) || state.deploymentBusy ? 'disabled' : ''}><span><strong>${escapeHtml(agent.hostname || agent.client_id)}</strong><small>${escapeHtml(agent.client_id)}</small></span></label><span class="chip ${!agent.online || ['error', 'starting'].includes(agent.state) ? 'amber' : reason ? 'blue' : 'green'}">${escapeHtml(status)}</span><button type="button" class="button" data-configure-agent="${escapeHtml(agent.client_id)}" ${reason || state.deploymentBusy ? 'disabled' : ''}>配置</button></div><div class="client-facts"><span>执行插件 <b>${escapeHtml((agent.plugin_keys || []).join('、') || '尚未配置')}</b></span><span>心跳 <b>${Number.isFinite(Number(agent.last_seen_age_ms)) ? `${(Number(agent.last_seen_age_ms) / 1000).toFixed(1)} 秒前` : '--'}</b></span><span>Agent 版本 <b>${escapeHtml(agent.agent_version || '--')}</b></span><span>更新时间窗 <b>${agent.update_window_open === false ? '尚未开放' : '允许更新'}</b></span></div>${configHint ? `<p class="management-status">${escapeHtml(configHint)}</p>` : ''}${deployment ? `<p class="management-status">部署：${escapeHtml(({ current: '已生效', pending: '等待应用', applying: '正在应用', failed: '应用失败' })[deployment.state] || deployment.state)}${deployment.reported?.message ? ` · ${escapeHtml(deployment.reported.message)}` : ''}</p>` : ''}${workers.length ? `<details class="client-workers" ${reason === '正在执行任务' ? 'open' : ''}><summary>${workers.length} 个插件进程与任务详情</summary>${workers.map((worker) => `<section class="client-plugin"><div class="panel-head"><h3>${escapeHtml(worker.plugin_key || worker.plugin_type)}</h3><span class="chip ${worker.status === 'busy' ? 'blue' : 'green'}">${worker.registered ? worker.status === 'busy' ? '处理中' : '空闲' : '尚未注册'}</span></div><p class="client-info">${escapeHtml(worker.worker_id)} · ${escapeHtml(worker.plugin_info || '')}</p><div class="client-facts"><span>内存 <b>${formatBytes(worker.memory_bytes)}</b></span><span>可用磁盘 <b>${formatBytes(worker.disk_free_bytes)}</b></span><span>CPU <b>${worker.cpu_percent == null ? '--' : `${Number(worker.cpu_percent).toFixed(0)}%`}</b></span></div>${worker.tasks?.length ? `<div class="table-wrap"><table><thead><tr><th>当前任务</th><th>运行</th><th>状态</th></tr></thead><tbody>${worker.tasks.map((task) => `<tr><td>${escapeHtml(task.task_id)}</td><td>${escapeHtml(task.run_id)}</td><td>${task.acked ? '客户端已确认' : '等待确认'}</td></tr>`).join('')}</tbody></table></div>` : '<p class="management-status">当前没有分配的任务</p>'}</section>`).join('')}</details>` : ''}</article>`;
+  }).join('') || '<div class="empty-panel"><h2>还没有客户端 Agent</h2><p>在客户端包填写服务器地址并启动 Agent。即使尚未启用插件，也会在这里显示。</p></div>';
+  const available = agents.filter((agent) => !agentUnavailableReason(agent));
+  const invalid = state.selectedAgentIds.some((id) => !agents.some((agent) => agent.client_id === id && !agentUnavailableReason(agent)));
+  const waiting = agents.filter((agent) => state.selectedAgentIds.includes(agent.client_id) && agent.update_window_open === false).length;
+  $('clients-selected-count').textContent = state.selectedAgentIds.length ? `已选 ${state.selectedAgentIds.length} 台${invalid ? ' · 部分机器当前不可用' : ''}${waiting ? ` · ${waiting} 台将等待更新时间窗，期间暂停领取任务` : ''}` : `可配置 ${available.length} 台`;
+  $('clients-configure').disabled = state.deploymentBusy || !state.selectedAgentIds.length || invalid;
+  $('clients-select-all').checked = available.length > 0 && available.every((agent) => state.selectedAgentIds.includes(agent.client_id));
+  $('clients-select-all').indeterminate = state.selectedAgentIds.length > 0 && (!available.length || !available.every((agent) => state.selectedAgentIds.includes(agent.client_id)) || invalid);
+  $('clients-select-all').disabled = state.deploymentBusy || (!available.length && !state.selectedAgentIds.length);
+  if (state.deploymentBatchTargets) renderBatchTargets();
+}
+
+function loadAgents() {
+  if (state.agentsLoad) return state.agentsLoad;
+  state.agentsBusy = true;
+  state.agentsLoad = (async () => {
+    try {
+      const result = await jsonFetch('/api/agents');
+      state.agents = result.agents || []; state.agentsError = '';
+    } catch (error) { state.agentsError = error.message; if (state.agents === null) state.agents = []; }
+    finally { state.agentsBusy = false; state.agentsLoad = null; renderClients(); }
+  })();
+  return state.agentsLoad;
 }
 
 async function loadScheduler() {
@@ -746,6 +796,7 @@ function setWorkspaceTab(tab, focus = false) {
     if (selected && focus) button.focus?.();
   });
   document.querySelectorAll('[data-workspace-panel]').forEach((panel) => { panel.hidden = panel.dataset.workspacePanel !== tab; });
+  if (tab === 'deployments') navigate('clients');
 }
 
 function openWorkspaceDrawer(title, content, trigger = document.activeElement) {
@@ -815,7 +866,7 @@ function deploymentComponents() { return Object.entries(state.deploymentSelected
 
 // These transformations do not mutate the saved patch. Unknown plugin and client
 // options survive editing; only fields represented by the chosen form change.
-function readDeploymentWizard(patch, components, requestedPlugin) {
+function readDeploymentWizard(patch, components, requestedPlugin, incremental = false) {
   const enabled = Object.entries(patch.plugins || {}).find(([, item]) => item?.enabled === true)?.[0];
   const plugin = requestedPlugin || (['coverage', 'stpcompare'].includes(enabled) ? enabled : 'coverage');
   const config = patch.plugins?.[plugin] || {};
@@ -827,7 +878,7 @@ function readDeploymentWizard(patch, components, requestedPlugin) {
     for (const [path, , type] of group.fields) {
       let value = deploymentGet(config, path);
       const strip = (item) => { const ref = deploymentReference(item); return ref && ref[1] === slot ? (ref[2] || '') : item; };
-      if (type === 'arguments') value = (value || ['--input', '{stp}', '--output-dir', '{outdir}']).join('\n');
+      if (type === 'arguments') value = (value || (incremental ? [] : ['--input', '{stp}', '--output-dir', '{outdir}'])).join('\n');
       else if (type === 'paths') value = (value || []).map(strip).join('\n');
       else value = strip(value);
       values[path] = value ?? '';
@@ -839,7 +890,7 @@ function readDeploymentWizard(patch, components, requestedPlugin) {
     const value = patch.client?.[`${kind}_windows`];
     windows[kind] = { mode: value === undefined ? 'inherit' : value.length ? 'custom' : 'all', items: JSON.parse(JSON.stringify(value || [])) };
   }
-  return { plugin, groups, windows, threads: patch.client?.task_threads ?? '', dryRun: config.dry_run ?? null, storeCov: config.store_cov ?? false };
+  return { plugin, groups, windows, incremental, threads: patch.client?.task_threads ?? '', dryRun: config.dry_run ?? null, storeCov: config.store_cov ?? null };
 }
 
 function buildDeploymentWizard(patch, components, model, artifacts, knownPlugins = []) {
@@ -869,7 +920,7 @@ function buildDeploymentWizard(patch, components, model, artifacts, knownPlugins
     reserveReferences(preserved);
     for (const name of model.enabledPlugins) {
       if (!['coverage', 'stpcompare'].includes(name)) continue;
-      const draft = JSON.parse(JSON.stringify(name === model.plugin ? model : model.pluginModels?.[name] || readDeploymentWizard(patch, components, name)));
+      const draft = JSON.parse(JSON.stringify(name === model.plugin ? model : model.pluginModels?.[name] || readDeploymentWizard(patch, components, name, model.incremental)));
       delete draft.enabledPlugins; delete draft.pluginModels;
       draft.threads = model.threads; draft.windows = model.windows;
       for (const input of Object.values(draft.groups)) {
@@ -896,7 +947,8 @@ function buildDeploymentWizard(patch, components, model, artifacts, knownPlugins
   const config = next.plugins[model.plugin];
   const previousConfig = patch.plugins?.[model.plugin] || {};
   if (model.dryRun === null) delete config.dry_run;
-  if (model.plugin === 'coverage') config.store_cov = Boolean(model.storeCov);
+  if (model.plugin === 'coverage' && typeof model.storeCov === 'boolean') config.store_cov = model.storeCov;
+  else if (model.plugin === 'coverage') delete config.store_cov;
   const formSlots = new Map();
   const detachedSlots = new Set();
   for (const group of wizardGroups(model.plugin)) {
@@ -918,6 +970,7 @@ function buildDeploymentWizard(patch, components, model, artifacts, knownPlugins
     };
     for (const [path, , type] of group.fields) {
       const value = String(input.values[path] ?? '');
+      if (model.incremental && !value.trim() && ['arguments', 'version', 'optionalPath'].includes(type)) continue;
       if (type === 'arguments') {
         const args = value.split(/\r?\n/).filter((item) => item.trim());
         if (!args.some((item) => item.includes('{stp}')) || !args.some((item) => item.includes('{outdir}'))) throw new Error(`${group.title}参数必须包含 {stp} 和 {outdir}`);
@@ -977,19 +1030,21 @@ function setDeploymentBusy(busy) {
     if (busy) { input.dataset.busyDisabled = String(input.disabled); input.disabled = true; }
     else if (input.dataset.busyDisabled !== undefined) { input.disabled = input.dataset.busyDisabled === 'true'; delete input.dataset.busyDisabled; }
   });
-  for (const id of ['deployment-client', 'deployment-load', 'deployment-new', 'deployment-close', 'deployment-next', 'deployment-back', 'deployment-preview', 'deployment-editor-mode', 'deployment-save', 'deployment-rollback-button']) {
+  for (const id of ['deployment-client', 'deployment-load', 'deployment-new', 'deployment-close', 'deployment-reset', 'deployment-next', 'deployment-back', 'deployment-preview', 'deployment-editor-mode', 'deployment-save', 'deployment-rollback-button']) {
     if ($(id)) $(id).disabled = busy;
   }
   if (!busy) {
-    if ($('deployment-bind-scheduler')) $('deployment-bind-scheduler').disabled = !state.deploymentBinding?.program_bindings?.length;
+    if ($('deployment-bind-scheduler')) $('deployment-bind-scheduler').disabled = !state.deploymentBinding?.program_bindings?.length || Boolean(state.deploymentBatchTargets && (!state.deploymentBatchReview || state.deploymentWizardDirty || !Object.keys(state.deploymentBinding?.scheduler_plugins || {}).length));
     updateDeploymentMode();
   }
+  if (state.deploymentBatchTargets) $('deployment-rollback-button').disabled = busy || state.deploymentBatchTargets.length !== 1 || !state.deploymentBatchHistory?.history?.length;
+  if (state.agents !== null) renderClients();
 }
 
 function showDeploymentStep(step, focus = false) {
   state.deploymentStep = Math.max(0, Math.min(4, Number(step) || 0));
   const wizard = $('deployment-editor-mode').value === 'wizard';
-  document.querySelectorAll('[data-deployment-stage]').forEach((section) => { section.hidden = Number(section.dataset.deploymentStage) !== state.deploymentStep; });
+  document.querySelectorAll('[data-deployment-stage]').forEach((section) => { section.hidden = Number(section.dataset.deploymentStage) !== state.deploymentStep || Boolean(state.deploymentBatchTargets && section.dataset.deploymentResource !== undefined && !batchScopes().resources); });
   document.querySelectorAll('[data-deployment-step]').forEach((button) => {
     const index = Number(button.dataset.deploymentStep);
     button.setAttribute('aria-current', index === state.deploymentStep ? 'step' : 'false');
@@ -1004,10 +1059,18 @@ function showDeploymentStep(step, focus = false) {
   }
   $('deployment-save').hidden = state.deploymentEditorOpen && state.deploymentStep !== 4;
   $('deployment-preview').hidden = !wizard || (state.deploymentEditorOpen && state.deploymentStep !== 4);
+  const keepSchedule = Boolean(state.deploymentBatchTargets && !batchScopes().schedule);
+  $('deployment-schedule-fields').disabled = state.deploymentBusy || keepSchedule;
+  $('deployment-schedule-inherit').hidden = !keepSchedule;
+  $('deployment-rollback-section').hidden = Boolean(state.deploymentBatchTargets && state.deploymentBatchTargets.length !== 1);
+  $('deployment-reset').hidden = !state.deploymentBatchTargets;
+  $('deployment-plugin-scope-help').textContent = state.deploymentBatchTargets && !batchScopes().plugins
+    ? '勾选本次需要修改程序或数据的插件。各机器当前的插件启用状态保持原值。'
+    : '勾选部署后需要启用的插件；未勾选的已知插件将停用。程序和数据按本次修改范围配置。';
   if (state.deploymentStep === 4) renderDeploymentSummary();
   if (focus) {
     const firstResource = state.deploymentWizard ? wizardGroups(state.deploymentWizard.plugin).find((group) => group.id !== 'plugin') : null;
-    const target = [ 'deployment-client', 'deployment-plugin', firstResource ? `deployment-artifact-${firstResource.id}` : 'deployment-dry-run', 'deployment-threads', 'deployment-summary' ][state.deploymentStep];
+    const target = [ state.deploymentBatchTargets ? 'batch-scope-plugins' : 'deployment-client', 'deployment-plugin', firstResource ? `deployment-artifact-${firstResource.id}` : 'deployment-dry-run', keepSchedule ? 'deployment-next' : 'deployment-threads', 'deployment-summary' ][state.deploymentStep];
     $(target)?.focus?.({ preventScroll: true });
     $('deployment-editor')?.scrollIntoView?.({ block: 'start' });
   }
@@ -1015,6 +1078,7 @@ function showDeploymentStep(step, focus = false) {
 
 function renderDeploymentSummary() {
   if (!$('deployment-summary')) return;
+  if (state.deploymentBatchTargets) { renderBatchReview(); return; }
   let patch;
   try { patch = readDeploymentPatch(); } catch (_) { $('deployment-summary').textContent = '配置 JSON 尚未完整，请修正后核对。'; return; }
   const enabled = Object.entries(patch.plugins || {}).filter(([, value]) => value?.enabled).map(([name]) => name).join(', ') || '继承客户端配置';
@@ -1030,6 +1094,9 @@ function renderDeploymentSummary() {
 
 async function openDeploymentEditor(client = '') {
   if (state.deploymentBusy) return;
+  state.deploymentBatchTargets = null; state.deploymentBatchReview = null; state.deploymentBatchHistory = null;
+  $('deployment-batch-targets').hidden = true; $('deployment-batch-scopes').hidden = true;
+  $('deployment-batch-review').hidden = true; $('deployment-single-target').hidden = false;
   setWorkspaceTab('deployments');
   state.deploymentEditorOpen = true;
   $('deployment-editor').hidden = false;
@@ -1051,6 +1118,177 @@ async function openDeploymentEditor(client = '') {
   showDeploymentStep(0, true);
 }
 
+function batchScopes() {
+  return { plugins: Boolean($('batch-scope-plugins').checked), resources: Boolean($('batch-scope-resources').checked), schedule: Boolean($('batch-scope-schedule').checked) };
+}
+
+function batchWindowNotice() {
+  const waiting = (state.deploymentBatchTargets || []).filter((id) => (state.agents || []).find((agent) => agent.client_id === id)?.update_window_open === false);
+  return waiting.length ? `${waiting.join('、')} 的更新时间窗尚未开放。发布后会预占这些机器，等待窗口期间不再领取任务。` : '';
+}
+
+function renderBatchTargets() {
+  const ids = state.deploymentBatchTargets;
+  if (!ids) return;
+  const notice = batchWindowNotice();
+  $('deployment-batch-targets').innerHTML = `<strong>已选 ${ids.length} 台客户端</strong><div>${ids.map((id) => `<span class="chip">${escapeHtml(id)}</span>`).join('')}</div><p class="config-help">使用同一份增量配置，分别合并到每台机器。只提交本次明确修改的字段。</p>${notice ? `<p class="management-status warning">${escapeHtml(notice)}</p>` : ''}`;
+}
+
+function validateBatchTargets() {
+  if (!state.deploymentBatchTargets?.length) throw new Error('请先选择客户端机器。');
+  const blocked = state.deploymentBatchTargets.map((id) => {
+    const agent = (state.agents || []).find((item) => item.client_id === id);
+    const reason = agentUnavailableReason(agent);
+    return reason ? `${id}：${reason}` : '';
+  }).filter(Boolean);
+  if (blocked.length) throw new Error(`所选客户端暂不可配置：${blocked.join('；')}。草稿已保留。`);
+}
+
+async function openBatchDeployment(clientIds = state.selectedAgentIds, reset = false) {
+  if (state.deploymentBusy) return;
+  const ids = [...new Set(clientIds)];
+  navigate('clients');
+  await loadAgents();
+  const blocked = ids.filter((id) => !(state.agents || []).some((agent) => agent.client_id === id && !agentUnavailableReason(agent)));
+  if (!ids.length || blocked.length) { $('deployment-status').textContent = blocked.length ? `客户端 ${blocked.join('、')} 当前不可配置。请刷新状态或等待其空闲。` : '请先从客户端列表选择在线空闲机器。'; return false; }
+  if (!reset && JSON.stringify(state.deploymentBatchTargets) === JSON.stringify(ids)) {
+    state.deploymentEditorOpen = true; $('deployment-editor').hidden = false;
+    showDeploymentStep(state.deploymentStep, true); return true;
+  }
+  if (!reset && state.deploymentBatchTargets) {
+    state.selectedAgentIds = ids; state.deploymentBatchTargets = ids;
+    state.deploymentBatchReview = null; state.deploymentBinding = null; state.deploymentBatchHistory = null;
+    state.deploymentPreview = ''; state.deploymentWizardDirty = true;
+    $('deployment-bindings').hidden = true; $('deployment-batch-review').hidden = true;
+    $('deployment-rollback').innerHTML = '<option value="">选择历史版本</option>';
+    $('deployment-history-status').textContent = ''; $('deployment-rollback-button').disabled = true;
+    state.deploymentEditorOpen = true; $('deployment-editor').hidden = false;
+    renderClients(); showDeploymentStep(0, true);
+    $('deployment-status').textContent = '目标客户端已更新，现有增量草稿已保留。请重新核对全部目标；待配置机器需明确启用插件。';
+    if (ids.length === 1) await loadBatchDeploymentHistory();
+    return true;
+  }
+  await loadArtifacts();
+  state.selectedAgentIds = ids;
+  state.deploymentBatchTargets = ids; state.deploymentBatchReview = null; state.deploymentBatchHistory = null;
+  state.deploymentClient = ''; state.deploymentRevision = null; state.deploymentDraftLoaded = true;
+  state.deploymentSelected = {}; state.deploymentBinding = null; state.deploymentPreview = '';
+  $('deployment-patch').value = '{}'; $('deployment-reason').value = '';
+  $('deployment-editor-mode').value = 'wizard'; $('deployment-advanced').open = false;
+  $('deployment-batch-targets').hidden = false; $('deployment-single-target').hidden = true;
+  $('deployment-batch-scopes').hidden = false;
+  renderBatchTargets();
+  $('batch-scope-plugins').checked = ids.some((id) => (state.agents || []).find((agent) => agent.client_id === id)?.state === 'unconfigured');
+  $('batch-scope-resources').checked = true; $('batch-scope-schedule').checked = false;
+  $('deployment-bindings').hidden = true; $('deployment-batch-review').hidden = true;
+  $('deployment-rollback').innerHTML = '<option value="">选择历史版本</option>';
+  $('deployment-history-status').textContent = '';
+  $('deployment-rollback-button').disabled = true;
+  state.deploymentEditorOpen = true; $('deployment-editor').hidden = false;
+  importDeploymentWizard(); updateDeploymentMode(); showDeploymentStep(0, true);
+  $('deployment-status').textContent = '先核对本次修改范围，再配置所选插件的程序与数据。';
+  renderClients();
+  if (ids.length === 1) await loadBatchDeploymentHistory();
+  return true;
+}
+
+async function loadBatchDeploymentHistory() {
+  if (state.deploymentBusy || state.deploymentBatchTargets?.length !== 1) return;
+  const client = state.deploymentBatchTargets[0];
+  setDeploymentBusy(true);
+  try {
+    const result = await jsonFetch(`/api/deployments/${encodeURIComponent(client)}`);
+    state.deploymentBatchHistory = { client_id: client, revision: result.desired?.revision || null, history: result.history || [] };
+    renderDeploymentHistory(result);
+    $('deployment-history-status').textContent = result.history?.length ? '历史记录已读取；恢复时会核对当前部署版本和整机空闲状态。' : '此客户端还没有可恢复的历史部署。';
+  } catch (error) { $('deployment-history-status').textContent = `历史读取失败：${error.message}。当前配置草稿已保留。`; }
+  finally { setDeploymentBusy(false); }
+}
+
+function buildBatchDeploymentRequest() {
+  if ($('deployment-editor-mode').value !== 'wizard') {
+    const patch = readDeploymentPatch();
+    if (!Object.keys(patch).length && !deploymentComponents().length) throw new Error('请填写本次配置变更或选择制品。');
+    return { client_ids: [...state.deploymentBatchTargets], components: deploymentComponents(), config_patch: patch };
+  }
+  const scopes = batchScopes();
+  if (!Object.values(scopes).some(Boolean)) throw new Error('请至少选择一项修改范围。');
+  const model = collectDeploymentWizard();
+  let patch = {}, components = [];
+  if (scopes.resources && model.enabledPlugins.length) {
+    const built = buildDeploymentWizard({}, [], { ...model, threads: '', windows: { execution: { mode: 'inherit' }, update: { mode: 'inherit' } } }, state.artifacts, executionPluginNames());
+    patch = built.config_patch; components = built.components;
+    for (const [name, config] of Object.entries(patch.plugins || {})) {
+      delete config.enabled;
+      if (!Object.keys(config).length) delete patch.plugins[name];
+    }
+    if (patch.plugins && !Object.keys(patch.plugins).length) delete patch.plugins;
+    if (patch.client && !Object.keys(patch.client).length) delete patch.client;
+  }
+  if (scopes.plugins) {
+    const names = new Set(['coverage', 'stpcompare', ...executionPluginNames(), ...model.enabledPlugins]);
+    for (const name of names) deploymentSet(patch, `plugins.${name}.enabled`, model.enabledPlugins.includes(name));
+  }
+  if (scopes.schedule) applyDeploymentCommon(patch, model);
+  if (!Object.keys(patch).length && !components.length) throw new Error('当前范围没有填写变更；继承现有运行安排不会产生新的配置。');
+  return { client_ids: [...state.deploymentBatchTargets], components, config_patch: patch };
+}
+
+function batchPreviewSnapshot() {
+  return JSON.stringify({ targets: state.deploymentBatchTargets, scopes: batchScopes(), mode: $('deployment-editor-mode').value, model: collectDeploymentWizard(), json: $('deployment-patch').value, components: deploymentComponents() });
+}
+
+function renderBatchReview() {
+  const review = state.deploymentBatchReview;
+  const notice = batchWindowNotice();
+  $('deployment-summary').innerHTML = `<div class="deployment-review-head"><strong>${state.deploymentBatchTargets.length} 台客户端</strong><span class="chip blue">增量合并</span></div><p class="config-help">${$('deployment-editor-mode').value === 'wizard' ? Object.entries(batchScopes()).filter(([, value]) => value).map(([name]) => ({ plugins: '插件启用状态', resources: '插件、程序与数据', schedule: '运行安排' })[name]).join(' · ') : '高级 JSON 中明确指定的配置'}。发布前将再次核对每台机器的空闲状态及配置版本。</p>${notice ? `<p class="management-status warning">${escapeHtml(notice)}</p>` : ''}`;
+  $('deployment-batch-review').hidden = !review;
+  if (!review) return;
+  $('deployment-batch-review').innerHTML = `<h3>逐台配置预览</h3>${review.clients.map((client) => `<details class="batch-review-client"><summary><strong>${escapeHtml(client.client_id)}</strong><span>${client.revision ? '更新现有部署' : '首次部署'}</span></summary>${client.changes ? `<p class="config-help">${escapeHtml(typeof client.changes === 'string' ? client.changes : JSON.stringify(client.changes))}</p>` : ''}<p class="config-help">以下为该机器合并后的配置，仅供核对。发布发送本次增量变更。</p><pre>${escapeHtml(JSON.stringify({ components: client.components, config_patch: client.config_patch }, null, 2))}</pre></details>`).join('')}`;
+}
+
+async function previewBatchDeployment() {
+  if (state.deploymentBusy) return false;
+  try {
+    validateBatchTargets();
+    const payload = buildBatchDeploymentRequest();
+    const snapshot = batchPreviewSnapshot();
+    setDeploymentBusy(true); $('deployment-preview-status').textContent = '正在核对所选机器和逐台合并后的配置…';
+    const result = await jsonFetch('/api/deployments/batch/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    if (snapshot !== batchPreviewSnapshot()) throw new Error('预览期间草稿已变化，请重新核对。');
+    if (!Array.isArray(result.clients) || result.clients.length !== payload.client_ids.length || payload.client_ids.some((id) => !result.clients.some((client) => client.client_id === id && Object.hasOwn(client, 'revision')))) throw new Error('预览未返回全部目标客户端，请重新读取。');
+    // Per-client configurations may contain masked secrets. Keep them for
+    // review only; publication must use the exact original incremental patch.
+    state.deploymentBatchReview = { ...result, payload };
+    $('deployment-patch').value = JSON.stringify(payload.config_patch, null, 2);
+    state.deploymentSelected = Object.fromEntries(payload.components.map((item) => [item.slot, item.artifact_id]));
+    state.deploymentBinding = result; state.deploymentWizardDirty = false;
+    state.deploymentPreview = batchPreviewSnapshot();
+    renderDeploymentBindings(result); renderBatchReview();
+    $('deployment-preview-status').textContent = `已核对 ${result.clients.length} 台客户端，请展开逐台配置后发布。`;
+    return true;
+  } catch (error) { $('deployment-preview-status').textContent = `无法生成预览：${error.message}`; return false; }
+  finally { setDeploymentBusy(false); }
+}
+
+async function publishBatchDeployment() {
+  if (state.deploymentBusy) return;
+  try {
+    validateBatchTargets();
+    if (!state.deploymentBatchReview || state.deploymentWizardDirty || state.deploymentPreview !== batchPreviewSnapshot()) throw new Error('请先核对当前增量配置和全部目标机器，再发布。');
+    const review = state.deploymentBatchReview;
+    setDeploymentBusy(true); $('deployment-status').textContent = '正在预占客户端并发布部署…';
+    const payload = { targets: review.clients.map(({ client_id, revision }) => ({ client_id, revision })), components: review.payload.components, config_patch: review.payload.config_patch, reason: $('deployment-reason').value.trim(), operator_id: state.operatorId };
+    const result = await jsonFetch('/api/deployments/batch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    for (const client of result.clients || []) state.deployments = [...state.deployments.filter((item) => item.client_id !== client.client_id), client];
+    renderDeployments(); renderClients();
+    state.deploymentBatchReview = null; state.deploymentPreview = ''; renderBatchReview();
+    $('deployment-status').textContent = `已发布 ${result.clients?.length || payload.targets.length} 台客户端${result.batch_id ? ` · 批次 ${result.batch_id}` : ''}。请查看下方逐台应用状态。`;
+    await Promise.all([loadAgents(), loadArtifacts()]);
+  } catch (error) { state.deploymentPreview = ''; state.deploymentWizardDirty = true; $('deployment-status').textContent = `发布失败：${error.message}。草稿已保留，请重新核对后再发布。`; }
+  finally { setDeploymentBusy(false); }
+}
+
 function closeDeploymentEditor() {
   if (state.deploymentBusy) return;
   state.deploymentEditorOpen = false;
@@ -1062,6 +1300,28 @@ function closeDeploymentEditor() {
 async function advanceDeploymentStep() {
   if (state.deploymentBusy) return false;
   try {
+    if (state.deploymentBatchTargets) {
+      validateBatchTargets();
+      if (state.deploymentStep === 0) {
+        if ($('deployment-editor-mode').value !== 'wizard') {
+          if (!(await previewBatchDeployment())) return false;
+          showDeploymentStep(4, true); return true;
+        }
+        const scopes = batchScopes();
+        if (!Object.values(scopes).some(Boolean)) throw new Error('请至少选择一项修改范围。');
+        showDeploymentStep(scopes.plugins || scopes.resources ? 1 : 3, true); return true;
+      }
+      if (state.deploymentStep === 1) {
+        if (!state.deploymentEnabledPlugins.length && !batchScopes().plugins) throw new Error('请至少选择一个要配置的执行插件。');
+        showDeploymentStep(batchScopes().resources && state.deploymentEnabledPlugins.length ? 2 : 3, true); return true;
+      }
+      if (state.deploymentStep === 2) { buildBatchDeploymentRequest(); showDeploymentStep(3, true); return true; }
+      if (state.deploymentStep === 3) {
+        if (!(await previewBatchDeployment())) { $('deployment-status').textContent = $('deployment-preview-status').textContent; return false; }
+        showDeploymentStep(4, true); return true;
+      }
+      return true;
+    }
     if (state.deploymentStep === 0) {
       const client = $('deployment-client').value.trim();
       if (!client) throw new Error('请选择或填写目标客户端标识。');
@@ -1110,7 +1370,7 @@ function renderDeploymentWizard() {
   $('deployment-resource-plugin').value = model.plugin;
   const names = [...new Set(['coverage', 'stpcompare', ...executionPluginNames(), ...Object.keys(readDeploymentPatch().plugins || {})])];
   $('deployment-enabled-plugins').innerHTML = names.map((name) => `<label class="check-field"><input type="checkbox" data-deployment-enable="${escapeHtml(name)}" ${state.deploymentEnabledPlugins.includes(name) ? 'checked' : ''}>${escapeHtml(name)}</label>`).join('');
-  $('deployment-fields').innerHTML = wizardGroups(model.plugin).map((group) => `<section class="deployment-section" data-deployment-stage="${group.id === 'plugin' ? 1 : 2}"><h3>${group.title}</h3><div class="management-form"><div class="management-field"><label for="deployment-artifact-${group.id}">已上传制品</label><select id="deployment-artifact-${group.id}">${wizardArtifactOptions(group.kind, model.groups[group.id].artifactId)}</select></div>${group.fields.map(([path, label, type]) => `<div class="management-field grow-field"><label for="${deploymentFieldId(group.id, path)}">${escapeHtml(label)}</label>${['arguments', 'paths'].includes(type) ? `<textarea id="${deploymentFieldId(group.id, path)}" spellcheck="false">${escapeHtml(model.groups[group.id].values[path])}</textarea>` : `<input id="${deploymentFieldId(group.id, path)}" value="${escapeHtml(model.groups[group.id].values[path])}" autocomplete="off">`}</div>`).join('')}</div></section>`).join('');
+  $('deployment-fields').innerHTML = wizardGroups(model.plugin).map((group) => `<section class="deployment-section" data-deployment-resource data-deployment-stage="${group.id === 'plugin' ? 1 : 2}"><h3>${group.title}</h3><div class="management-form"><div class="management-field"><label for="deployment-artifact-${group.id}">已上传制品</label><select id="deployment-artifact-${group.id}">${wizardArtifactOptions(group.kind, model.groups[group.id].artifactId)}</select></div>${group.fields.map(([path, label, type]) => `<div class="management-field grow-field"><label for="${deploymentFieldId(group.id, path)}">${escapeHtml(label)}</label>${['arguments', 'paths'].includes(type) ? `<textarea id="${deploymentFieldId(group.id, path)}" spellcheck="false">${escapeHtml(model.groups[group.id].values[path])}</textarea>` : `<input id="${deploymentFieldId(group.id, path)}" value="${escapeHtml(model.groups[group.id].values[path])}" autocomplete="off">`}</div>`).join('')}</div></section>`).join('');
   // Assign properties as well as markup so the form and tests share one source.
   for (const group of wizardGroups(model.plugin)) {
     $(`deployment-artifact-${group.id}`).value = model.groups[group.id].artifactId;
@@ -1118,7 +1378,7 @@ function renderDeploymentWizard() {
   }
   $('deployment-threads').value = model.threads;
   $('deployment-dry-run').value = model.dryRun === null ? 'inherit' : model.dryRun ? 'simulate' : 'real';
-  $('deployment-store-cov').checked = model.storeCov;
+  $('deployment-store-cov').value = model.storeCov === null ? 'inherit' : model.storeCov ? 'keep' : 'discard';
   $('deployment-store-cov-field').hidden = model.plugin !== 'coverage';
   for (const kind of ['execution', 'update']) renderDeploymentWindows(kind);
   $('deployment-preview-status').textContent = model.plugin === 'coverage' ? '预览时核对所选程序制品的内容身份；数据注册版本仍需与数据目录的 version.txt 一致。业务程序参数由插件传入 STP 文件路径。' : '两个程序分别使用独立输出目录，并各生成 info.txt 和 info_new.txt；预览时核对程序内容与注册版本。';
@@ -1138,7 +1398,7 @@ function collectDeploymentWizard() {
   }
   model.threads = $('deployment-threads').value;
   model.dryRun = $('deployment-dry-run').value === 'inherit' ? null : $('deployment-dry-run').value === 'simulate';
-  model.storeCov = Boolean($('deployment-store-cov').checked);
+  model.storeCov = $('deployment-store-cov').value === 'inherit' ? null : $('deployment-store-cov').value === 'keep';
   model.enabledPlugins = [...state.deploymentEnabledPlugins];
   model.pluginModels = Object.fromEntries(Object.entries(state.deploymentWizardDrafts).map(([name, draft]) => {
     const copy = { ...draft }; delete copy.enabledPlugins; delete copy.pluginModels; return [name, copy];
@@ -1150,7 +1410,7 @@ function importDeploymentWizard(plugin) {
   state.deploymentWizardDrafts = {};
   try {
     const patch = readDeploymentPatch();
-    state.deploymentWizard = readDeploymentWizard(patch, deploymentComponents(), plugin);
+    state.deploymentWizard = readDeploymentWizard(patch, deploymentComponents(), plugin, Boolean(state.deploymentBatchTargets));
     state.deploymentEnabledPlugins = Object.entries(patch.plugins || {}).filter(([, item]) => item?.enabled === true).map(([name]) => name);
     if (!state.deploymentEnabledPlugins.length) state.deploymentEnabledPlugins = [state.deploymentWizard.plugin];
     state.deploymentWizardSource = JSON.stringify({ patch: $('deployment-patch').value, components: deploymentComponents() });
@@ -1167,12 +1427,17 @@ function updateDeploymentMode() {
   $('deployment-patch').readOnly = wizard;
   showDeploymentStep(wizard ? state.deploymentStep : state.deploymentStep > 0 ? 4 : 0);
   if (!wizard && $('deployment-advanced')) $('deployment-advanced').open = true;
+  if (state.deploymentBatchTargets) {
+    $('deployment-batch-scopes').hidden = !wizard;
+    $('deployment-preview').hidden = state.deploymentStep !== 4;
+  }
   renderArtifacts();
 }
 function deploymentPreviewSnapshot(model = collectDeploymentWizard()) {
   return JSON.stringify({ model, patch: $('deployment-patch').value, components: deploymentComponents() });
 }
 async function previewDeploymentWizard() {
+  if (state.deploymentBatchTargets) return previewBatchDeployment();
   if (state.deploymentBusy) return false;
   try {
     if (!state.deploymentDraftLoaded || $('deployment-client').value.trim() !== state.deploymentClient) throw new Error('请先读取目标客户端的当前部署');
@@ -1202,18 +1467,28 @@ function renderDeploymentBindings(result) {
   const bindings = result.program_bindings || [];
   $('deployment-binding-list').innerHTML = bindings.map((item) => `<details class="binding-item"><summary><strong>${escapeHtml(item.plugin)} · ${escapeHtml(item.role === 'baseline' ? '老程序' : item.role === 'candidate' ? '新程序' : item.role === 'program' ? '业务程序' : item.role)}</strong><span class="chip green">内容已核对</span></summary><p class="config-help">程序路径：${escapeHtml(item.executable)}<br>注册版本：<code>${escapeHtml(item.version)}</code></p></details>`).join('') || '<p class="config-help">当前路径没有可绑定的程序制品，需自行核对服务端预期版本与客户端注册版本。</p>';
   $('deployment-binding-status').textContent = (result.warnings || []).join('\n');
-  $('deployment-bind-scheduler').disabled = !bindings.length;
+  $('deployment-bind-scheduler').disabled = !bindings.length || Boolean(state.deploymentBatchTargets && !Object.keys(result.scheduler_plugins || {}).length);
 }
+
 async function bindDeploymentScheduler() {
   if (state.deploymentBusy) return;
-  if (!state.deploymentBinding || state.deploymentWizardDirty || state.deploymentPreview !== deploymentPreviewSnapshot() || $('deployment-client').value.trim() !== state.deploymentClient) {
+  const previewValid = state.deploymentBatchTargets ? state.deploymentBatchReview && state.deploymentPreview === batchPreviewSnapshot() : state.deploymentPreview === deploymentPreviewSnapshot() && $('deployment-client').value.trim() === state.deploymentClient;
+  if (!state.deploymentBinding || state.deploymentWizardDirty || !previewValid) {
     $('deployment-binding-status').textContent = '草稿已变化，请重新生成预览后保存匹配配置。'; return;
   }
   setDeploymentBusy(true); $('deployment-bind-scheduler').disabled = true;
   try {
-    const result = await jsonFetch('/api/deployments/bind-scheduler', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ components: deploymentComponents(), config_patch: readDeploymentPatch(), scheduler_revision: state.deploymentBinding.scheduler_revision, operator_id: state.operatorId }) });
+    if (state.deploymentBatchTargets && !Object.keys(state.deploymentBatchReview.scheduler_plugins || {}).length) throw new Error('所选机器没有一致的程序身份，请按相同程序版本分批配置。');
+    // The backend merges machine defaults and resolves identities again. The
+    // displayed per-machine previews may contain masked secrets; never send them.
+    const plan = state.deploymentBatchTargets ? state.deploymentBatchReview.payload : { components: deploymentComponents(), config_patch: readDeploymentPatch() };
+    const result = await jsonFetch('/api/deployments/bind-scheduler', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...plan, scheduler_revision: state.deploymentBinding.scheduler_revision, operator_id: state.operatorId }) });
     state.deploymentBinding.scheduler_revision = result.scheduler_revision || result.revision;
-    $('deployment-binding-status').textContent = '服务端匹配配置已保存。需重启调度器后生效；客户端部署仍需单独点击发布。';
+    if (state.deploymentBatchTargets) {
+      state.deploymentPreview = ''; state.deploymentBatchReview = null; state.deploymentWizardDirty = true; renderBatchReview();
+      $('deployment-preview-status').textContent = '服务端匹配配置已更新，请重新生成逐台配置预览后发布客户端部署。';
+    }
+    $('deployment-binding-status').textContent = '服务端匹配配置已保存。需重启调度器后生效；请重新核对客户端部署后发布。';
   } catch (error) { $('deployment-binding-status').textContent = `保存失败：${error.message}。当前草稿已保留。`; }
   finally { setDeploymentBusy(false); }
 }
@@ -1304,7 +1579,7 @@ function renderDeployments() {
     const applied = deployment.reported?.state === 'ready' ? summary(deployment.reported) : '尚未确认生效';
     return `<tr><td><button type="button" class="workspace-table-link" data-deployment-detail="${escapeHtml(deployment.client_id)}">${escapeHtml(deployment.client_id)}</button><small class="workspace-table-sub">${escapeHtml(deployment.reported?.message || '')}</small></td><td><span class="chip ${deployment.state === 'current' ? 'green' : deployment.state === 'failed' ? 'red' : 'amber'}">${escapeHtml(labels[deployment.state] || deployment.state)}</span></td><td class="deployment-version-cell">${escapeHtml(applied)}</td><td class="deployment-version-cell">${escapeHtml(deployment.desired ? summary(deployment.desired) : '未配置')}</td><td><div class="workspace-row-actions"><button type="button" class="button compact" data-deployment-detail="${escapeHtml(deployment.client_id)}">详情</button><button type="button" class="button compact" data-edit-deployment="${escapeHtml(deployment.client_id)}" ${state.deploymentBusy ? 'disabled' : ''}>编辑</button></div></td></tr>`;
   });
-  $('deployment-list').innerHTML = rows.length ? rows.join('') : '<tr><td colspan="5" class="empty-row">还没有客户端部署。点击“创建部署”，选择一台客户端开始配置。</td></tr>';
+  $('deployment-list').innerHTML = rows.length ? rows.join('') : '<tr><td colspan="5" class="empty-row">还没有客户端部署。请从上方客户端列表选择在线空闲机器开始配置。</td></tr>';
   const clientIds = new Set(state.deployments.map((item) => item.client_id));
   for (const worker of state.scheduler?.clients || []) {
     clientIds.add(worker.physical_client_id || worker.worker_id);
@@ -1317,7 +1592,22 @@ function openDeploymentDetails(client, trigger) {
   if (!deployment) return;
   const labels = { current: '已生效', pending: '等待客户端', applying: '应用中', failed: '更新失败', unconfigured: '未配置', staged: '已下载', waiting_window: '等待更新时间窗', waiting_idle: '等待当前任务完成' };
   const components = deployment.desired?.components || [];
-  openWorkspaceDrawer(`${client} · 部署详情`, `<p class="drawer-intro"><span class="chip ${deployment.state === 'current' ? 'green' : deployment.state === 'failed' ? 'red' : 'amber'}">${escapeHtml(labels[deployment.state] || deployment.state)}</span></p><dl class="detail-list"><div><dt>客户端回报</dt><dd>${escapeHtml(deployment.reported?.message || '尚未收到客户端回报')}</dd></div><div><dt>目标版本</dt><dd><code>${escapeHtml(deployment.desired?.revision || '--')}</code></dd></div><div><dt>回报版本</dt><dd><code>${escapeHtml(deployment.reported?.desired_revision || '--')}</code></dd></div><div><dt>变更说明</dt><dd>${escapeHtml(deployment.desired?.reason || '未填写')}</dd></div></dl><h3>目标制品</h3>${components.length ? `<ul class="deployment-review-artifacts">${components.map((item) => `<li><span>${escapeHtml(item.artifact?.name || item.slot)}</span><b>${escapeHtml(item.artifact?.version || '--')}</b></li>`).join('')}</ul>` : '<p class="config-help">此部署没有分发制品。</p>'}<p class="config-help">客户端将在更新时间窗内、当前任务完成后应用。回退历史版本可在编辑部署的确认步骤中操作。</p><div class="drawer-actions"><button type="button" class="button primary" data-edit-deployment="${escapeHtml(client)}" ${state.deploymentBusy ? 'disabled' : ''}>编辑或恢复历史部署</button></div>`, trigger);
+  const reported = deployment.reported;
+  const reportSummary = reported?.message || (reported ? ({
+    ready: '客户端已确认回报版本就绪。', failed: '客户端回报更新失败，未附具体说明。',
+    waiting_window: '客户端正在等待更新时间窗。', waiting_idle: '客户端正在等待当前任务完成。',
+    applying: '客户端正在应用回报版本。', staged: '客户端已下载并准备好回报版本。',
+  })[reported.state] || '已收到客户端回报，未附具体说明。' : '尚未收到客户端回报');
+  const guidance = ({
+    current: '目标部署已生效，客户端已确认此版本。',
+    failed: '此版本更新失败，不会自动重试。请修正配置后重新发布，或选择历史版本恢复。',
+    unconfigured: '尚未发布部署，请先选择插件、程序和数据。',
+    waiting_window: '客户端已预占，将在更新时间窗开放后应用；等待期间不再领取任务。',
+    waiting_idle: '客户端将在当前任务完成且更新时间窗开放后应用。',
+    applying: '客户端正在切换配置和启动插件，请等待应用结果。',
+    staged: '所需资源已准备，等待客户端应用并确认。',
+  })[deployment.state] || '目标部署尚未确认生效，客户端将在更新时间窗开放且整机空闲时应用。';
+  openWorkspaceDrawer(`${client} · 部署详情`, `<p class="drawer-intro"><span class="chip ${deployment.state === 'current' ? 'green' : deployment.state === 'failed' ? 'red' : 'amber'}">${escapeHtml(labels[deployment.state] || deployment.state)}</span></p><dl class="detail-list"><div><dt>客户端回报</dt><dd>${escapeHtml(reportSummary)}</dd></div><div><dt>目标版本</dt><dd><code>${escapeHtml(deployment.desired?.revision || '--')}</code></dd></div><div><dt>回报版本</dt><dd><code>${escapeHtml(deployment.reported?.desired_revision || '--')}</code></dd></div><div><dt>变更说明</dt><dd>${escapeHtml(deployment.desired?.reason || '未填写')}</dd></div></dl><h3>目标制品</h3>${components.length ? `<ul class="deployment-review-artifacts">${components.map((item) => `<li><span>${escapeHtml(item.artifact?.name || item.slot)}</span><b>${escapeHtml(item.artifact?.version || '--')}</b></li>`).join('')}</ul>` : '<p class="config-help">此部署没有分发制品。</p>'}<p class="config-help">${escapeHtml(guidance)} 单台配置时可展开“恢复历史部署”选择已有版本。</p><div class="drawer-actions"><button type="button" class="button primary" data-edit-deployment="${escapeHtml(client)}" ${state.deploymentBusy ? 'disabled' : ''}>编辑或恢复历史部署</button></div>`, trigger);
 }
 
 async function loadArtifacts() {
@@ -1395,6 +1685,7 @@ async function saveDeployment(event) {
   event.preventDefault();
   if (state.deploymentBusy) return;
   if (state.deploymentEditorOpen && state.deploymentStep !== 4) return advanceDeploymentStep();
+  if (state.deploymentBatchTargets) return publishBatchDeployment();
   const client = $('deployment-client').value.trim();
   const components = deploymentComponents();
   if (!client || !state.deploymentDraftLoaded || state.deploymentClient !== client) { $('deployment-status').textContent = '请先读取目标客户端的当前部署。'; return; }
@@ -1424,6 +1715,21 @@ async function saveDeployment(event) {
 async function rollbackDeployment() {
   const target = $('deployment-rollback').value;
   if (!target || !state.deploymentDraftLoaded || state.deploymentBusy) return;
+  if (state.deploymentBatchTargets) {
+    try {
+      validateBatchTargets();
+      const history = state.deploymentBatchHistory;
+      if (state.deploymentBatchTargets.length !== 1 || history?.client_id !== state.deploymentBatchTargets[0] || !history.history.some((item) => item.revision === target)) throw new Error('请先读取此客户端的历史部署。');
+      setDeploymentBusy(true);
+      await jsonFetch(`/api/deployments/${encodeURIComponent(history.client_id)}/desired`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ revision: history.revision, action: 'rollback', target_revision: target, reason: $('deployment-reason').value.trim(), operator_id: state.operatorId }) });
+      state.deploymentPreview = ''; state.deploymentBatchReview = null; state.deploymentBatchHistory = null;
+      await Promise.all([loadArtifacts(), loadAgents()]);
+      setDeploymentBusy(false); await loadBatchDeploymentHistory();
+      $('deployment-status').textContent = '回滚期望已发布，客户端将在更新时间窗内应用。未发布的编辑草稿已保留，使用前请重新核对。';
+    } catch (error) { $('deployment-status').textContent = `回滚失败：${error.message}。编辑草稿已保留；如版本冲突，请刷新历史后重试。`; }
+    finally { setDeploymentBusy(false); }
+    return;
+  }
   if ($('deployment-client').value.trim() !== state.deploymentClient) { $('deployment-status').textContent = '请先读取目标客户端的当前部署。'; return; }
   setDeploymentBusy(true);
   try {
@@ -1493,6 +1799,7 @@ async function loadAll() {
     if (state.page === 'logs') await loadLogs();
     if (state.page === 'plugins') await loadConfig($('config-kind').value || state.configKind);
     if (state.page === 'plugins') await loadArtifacts();
+    if (state.page === 'clients') await Promise.all([loadAgents(), loadArtifacts()]);
   } catch (error) {
     if (requestId !== state.loadRequest) return;
     throw error;
@@ -2006,7 +2313,32 @@ $('active-runs').addEventListener('click', (event) => {
   const button = event.target.closest('[data-stop-run]');
   if (button && !button.disabled) return schedulerCommand('stop', button.dataset.stopPlugin, button.dataset.stopRun);
 });
-$('clients-refresh').addEventListener('click', loadScheduler);
+$('clients-refresh').addEventListener('click', () => Promise.all([loadScheduler(), loadAgents(), loadArtifacts()]));
+$('clients-select-all').addEventListener('change', () => {
+  if (state.deploymentBusy) return;
+  state.selectedAgentIds = $('clients-select-all').checked ? (state.agents || []).filter((agent) => !agentUnavailableReason(agent)).map((agent) => agent.client_id) : [];
+  renderClients();
+});
+$('clients-configure').addEventListener('click', () => openBatchDeployment());
+$('client-list').addEventListener('change', (event) => {
+  const id = event.target.dataset.agentSelect;
+  if (!id || state.deploymentBusy) return;
+  const agent = (state.agents || []).find((item) => item.client_id === id);
+  if (event.target.checked && agentUnavailableReason(agent)) return;
+  state.selectedAgentIds = state.selectedAgentIds.filter((value) => value !== id);
+  if (event.target.checked) state.selectedAgentIds.push(id);
+  renderClients();
+});
+$('client-list').addEventListener('click', (event) => {
+  const button = event.target.closest('[data-configure-agent]');
+  if (button && !button.disabled) return openBatchDeployment([button.dataset.configureAgent]);
+});
+$('deployment-go-clients').addEventListener('click', () => navigate('clients'));
+for (const kind of ['plugins', 'resources', 'schedule']) $('batch-scope-' + kind).addEventListener('change', () => {
+  state.deploymentWizardDirty = true;
+  $('deployment-preview-status').textContent = '修改范围已变化，请重新核对全部客户端。';
+  showDeploymentStep(state.deploymentStep);
+});
 $('logs-form').addEventListener('submit', async (event) => { event.preventDefault(); await loadLogs(); });
 $('logs-file').addEventListener('change', loadLogs);
 $('logs-level').addEventListener('change', loadLogs);
@@ -2028,7 +2360,7 @@ $('workspace-drawer-content')?.addEventListener('click', async (event) => {
   const link = event.target.closest('[data-workspace-go]');
   if (link) { closeWorkspaceDrawer(); setWorkspaceTab(link.dataset.workspaceGo, true); return; }
   const edit = event.target.closest('[data-edit-deployment]');
-  if (edit && !state.deploymentBusy) { closeWorkspaceDrawer(); await openDeploymentEditor(edit.dataset.editDeployment); return; }
+  if (edit && !state.deploymentBusy) { closeWorkspaceDrawer(); await openBatchDeployment([edit.dataset.editDeployment]); return; }
   const install = event.target.closest('[data-install-artifact]');
   if (install && !state.serverPluginBusy) {
     closeWorkspaceDrawer(); setWorkspaceTab('plugins');
@@ -2068,8 +2400,15 @@ $('deployment-load').addEventListener('click', async () => {
   }
   return loaded;
 });
-$('deployment-new')?.addEventListener('click', () => openDeploymentEditor());
+$('deployment-new')?.addEventListener('click', () => {
+  if (state.deploymentBusy) return;
+  if (state.selectedAgentIds.length) return openBatchDeployment();
+  navigate('clients'); $('client-list').scrollIntoView?.({ block: 'start' });
+  $('deployment-status').textContent = '请先选择需要配置的在线空闲客户端。';
+});
 $('deployment-close')?.addEventListener('click', closeDeploymentEditor);
+$('deployment-reset').addEventListener('click', () => state.deploymentBatchTargets && openBatchDeployment(state.deploymentBatchTargets, true));
+$('deployment-history-refresh').addEventListener('click', () => state.deploymentBatchTargets ? loadBatchDeploymentHistory() : loadDeployment(state.deploymentClient));
 $('deployment-next')?.addEventListener('click', advanceDeploymentStep);
 $('deployment-back')?.addEventListener('click', () => { if (!state.deploymentBusy) showDeploymentStep($('deployment-editor-mode').value === 'json' ? 0 : state.deploymentStep - 1, true); });
 document.querySelectorAll('[data-deployment-step]').forEach((button) => button.addEventListener('click', () => {
@@ -2085,7 +2424,11 @@ $('deployment-editor-mode').addEventListener('change', () => {
   } else if (state.deploymentWizard) {
     try {
       const model = collectDeploymentWizard();
-      const draft = buildDeploymentWizard(readDeploymentPatch(), deploymentComponents(), model, state.artifacts, executionPluginNames());
+      const desiredMode = $('deployment-editor-mode').value;
+      if (state.deploymentBatchTargets) $('deployment-editor-mode').value = 'wizard';
+      let draft;
+      try { draft = state.deploymentBatchTargets ? buildBatchDeploymentRequest() : buildDeploymentWizard(readDeploymentPatch(), deploymentComponents(), model, state.artifacts, executionPluginNames()); }
+      finally { $('deployment-editor-mode').value = desiredMode; }
       $('deployment-patch').value = JSON.stringify(draft.config_patch, null, 2);
       state.deploymentSelected = Object.fromEntries(draft.components.map((item) => [item.slot, item.artifact_id]));
       state.deploymentWizard = model;
@@ -2109,7 +2452,7 @@ function switchDeploymentPlugin(plugin) {
     delete current.enabledPlugins; delete current.pluginModels;
     state.deploymentWizardDrafts[current.plugin] = current;
   }
-  state.deploymentWizard = state.deploymentWizardDrafts[plugin] || readDeploymentWizard(readDeploymentPatch(), deploymentComponents(), plugin);
+  state.deploymentWizard = state.deploymentWizardDrafts[plugin] || readDeploymentWizard(readDeploymentPatch(), deploymentComponents(), plugin, Boolean(state.deploymentBatchTargets));
   if (current) { state.deploymentWizard.threads = current.threads; state.deploymentWizard.windows = current.windows; }
   renderDeploymentWizard(); state.deploymentWizardDirty = true;
 }
@@ -2143,7 +2486,7 @@ $('artifact-list').addEventListener('change', selectArtifact);
 $('artifact-list').addEventListener('click', (event) => { const button = event.target.closest('[data-artifact-detail]'); if (button) openArtifactDetails(button.dataset.artifactDetail, button); });
 $('deployment-list').addEventListener('click', (event) => {
   const edit = event.target.closest('[data-edit-deployment]');
-  if (edit) return openDeploymentEditor(edit.dataset.editDeployment);
+  if (edit) return openBatchDeployment([edit.dataset.editDeployment]);
   const detail = event.target.closest('[data-deployment-detail]');
   if (detail) openDeploymentDetails(detail.dataset.deploymentDetail, detail);
 });
@@ -2253,7 +2596,8 @@ if (typeof window.setInterval === 'function') {
   window.setInterval(async () => {
     if (document.hidden) return;
     if (['overview', 'clients', 'plugins'].includes(state.page)) await loadScheduler();
-    if (state.page === 'plugins' && !state.deploymentBusy && !state.artifactBusy) await loadArtifacts();
+    if (state.page === 'clients') await loadAgents();
+    if (['plugins', 'clients'].includes(state.page) && !state.deploymentBusy && !state.artifactBusy) await loadArtifacts();
     if (state.page === 'logs' && $('logs-auto').checked && !state.logsBusy) await loadLogs();
   }, 5000);
 }

@@ -80,6 +80,7 @@ nlohmann::json Scheduler::BuildStatus() const {
             {"disk_free_bytes", heartbeat.resource().disk_free_bytes()}, {"cpu_percent", heartbeat.resource().cpu_percent()},
             {"plugin_info", heartbeat.plugin_info()}, {"tasks", std::move(tasks)}});
     }
+    AppendAgentStatus(result);
     nlohmann::json configuration = nlohmann::json::object();
     for (const auto* key : {"server", "plugins"}) {
         if (const auto* section = config_.find(key)) configuration[key] = *section;
@@ -102,6 +103,12 @@ nlohmann::json Scheduler::managementStatus() {
     const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - status_updated_).count();
     status["snapshot_age_ms"] = age;
     for (auto& client : status["clients"]) client["last_seen_age_ms"] = client["last_seen_age_ms"].get<long long>() + age;
+    for (auto& agent : status["agents"]) {
+        agent["last_seen_age_ms"] = agent["last_seen_age_ms"].get<long long>() + age;
+        agent["online"] = agent["online"].get<bool>() &&
+            agent["last_seen_age_ms"].get<long long>() <
+                std::max(1, config_.get("server.agent_timeout_ms", 60000));
+    }
     return status;
 }
 
@@ -111,6 +118,14 @@ nlohmann::json Scheduler::managementCommand(const nlohmann::json& request) {
     };
     if (!request.is_object() || !request.contains("action") || !request["action"].is_string())
         return invalid("action must be a string");
+    const auto action = request["action"].get<std::string>();
+    if (action == "agent_heartbeat" || action == "reserve_clients" ||
+        action == "commit_reservation" || action == "release_clients") {
+        ControlCommand command{};
+        command.kind = ControlCommand::Kind::ClientControl;
+        command.client_control = request;
+        return SubmitDetailed(std::move(command), true);
+    }
     for (const auto* field : {"plugin_type", "dataset_version", "run_id"})
         if (request.contains(field) && !request[field].is_string()) return invalid(std::string(field) + " must be a string");
     if (request.contains("params") && !request["params"].is_string() && !request["params"].is_object())
@@ -130,12 +145,11 @@ nlohmann::json Scheduler::managementCommand(const nlohmann::json& request) {
                 return invalid("worker_ids must contain nonempty identities of at most 255 bytes");
         }
     }
-    const auto action = request["action"].get<std::string>();
     ControlCommand command{};
     if (action == "run") command.kind = ControlCommand::Kind::Run;
     else if (action == "stop") command.kind = ControlCommand::Kind::Stop;
     else if (action == "wakeup") command.kind = ControlCommand::Kind::Wake;
-    else return invalid("action must be run, stop or wakeup");
+    else return invalid("action must be run, stop, wakeup, agent_heartbeat, reserve_clients, commit_reservation or release_clients");
     command.plugin_type = request.value("plugin_type", std::string());
     command.dataset_version = request.value("dataset_version", std::string());
     command.run_id = request.value("run_id", std::string());

@@ -108,10 +108,66 @@
             <div class="plugin-result-view" id="plugin-result-view"></div>
           </details>
         </section>
-        <section class="page" id="page-clients" hidden>
-          <div class="section-head"><h2>连接到调度器的客户端<span class="count" id="client-count"></span></h2><button type="button" class="button" id="clients-refresh">刷新客户端</button></div>
+        <section class="page plugin-workspace" id="page-clients" hidden>
+          <div class="section-head"><h2>客户端机器<span class="count" id="client-count"></span></h2><button type="button" class="button" id="clients-refresh">刷新客户端</button></div>
           <p class="management-status" id="clients-status" role="status"></p>
+          <div class="clients-toolbar"><label class="check-field"><input type="checkbox" id="clients-select-all">选择全部可用机器</label><span id="clients-selected-count">未选择客户端</span><button type="button" class="button primary" id="clients-configure" disabled>配置所选客户端</button></div>
           <div id="client-list" class="client-list"></div>
+          <div class="workspace-heading clients-deployment-heading"><div><h2>部署与更新</h2><p>按机器选择资源，预览差异后统一发布，逐台追踪应用状态。</p></div><button type="button" class="button" id="deployment-new">从客户端列表选择</button></div>
+            <p class="management-status workspace-status" id="deployment-status" role="status"></p>
+            <section class="workspace-surface deployment-editor" id="deployment-editor" hidden aria-label="客户端部署向导">
+              <div class="deployment-editor-head"><div><span class="workspace-eyebrow">部署向导</span><h3>配置客户端</h3></div><div class="head-actions"><button type="button" class="button" id="deployment-reset" hidden>清空本次修改</button><button type="button" class="button" id="deployment-close">收起配置</button></div></div>
+              <ol class="deployment-steps" aria-label="部署步骤">
+                <li><button type="button" data-deployment-step="0" aria-current="step"><span>1</span><b>选择客户端</b></button></li>
+                <li><button type="button" data-deployment-step="1"><span>2</span><b>选择插件</b></button></li>
+                <li><button type="button" data-deployment-step="2"><span>3</span><b>程序与数据</b></button></li>
+                <li><button type="button" data-deployment-step="3"><span>4</span><b>运行安排</b></button></li>
+                <li><button type="button" data-deployment-step="4"><span>5</span><b>确认发布</b></button></li>
+              </ol>
+              <form id="deployment-form" class="deployment-form" novalidate>
+                <section data-deployment-stage="0" class="deployment-stage">
+                  <div class="stage-heading"><h3>核对目标客户端和修改范围</h3><p>先选择在线空闲机器，再明确本次需要更新的内容。</p></div>
+                  <div id="deployment-batch-targets" class="batch-targets" hidden></div>
+                  <fieldset id="deployment-batch-scopes" class="batch-scopes" hidden><legend>本次修改范围</legend><label class="check-field"><input type="checkbox" id="batch-scope-plugins">插件启用状态</label><label class="check-field"><input type="checkbox" id="batch-scope-resources" checked>插件、程序与数据</label><label class="check-field"><input type="checkbox" id="batch-scope-schedule">运行安排</label><p class="config-help">只提交勾选范围；未填写的字段沿用每台机器现有配置。首次部署请明确配置插件、程序和数据。</p></fieldset>
+                  <div id="deployment-single-target" class="management-form target-client-form"><div class="management-field grow-field"><label for="deployment-client">客户端 worker_id</label><input id="deployment-client" list="deployment-client-options" required placeholder="选择或输入客户端标识" autocomplete="off"><datalist id="deployment-client-options"></datalist></div><button class="button" type="button" id="deployment-load">读取当前部署</button></div>
+                  <div class="workspace-note"><span class="note-symbol">i</span><p>每台客户端可同时启用多个插件，各插件独立执行；配置更新以整台机器为单位，发布时会再次确认所有插件均已空闲。</p></div>
+                </section>
+                <section data-deployment-stage="1" class="deployment-stage" hidden>
+                  <div class="stage-heading"><h3>选择任务执行插件</h3><p>插件决定程序的调用方式和结果入库方式。</p></div>
+                  <div id="deployment-enabled-plugins" class="management-form" aria-label="启用的客户端插件"></div>
+                  <div class="management-form"><div class="management-field"><label for="deployment-plugin">正在配置的插件</label><select id="deployment-plugin"><option value="coverage">coverage · 覆盖率</option><option value="stpcompare">stpcompare · 新老程序结果采集</option></select></div></div><p class="config-help" id="deployment-plugin-scope-help">勾选需要配置的插件，再分别选择 DLL、程序和数据。其他插件使用高级 JSON 配置。</p>
+                </section>
+                <div id="deployment-wizard" class="deployment-wizard">
+                  <div data-deployment-stage="2" class="stage-heading" hidden><h3>配置程序与数据</h3><p>选择制品后填写包内路径；也可以使用客户端现有路径。</p><label for="deployment-resource-plugin">正在配置的插件</label><select id="deployment-resource-plugin"><option value="coverage">coverage · 覆盖率</option><option value="stpcompare">stpcompare · 新老程序结果采集</option></select></div>
+                  <div id="deployment-fields"></div>
+                  <section data-deployment-stage="2" class="deployment-execution-options" hidden>
+                    <div class="management-form"><div class="management-field"><label for="deployment-dry-run">执行模式</label><select id="deployment-dry-run"><option value="inherit">沿用现有配置</option><option value="simulate">模拟执行（不运行业务程序）</option><option value="real">真实执行</option></select></div><div id="deployment-store-cov-field" class="management-field"><label for="deployment-store-cov">原始 cov 文件（coverage）</label><select id="deployment-store-cov"><option value="inherit">沿用现有配置</option><option value="keep">保留</option><option value="discard">不保留</option></select></div></div>
+                  </section>
+                  <section data-deployment-stage="3" class="deployment-stage" hidden>
+                    <div class="stage-heading"><h3>安排执行和更新时间</h3><p>时间按客户端本机时区计算。执行窗口结束后，已开始的任务会继续完成。</p></div>
+                    <p class="config-help" id="deployment-schedule-inherit" hidden>本次未勾选“运行安排”，每台机器的并发数和时间窗保持原值。需要修改时，请返回第一步勾选。</p>
+                    <fieldset class="deployment-schedule-fields" id="deployment-schedule-fields">
+                    <div class="management-form"><div class="management-field"><label for="deployment-threads">每插件任务并发数</label><input id="deployment-threads" type="number" min="1" step="1" placeholder="留空继承基础配置"></div></div><p class="config-help">每个启用插件分别使用此并发数。例如启用两个插件且设置为 2 时，总并发上限约为 4。</p>
+                    <div class="deployment-window-grid"><section class="deployment-window"><h3>任务执行时间窗</h3><p class="workspace-help">控制何时领取新任务。</p><div id="deployment-execution-windows"></div><button class="button" type="button" id="deployment-execution-add">＋ 添加执行时段</button></section><section class="deployment-window"><h3>程序与数据更新时间窗</h3><p class="workspace-help">控制何时应用新部署。</p><div id="deployment-update-windows"></div><button class="button" type="button" id="deployment-update-add">＋ 添加更新时段</button></section></div>
+                    <p class="config-help">跨午夜的时段归属开始日。修改更新时间窗也需等待当前生效窗口开放。</p>
+                    </fieldset>
+                  </section>
+                </div>
+                <section data-deployment-stage="4" class="deployment-stage" hidden>
+                  <div class="stage-heading"><h3>确认部署内容</h3><p>核对目标版本与运行安排，发布后可在下方跟踪客户端状态。</p></div>
+                  <div id="deployment-batch-review" class="batch-review" hidden></div>
+                  <div id="deployment-summary" class="deployment-summary" tabindex="-1"></div>
+                  <div class="preview-toolbar"><button type="button" class="button" id="deployment-preview">生成配置预览</button></div>
+                  <div id="deployment-bindings" class="deployment-section binding-panel" hidden><h3>服务端程序匹配</h3><div id="deployment-binding-list"></div><button type="button" class="button" id="deployment-bind-scheduler">保存服务端匹配配置</button><p class="management-status" id="deployment-binding-status" role="status"></p></div>
+                  <div class="management-form release-reason"><div class="management-field grow-field"><label for="deployment-reason">变更说明</label><input id="deployment-reason" placeholder="例如：更新候选程序，保留当前数据版本"></div></div>
+                </section>
+                <p class="management-status workspace-status" id="deployment-preview-status" role="status"></p>
+                  <details class="workspace-advanced" id="deployment-rollback-section"><summary>恢复历史部署</summary><p class="config-help">恢复会发布旧版本的部署期望，仍需等待客户端应用。</p><div class="management-form"><div class="management-field"><label for="deployment-rollback">历史部署</label><select id="deployment-rollback"><option value="">选择历史版本</option></select></div><button class="button" type="button" id="deployment-rollback-button">恢复此版本</button></div><button type="button" class="button" id="deployment-history-refresh">刷新历史</button><p class="management-status" id="deployment-history-status" role="status"></p></details>
+                <details class="workspace-advanced" id="deployment-advanced"><summary>高级配置 <span>JSON 与制品引用</span></summary><div class="management-form"><div class="management-field"><label for="deployment-editor-mode">配置方式</label><select id="deployment-editor-mode"><option value="wizard">表单向导</option><option value="json">高级 JSON 编辑</option></select></div><button class="button" type="button" id="deployment-import">从 JSON 回填表单</button></div><label class="config-help" for="deployment-patch">客户端配置覆盖（JSON）</label><textarea id="deployment-patch" class="config-json deployment-patch" spellcheck="false" aria-label="客户端配置覆盖 JSON">{}</textarea><p class="config-help">仅修改指定字段，其他基础配置继续保留。使用 <code>{artifact:槽位}/包内路径</code> 引用制品；高级模式可在制品库勾选所需制品。上传数据不会自动替换服务端 manifest 或预期数据版本。</p></details>
+                <div class="deployment-step-footer"><button type="button" class="button" id="deployment-back" hidden>上一步</button><span class="step-footer-hint">发布后需等待客户端应用</span><button type="button" class="button primary" id="deployment-next">下一步</button><button class="button primary" type="submit" id="deployment-save" hidden>发布客户端部署</button></div>
+              </form>
+            </section>
+            <div class="workspace-surface"><div class="workspace-list-heading"><h3>部署状态</h3><span class="workspace-help">客户端按更新时间窗应用</span></div><div class="table-wrap workspace-table deployment-state"><table><thead><tr><th>客户端</th><th>状态</th><th>当前部署</th><th>目标部署</th><th class="actions-column">操作</th></tr></thead><tbody id="deployment-list"></tbody></table></div></div>
         </section>
         <section class="page" id="page-history" hidden>
           <div class="section-head"><h2>全部运行记录<span class="count" id="history-count"></span></h2></div>
@@ -166,55 +222,8 @@
           </section>
 
           <section id="workspace-panel-deployments" class="workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-deployments" data-workspace-panel="deployments" hidden>
-            <div class="workspace-heading"><div><span class="workspace-eyebrow">发布与更新</span><h2>客户端部署</h2><p>为客户端选择程序和数据，跟踪更新直到生效。</p></div><button type="button" class="button primary" id="deployment-new">＋ 创建部署</button></div>
-            <p class="management-status workspace-status" id="deployment-status" role="status"></p>
-            <section class="workspace-surface deployment-editor" id="deployment-editor" hidden aria-label="客户端部署向导">
-              <div class="deployment-editor-head"><div><span class="workspace-eyebrow">部署向导</span><h3>配置客户端</h3></div><button type="button" class="button" id="deployment-close">收起配置</button></div>
-              <ol class="deployment-steps" aria-label="部署步骤">
-                <li><button type="button" data-deployment-step="0" aria-current="step"><span>1</span><b>选择客户端</b></button></li>
-                <li><button type="button" data-deployment-step="1"><span>2</span><b>选择插件</b></button></li>
-                <li><button type="button" data-deployment-step="2"><span>3</span><b>程序与数据</b></button></li>
-                <li><button type="button" data-deployment-step="3"><span>4</span><b>运行安排</b></button></li>
-                <li><button type="button" data-deployment-step="4"><span>5</span><b>确认发布</b></button></li>
-              </ol>
-              <form id="deployment-form" class="deployment-form" novalidate>
-                <section data-deployment-stage="0" class="deployment-stage">
-                  <div class="stage-heading"><h3>这次部署到哪台客户端？</h3><p>可选择已连接的客户端，也可填写稍后上线的客户端标识。</p></div>
-                  <div class="management-form target-client-form"><div class="management-field grow-field"><label for="deployment-client">客户端 worker_id</label><input id="deployment-client" list="deployment-client-options" required placeholder="选择或输入客户端标识" autocomplete="off"><datalist id="deployment-client-options"></datalist></div><button class="button" type="button" id="deployment-load">读取当前部署</button></div>
-                  <div class="workspace-note"><span class="note-symbol">i</span><p>填写物理客户端的基础 worker_id。每台客户端可同时启用多个插件，各插件独立执行；程序与数据统一更新。</p></div>
-                </section>
-                <section data-deployment-stage="1" class="deployment-stage" hidden>
-                  <div class="stage-heading"><h3>选择任务执行插件</h3><p>插件决定程序的调用方式和结果入库方式。</p></div>
-                  <div id="deployment-enabled-plugins" class="management-form" aria-label="启用的客户端插件"></div>
-                  <div class="management-form"><div class="management-field"><label for="deployment-plugin">正在配置的插件</label><select id="deployment-plugin"><option value="coverage">coverage · 覆盖率</option><option value="stpcompare">stpcompare · 新老程序结果采集</option></select></div></div><p class="config-help">勾选需要启用的插件，再分别配置每个插件的 DLL、程序和数据。其他插件使用高级 JSON 配置。</p>
-                </section>
-                <div id="deployment-wizard" class="deployment-wizard">
-                  <div data-deployment-stage="2" class="stage-heading" hidden><h3>配置程序与数据</h3><p>选择制品后填写包内路径；也可以使用客户端现有路径。</p><label for="deployment-resource-plugin">正在配置的插件</label><select id="deployment-resource-plugin"><option value="coverage">coverage · 覆盖率</option><option value="stpcompare">stpcompare · 新老程序结果采集</option></select></div>
-                  <div id="deployment-fields"></div>
-                  <section data-deployment-stage="2" class="deployment-execution-options" hidden>
-                    <div class="management-form"><div class="management-field"><label for="deployment-dry-run">执行模式</label><select id="deployment-dry-run"><option value="inherit">继承客户端基础配置</option><option value="simulate">模拟执行（不运行业务程序）</option><option value="real">真实执行</option></select></div><label id="deployment-store-cov-field" class="check-field"><input id="deployment-store-cov" type="checkbox">保留原始 cov（coverage）</label></div>
-                  </section>
-                  <section data-deployment-stage="3" class="deployment-stage" hidden>
-                    <div class="stage-heading"><h3>安排执行和更新时间</h3><p>时间按客户端本机时区计算。执行窗口结束后，已开始的任务会继续完成。</p></div>
-                    <div class="management-form"><div class="management-field"><label for="deployment-threads">每插件任务并发数</label><input id="deployment-threads" type="number" min="1" step="1" placeholder="留空继承基础配置"></div></div><p class="config-help">每个启用插件分别使用此并发数。例如启用两个插件且设置为 2 时，总并发上限约为 4。</p>
-                    <div class="deployment-window-grid"><section class="deployment-window"><h3>任务执行时间窗</h3><p class="workspace-help">控制何时领取新任务。</p><div id="deployment-execution-windows"></div><button class="button" type="button" id="deployment-execution-add">＋ 添加执行时段</button></section><section class="deployment-window"><h3>程序与数据更新时间窗</h3><p class="workspace-help">控制何时应用新部署。</p><div id="deployment-update-windows"></div><button class="button" type="button" id="deployment-update-add">＋ 添加更新时段</button></section></div>
-                    <p class="config-help">跨午夜的时段归属开始日。修改更新时间窗也需等待当前生效窗口开放。</p>
-                  </section>
-                </div>
-                <section data-deployment-stage="4" class="deployment-stage" hidden>
-                  <div class="stage-heading"><h3>确认部署内容</h3><p>核对目标版本与运行安排，发布后可在下方跟踪客户端状态。</p></div>
-                  <div id="deployment-summary" class="deployment-summary" tabindex="-1"></div>
-                  <div class="preview-toolbar"><button type="button" class="button" id="deployment-preview">生成配置预览</button></div>
-                  <div id="deployment-bindings" class="deployment-section binding-panel" hidden><h3>服务端程序匹配</h3><div id="deployment-binding-list"></div><button type="button" class="button" id="deployment-bind-scheduler">保存服务端匹配配置</button><p class="management-status" id="deployment-binding-status" role="status"></p></div>
-                  <div class="management-form release-reason"><div class="management-field grow-field"><label for="deployment-reason">变更说明</label><input id="deployment-reason" placeholder="例如：更新候选程序，保留当前数据版本"></div></div>
-                  <details class="workspace-advanced"><summary>恢复历史部署</summary><p class="config-help">恢复会发布旧版本的部署期望，仍需等待客户端应用。</p><div class="management-form"><div class="management-field"><label for="deployment-rollback">历史部署</label><select id="deployment-rollback"><option value="">选择历史版本</option></select></div><button class="button" type="button" id="deployment-rollback-button">恢复此版本</button></div></details>
-                </section>
-                <p class="management-status workspace-status" id="deployment-preview-status" role="status"></p>
-                <details class="workspace-advanced" id="deployment-advanced"><summary>高级配置 <span>JSON 与制品引用</span></summary><div class="management-form"><div class="management-field"><label for="deployment-editor-mode">配置方式</label><select id="deployment-editor-mode"><option value="wizard">表单向导</option><option value="json">高级 JSON 编辑</option></select></div><button class="button" type="button" id="deployment-import">从 JSON 回填表单</button></div><label class="config-help" for="deployment-patch">客户端配置覆盖（JSON）</label><textarea id="deployment-patch" class="config-json deployment-patch" spellcheck="false" aria-label="客户端配置覆盖 JSON">{}</textarea><p class="config-help">仅修改指定字段，其他基础配置继续保留。使用 <code>{artifact:槽位}/包内路径</code> 引用制品；高级模式可在制品库勾选所需制品。上传数据不会自动替换服务端 manifest 或预期数据版本。</p></details>
-                <div class="deployment-step-footer"><button type="button" class="button" id="deployment-back" hidden>上一步</button><span class="step-footer-hint">发布后需等待客户端应用</span><button type="button" class="button primary" id="deployment-next">下一步</button><button class="button primary" type="submit" id="deployment-save" hidden>发布客户端部署</button></div>
-              </form>
-            </section>
-            <div class="workspace-surface"><div class="workspace-list-heading"><h3>部署状态</h3><span class="workspace-help">客户端按更新时间窗应用</span></div><div class="table-wrap workspace-table deployment-state"><table><thead><tr><th>客户端</th><th>状态</th><th>当前部署</th><th>目标部署</th><th class="actions-column">操作</th></tr></thead><tbody id="deployment-list"></tbody></table></div></div>
+            <div class="workspace-heading"><div><span class="workspace-eyebrow">发布与更新</span><h2>客户端部署</h2><p>为客户端选择程序和数据，跟踪更新直到生效。</p></div></div>
+            <p class="workspace-help">客户端部署已移至客户端页面。先选择在线空闲机器，再配置和发布。</p><button type="button" class="button primary" id="deployment-go-clients">打开客户端</button>
           </section>
 
           <section id="workspace-panel-settings" class="workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-settings" data-workspace-panel="settings" hidden>
@@ -227,7 +236,6 @@
               <div class="settings-footer"><p class="management-status" id="config-status" role="status"></p><div class="head-actions"><button type="button" class="button" id="config-discard" hidden>放弃草稿并重载</button><button type="button" class="button primary" id="config-save" disabled>保存配置</button></div></div>
             </section>
           </section>
-          <dialog id="workspace-drawer" class="workspace-drawer" aria-labelledby="workspace-drawer-title" hidden><header class="workspace-drawer-head"><div><span class="workspace-eyebrow">详细信息</span><h2 id="workspace-drawer-title"></h2></div><button type="button" class="icon-button" id="workspace-drawer-close" aria-label="关闭详情">×</button></header><div id="workspace-drawer-content" class="workspace-drawer-content"></div></dialog>
         </section>
 
         <section class="page" id="page-logs" hidden>
@@ -278,6 +286,9 @@
     </div>
     <footer><span><span class="dot" id="footer-dot"></span><span id="footer-status">结果服务连接中</span></span><span>执行状态 · 结果完整性 · 分析状态独立展示</span></footer>
   </div>
+  <!-- Shared modal dialogs stay outside pages: opening a dialog inside a hidden
+       page can make the rest of the document inert without displaying it. -->
+  <dialog id="workspace-drawer" class="workspace-drawer" aria-labelledby="workspace-drawer-title" hidden><header class="workspace-drawer-head"><div><span class="workspace-eyebrow">详细信息</span><h2 id="workspace-drawer-title"></h2></div><button type="button" class="icon-button" id="workspace-drawer-close" aria-label="关闭详情">×</button></header><div id="workspace-drawer-content" class="workspace-drawer-content"></div></dialog>
   <dialog class="view-editor-dialog" id="report-editor-dialog">
     <div class="view-editor-head"><div><strong id="report-editor-title">编辑 Python 报告脚本</strong><span id="report-editor-plugin"></span></div><button type="button" class="icon-button" id="close-report-editor" title="关闭" aria-label="关闭">×</button></div>
     <p class="report-editor-help">脚本只读取数据库中的结果，返回独立的 HTML 报告。可在报告内添加图表、筛选和交互。</p>

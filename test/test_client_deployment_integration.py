@@ -9,7 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,8 +28,10 @@ class ClientDeploymentIntegrationTests(unittest.TestCase):
         root = Path(tempfile.mkdtemp(prefix='deployment-multi-e2e-', dir=ROOT / 'build/test'))
         client_root = root / '双插件 client'
         client_root.mkdir()
+        management = f'http://127.0.0.1:{unused_port()}'
         service = ResultService(ServiceConfig(workspace=str(root), providers={},
-                                              artifact_store_dir=str(root / 'repository')))
+                                              artifact_store_dir=str(root / 'repository'),
+                                              scheduler_management_url=management))
 
         class QuietHandler(Handler):
             def log_message(self, *args):
@@ -49,7 +51,6 @@ class ClientDeploymentIntegrationTests(unittest.TestCase):
         self.addCleanup(close_server)
         endpoint = f'http://127.0.0.1:{server.server_port}'
         scheduler_endpoint = f'tcp://127.0.0.1:{unused_port()}'
-        management = f'http://127.0.0.1:{unused_port()}'
         entered = root / 'probe-result.txt'
         scheduler_config = root / 'scheduler.json'
         scheduler_config.write_text(json.dumps({
@@ -108,6 +109,10 @@ class ClientDeploymentIntegrationTests(unittest.TestCase):
             current = workers()
             return current if set(current) == {'demo', 'probe'} else None
 
+        def configurable():
+            return any(item['client_id'] == 'multi-worker' and item['configurable']
+                       for item in request(endpoint, '/api/agents')['agents'])
+
         def worker_pids():
             return {key: int(pid) for key, pid in re.findall(
                 r'client worker started: plugin=(\S+) pid=(\d+)', client.text())}
@@ -148,12 +153,19 @@ class ClientDeploymentIntegrationTests(unittest.TestCase):
                 return current and all(item['tasks'] for item in current.values())
 
             wait(both_have_tasks)
+            if label == 'healthy':
+                with self.assertRaises(HTTPError) as rejection:
+                    publish(good_probe, first, 'must-not-update-busy-client')
+                self.assertEqual(409, rejection.exception.code)
+                rejection.exception.close()
+                self.assertEqual(first, request(endpoint, state_path)['desired']['revision'])
             wait(lambda: entered.is_file() and scheduler.text().count('demo plugin: run finished') > finished_before)
             wait(lambda: not any(run['run_id'] in run_ids for run in request(management, '/status')['active_runs']))
 
         initial = wait(both_workers)
         self.assertEqual({'multi-worker/demo', 'multi-worker/probe'}, {item['worker_id'] for item in initial.values()})
         self.assertEqual({'demo', 'client-retry-probe'}, {item['plugin_type'] for item in initial.values()})
+        wait(configurable)
         first = publish(good_probe, None, 'healthy-v1')
         wait(lambda: request(endpoint, state_path)['state'] == 'current')
         self.assertEqual(first, active()['revision'])
@@ -166,6 +178,7 @@ class ClientDeploymentIntegrationTests(unittest.TestCase):
         previous_pids = worker_pids()
 
         bad_probe = upload('probe', 'client_retry_probe.dll', b'invalid second plugin DLL', '2')
+        wait(configurable)
         rejected = publish(bad_probe, first, 'rejected-v2')
         wait(lambda: request(endpoint, state_path)['state'] == 'failed')
         wait(lambda: 'restoring previous configuration' in client.text())
@@ -195,8 +208,10 @@ class ClientDeploymentIntegrationTests(unittest.TestCase):
         root = Path(tempfile.mkdtemp(prefix='deployment-e2e-', dir=ROOT / 'build/test'))
         client_root = root / '客户端 运行目录'
         client_root.mkdir()
+        management = f'http://127.0.0.1:{unused_port()}'
         service = ResultService(ServiceConfig(workspace=str(root), providers={},
-                                              artifact_store_dir=str(root / 'repository')))
+                                              artifact_store_dir=str(root / 'repository'),
+                                              scheduler_management_url=management))
         class QuietHandler(Handler):
             def log_message(self, *args):
                 pass
@@ -212,7 +227,6 @@ class ClientDeploymentIntegrationTests(unittest.TestCase):
         self.addCleanup(close_server)
         endpoint = f'http://127.0.0.1:{server.server_port}'
         scheduler_endpoint = f'tcp://127.0.0.1:{unused_port()}'
-        management = f'http://127.0.0.1:{unused_port()}'
         plugin = {'dll': str(OPTIONS.bin_dir / 'demo.dll'), 'enabled': True}
         scheduler_config = root / 'scheduler.json'
         scheduler_config.write_text(json.dumps({
@@ -255,6 +269,10 @@ class ClientDeploymentIntegrationTests(unittest.TestCase):
         def active():
             return json.loads((client_root / 'deployments/active.json').read_text(encoding='utf-8'))
 
+        def configurable():
+            return any(item['client_id'] == 'e2e-worker' and item['configurable']
+                       for item in request(endpoint, '/api/agents')['agents'])
+
         def upload(contents, version):
             path = f'/api/artifacts/upload?kind=plugin&name=demo&version={version}&filename=demo.dll'
             req = Request(endpoint + path, data=contents, method='POST',
@@ -265,6 +283,7 @@ class ClientDeploymentIntegrationTests(unittest.TestCase):
         desired_path = '/api/deployments/e2e-worker/desired'
         state_path = '/api/deployments/e2e-worker'
         wait(lambda: request(management, '/status')['clients'])
+        wait(configurable)
         good = upload((OPTIONS.bin_dir / 'demo.dll').read_bytes(), '1')
         def publish(artifact, revision):
             return request(endpoint, desired_path, {
@@ -284,6 +303,7 @@ class ClientDeploymentIntegrationTests(unittest.TestCase):
         wait(lambda: 'demo plugin: run finished' in scheduler.text())
 
         bad = upload(b'invalid DLL fixture', '2')
+        wait(configurable)
         second = publish(bad, first)
         wait(lambda: request(endpoint, state_path)['state'] == 'failed')
         self.assertEqual(first, active()['revision'], 'failed registration must retain the old active release')
@@ -310,6 +330,7 @@ class ClientDeploymentIntegrationTests(unittest.TestCase):
         self.assertNotIn('deployment activation failed', client.text(),
                          'a rejected release must not execute again merely to recover its report')
 
+        wait(configurable)
         rolled_back = request(endpoint, desired_path, {'revision': second, 'action': 'rollback',
                               'target_revision': first, 'reason': 'return to healthy release'}, 'PUT')
         final_revision = rolled_back['desired']['revision']

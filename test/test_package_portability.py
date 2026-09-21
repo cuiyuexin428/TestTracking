@@ -72,7 +72,7 @@ class ClientPackageTests(unittest.TestCase):
         self.coverage = self.root / 'coverage tool'
         for directory in (self.bin, self.crt, self.program, self.dataset, self.coverage):
             directory.mkdir()
-        for name in ('client.exe', 'coverage.dll', 'stpcompare.dll'):
+        for name in ('client.exe', 'common.dll', 'coverage.dll', 'stpcompare.dll'):
             (self.bin / name).write_bytes(b'fixture never executed')
         for name in ('msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140_atomic_wait.dll'):
             (self.crt / name).write_bytes(b'fixture CRT never executed')
@@ -119,6 +119,48 @@ class ClientPackageTests(unittest.TestCase):
         self.assertIn('at most one', result.stderr)
         _, result = self.build('-OnlyClient', '-Config', 'Debug', succeeds=False)
         self.assertIn('Release', result.stderr)
+
+    def test_bootstrap_package_has_auto_identity_and_only_framework_runtime(self):
+        (self.bin / 'libprotobuf.dll').write_bytes(b'protobuf fixture')
+        (self.bin / 'custom_business.dll').write_bytes(b'must not ship')
+        output, _ = self.build('-Bootstrap', '-DeploymentEndpoint', 'http://192.0.2.1:56330/',
+                               '-Endpoint', 'tcp://192.0.2.1:5555')
+        config = json.loads((output / 'config/client.json').read_text())
+        self.assertEqual({}, config['plugins'])
+        self.assertEqual('auto', config['client']['worker_id'])
+        self.assertEqual('http://192.0.2.1:56330', config['client']['deployment_endpoint'])
+        self.assertEqual('tcp://192.0.2.1:5555', config['scheduler']['endpoint'])
+        self.assertNotIn('db_conn', json.dumps(config))
+        for name in ('client.exe', 'common.dll', 'libprotobuf.dll', 'vcruntime140.dll',
+                     'tools/client_update.ps1', 'start_client.bat'):
+            self.assertTrue((output / name).is_file(), name)
+        for name in ('coverage.dll', 'stpcompare.dll', 'custom_business.dll', 'testenv', 'store'):
+            self.assertFalse((output / name).exists(), name)
+
+    def test_bootstrap_requires_service_and_preserves_existing_output(self):
+        _, result = self.build('-Bootstrap', succeeds=False)
+        self.assertIn('requires -DeploymentEndpoint', result.stderr)
+        output, _ = self.build('-Bootstrap', '-DeploymentEndpoint', 'http://192.0.2.1:56330')
+        config_path = output / 'config/client.json'
+        before = config_path.read_bytes()
+        _, result = self.build('-Bootstrap', '-DeploymentEndpoint', 'http://192.0.2.2:56330', succeeds=False)
+        self.assertIn('empty output directory', result.stderr)
+        self.assertEqual(before, config_path.read_bytes())
+
+    def test_bootstrap_defaults_scheduler_to_remote_service_host_and_custom_port(self):
+        # No ServerIp is supplied here: the service host is enough for a client
+        # copied to another machine to reach the scheduler after deployment.
+        output = self.root / 'client package'
+        command = [shutil.which('powershell') or 'pwsh', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+                   '-File', str(ROOT / 'tools/build_package.ps1'), '-OutDir', str(output),
+                   '-BinDir', str(self.bin), '-VCRuntimeDir', str(self.crt), '-Bootstrap',
+                   '-DeploymentEndpoint', 'http://tracking.intranet:56330', '-ServerPort', '6012']
+        result = subprocess.run(command, cwd=self.root, capture_output=True, encoding='utf-8',
+                                errors='replace', timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        config = json.loads((output / 'config/client.json').read_text())
+        self.assertEqual('tcp://tracking.intranet:6012', config['scheduler']['endpoint'])
+        self.assertIn('-ServerPort', (output / 'README.md').read_text(encoding='utf-8-sig'))
 
     def test_client_component_includes_runtime_without_program_inputs(self):
         output, _ = self.build('-OnlyClient', '-Plugin', 'stpcompare',

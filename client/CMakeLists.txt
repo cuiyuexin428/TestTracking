@@ -10,6 +10,9 @@ target_include_directories(client PRIVATE
 )
 
 target_link_libraries(client PRIVATE common)
+if(WIN32)
+    target_link_libraries(client PRIVATE winhttp)
+endif()
 
 # Keep client.json in a config/ directory next to the executable. This
 # target runs on every build so config changes always reach the output dir.
