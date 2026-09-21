@@ -7,10 +7,11 @@
 namespace {
 class Probe : public common::TaskPlugin {
 public:
-    std::string pluginType() const override { return "scheduler-probe"; }
+    std::string pluginType() const override { return type_; }
     bool init(const std::string& config) override {
         const auto settings = nlohmann::json::parse(config);
         entered_ = settings.at("entered_file").get<std::string>();
+        type_ = settings.value("plugin_type", std::string("scheduler-probe"));
         throw_plan_ = settings.value("throw_plan", false);
         return true;
     }
@@ -51,6 +52,7 @@ public:
 private:
     common::Task task_;
     std::string entered_;
+    std::string type_ = "scheduler-probe";
     bool throw_plan_ = false;
     bool pending_ = false, done_ = false;
 };

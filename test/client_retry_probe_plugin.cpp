@@ -1,4 +1,6 @@
 #include <string>
+#include <thread>
+#include <chrono>
 #include <json.hpp>
 
 #ifdef _WIN32
@@ -15,6 +17,7 @@ class RetryProbe : public common::WorkerPlugin {
     bool init(const std::string& config) override {
         const auto value = nlohmann::json::parse(config);
         process_probe_ = value.value("process_probe", false);
+        task_sleep_ms_ = value.value("task_sleep_ms", 0);
 #ifdef _WIN32
         if (process_probe_) {
             wchar_t directory[MAX_PATH]{};
@@ -43,12 +46,16 @@ class RetryProbe : public common::WorkerPlugin {
         return process_probe_ ? common::RegisterOutcome::kReady : common::RegisterOutcome::kRetry;
     }
 
-    bool execute(const common::Task&, common::TaskResult&) override { return false; }
+    bool execute(const common::Task&, common::TaskResult&) override {
+        std::this_thread::sleep_for(std::chrono::milliseconds(task_sleep_ms_));
+        return process_probe_;
+    }
 
    private:
     int registrations_ = 0;
     bool process_probe_ = false;
     unsigned long child_pid_ = 0;
+    int task_sleep_ms_ = 0;
 };
 
 }  // namespace

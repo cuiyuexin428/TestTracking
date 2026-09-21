@@ -39,6 +39,7 @@ class SourceArchiveTests(unittest.TestCase):
                 'runtime/pgdata/postgresql.conf',
                 'runtime/logs/service.log',
                 'build/stale.exe',
+                'real-test/state.db',
             }
             for relative in included | excluded:
                 path = source / relative
@@ -172,6 +173,98 @@ class ClientPackageTests(unittest.TestCase):
                                succeeds=False)
         self.assertIn('both -BaselineConverterExe and -CandidateConverterExe', result.stderr)
 
+    def build_all_plugins(self):
+        return self.build('-Plugin', 'all',
+                          '-StepTestExe', self.program / 'CustomRunner.exe',
+                          '-BaselineConverterExe', self.program / 'BaselineRunner.exe',
+                          '-CandidateConverterExe', self.program / 'CandidateRunner.exe',
+                          '-ProgramVersion', 'cov-3', '-BaselineProgramVersion', 'old-7',
+                          '-CandidateProgramVersion', 'new-9', '-DatasetDir', self.dataset,
+                          '-OpenCppCoverageDir', self.coverage)[0]
+
+    def test_multi_plugin_package_has_isolated_versioned_programs_and_relocates(self):
+        output = self.build_all_plugins()
+        moved = self.root / 'moved multi plugin client'
+        shutil.move(output, moved)
+        config = json.loads((moved / 'config/client.json').read_text())
+        self.assertEqual({'coverage', 'stpcompare'}, set(config['plugins']))
+        self.assertTrue(all(item['enabled'] for item in config['plugins'].values()))
+        coverage = config['plugins']['coverage']
+        compare = config['plugins']['stpcompare']
+        self.assertEqual('testenv/program/coverage', coverage['program_dir'])
+        self.assertEqual('testenv/program/coverage/CustomRunner.exe', coverage['target_exe'])
+        self.assertTrue(all(path.startswith('testenv/program/coverage/') for path in coverage['engine_dlls']))
+        for program, version in [(coverage['target_exe'], 'cov-3'),
+                                 (compare['programs']['baseline']['executable'], 'old-7'),
+                                 (compare['programs']['candidate']['executable'], 'new-9')]:
+            executable = moved / program
+            self.assertTrue(executable.is_file())
+            self.assertEqual(version, (executable.parent / 'version.txt').read_text())
+            self.assertTrue((executable.parent / 'vcruntime140.dll').is_file())
+        self.assertEqual(coverage['stp_root'], compare['stp_root'])
+        self.assertTrue((moved / coverage['stp_root'] / 'manifest.txt').is_file())
+
+    def test_multi_plugin_component_updates_preserve_other_programs_and_configuration(self):
+        output = self.build_all_plugins()
+        config_path = output / 'config/client.json'
+        original = json.loads(config_path.read_text())
+        original['client']['custom'] = {'keep': True}
+        original['plugins']['coverage']['custom'] = 'coverage-setting'
+        original['plugins']['stpcompare']['custom'] = 'compare-setting'
+        config_path.write_text(json.dumps(original), encoding='utf-8')
+        self.build('-OnlyClient')
+        self.assertEqual(original, json.loads(config_path.read_text()))
+        before_stp = {str(path.relative_to(output)): path.read_bytes()
+                      for directory in ('baseline', 'candidate')
+                      for path in (output / 'testenv/program' / directory).rglob('*') if path.is_file()}
+        replacement = self.program / 'CoverageV4.exe'
+        replacement.write_bytes(b'coverage v4')
+        self.build('-OnlyProgram', '-Plugin', 'coverage', '-StepTestExe', replacement,
+                   '-ProgramVersion', 'cov-4', '-OpenCppCoverageDir', self.coverage)
+        after_coverage = json.loads(config_path.read_text())
+        self.assertEqual(original['plugins']['stpcompare'], after_coverage['plugins']['stpcompare'])
+        self.assertEqual('testenv/program/coverage/CoverageV4.exe', after_coverage['plugins']['coverage']['target_exe'])
+        for path, content in before_stp.items():
+            self.assertEqual(content, (output / path).read_bytes())
+        self.assertFalse((output / 'testenv/program/coverage/CustomRunner.exe').exists())
+        coverage_files = {str(path.relative_to(output)): path.read_bytes()
+                          for directory in ('testenv/program/coverage', 'testenv/opencppcoverage')
+                          for path in (output / directory).rglob('*') if path.is_file()}
+        next_baseline = self.program / 'OldV8.exe'
+        next_candidate = self.program / 'NewV10.exe'
+        next_baseline.write_bytes(b'baseline v8')
+        next_candidate.write_bytes(b'candidate v10')
+        self.build('-OnlyProgram', '-Plugin', 'stpcompare', '-BaselineConverterExe', next_baseline,
+                   '-CandidateConverterExe', next_candidate, '-BaselineProgramVersion', 'old-8',
+                   '-CandidateProgramVersion', 'new-10')
+        after_stp = json.loads(config_path.read_text())
+        self.assertEqual(after_coverage['plugins']['coverage'], after_stp['plugins']['coverage'])
+        self.assertEqual('testenv/program/baseline/OldV8.exe', after_stp['plugins']['stpcompare']['programs']['baseline']['executable'])
+        for path, content in coverage_files.items():
+            self.assertEqual(content, (output / path).read_bytes())
+        self.assertEqual('fixture data', (output / 'testenv/dataset/sample.stp').read_text())
+        _, result = self.build('-OnlyProgram', '-StepTestExe', replacement,
+                               '-OpenCppCoverageDir', self.coverage, succeeds=False)
+        self.assertIn('Multiple plugins are enabled', result.stderr)
+
+    def test_legacy_coverage_program_update_keeps_stp_sibling_directories(self):
+        output, _ = self.build('-StepTestExe', self.program / 'CustomRunner.exe',
+                               '-DatasetDir', self.dataset, '-OpenCppCoverageDir', self.coverage)
+        self.build('-OnlyClient', '-Plugin', 'all')
+        config_path = output / 'config/client.json'
+        before = json.loads(config_path.read_text())
+        self.assertEqual('testenv/program/CustomRunner.exe', before['plugins']['coverage']['target_exe'])
+        baseline = output / 'testenv/program/baseline/keep.exe'
+        baseline.parent.mkdir()
+        baseline.write_bytes(b'keep baseline')
+        self.build('-OnlyProgram', '-Plugin', 'coverage', '-StepTestExe', self.program / 'CustomRunner.exe',
+                   '-OpenCppCoverageDir', self.coverage)
+        updated = json.loads(config_path.read_text())
+        self.assertEqual(b'keep baseline', baseline.read_bytes())
+        self.assertEqual(before['plugins']['stpcompare'], updated['plugins']['stpcompare'])
+        self.assertEqual('testenv/program/coverage/CustomRunner.exe', updated['plugins']['coverage']['target_exe'])
+        self.assertEqual('testenv/program/coverage', updated['plugins']['coverage']['program_dir'])
+
     def test_dataset_update_needs_only_dataset_inputs(self):
         shutil.rmtree(self.bin)
         shutil.rmtree(self.crt)
@@ -208,6 +301,31 @@ class ClientPackageTests(unittest.TestCase):
         self.assertEqual(config['plugins']['coverage']['target_exe'], 'testenv/program/RunnerV2.exe')
         self.assertTrue((output / config['plugins']['coverage']['target_exe']).exists())
         self.assertTrue((output / 'testenv/dataset/sample.stp').exists())
+
+    def test_program_update_retains_custom_engine_symbols_when_module_option_is_omitted(self):
+        engine = self.program / 'FixtureEngine.dll'
+        symbols = self.program / 'FixtureEngine.pdb'
+        engine.write_bytes(b'custom engine v1')
+        symbols.write_bytes(b'custom engine symbols v1')
+        output, _ = self.build('-StepTestExe', self.program / 'CustomRunner.exe',
+                               '-DatasetDir', self.dataset, '-OpenCppCoverageDir', self.coverage,
+                               '-EngineDlls', 'FixtureEngine.dll')
+        config_path = output / 'config/client.json'
+        original = json.loads(config_path.read_text())['plugins']['coverage']
+        self.assertEqual(['testenv/program/FixtureEngine.dll'], original['engine_dlls'])
+        self.assertEqual(b'custom engine symbols v1', (output / 'testenv/program/FixtureEngine.pdb').read_bytes())
+
+        replacement = self.program / 'RunnerV2.exe'
+        replacement.write_bytes(b'runner v2')
+        engine.write_bytes(b'custom engine v2')
+        symbols.write_bytes(b'custom engine symbols v2')
+        self.build('-OnlyProgram', '-StepTestExe', replacement, '-OpenCppCoverageDir', self.coverage)
+        updated = json.loads(config_path.read_text())['plugins']['coverage']
+        self.assertEqual(original['engine_dlls'], updated['engine_dlls'])
+        deployed_engine = output / updated['engine_dlls'][0]
+        self.assertEqual(b'custom engine v2', deployed_engine.read_bytes())
+        self.assertEqual(b'custom engine symbols v2', deployed_engine.with_suffix('.pdb').read_bytes())
+        self.assertFalse((output / 'testenv/program/CustomRunner.exe').exists())
 
     def test_client_update_preserves_deployed_configuration_and_plugin(self):
         output, _ = self.build('-OnlyClient', '-Plugin', 'stpcompare')

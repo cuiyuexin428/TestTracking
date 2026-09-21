@@ -170,6 +170,8 @@ Client::Client(common::Config& config, std::shared_ptr<std::atomic<bool>> stop_s
       outgoing_limit_(static_cast<size_t>(task_slots_) * 4 + 32) {
     request_backoff_max_ = std::max(request_backoff_initial_, request_backoff_max_);
     if (qualify_worker_id && !selected_plugin_.empty()) worker_id_ += "/" + selected_plugin_;
+    if (worker_id_.empty() || worker_id_.size() > 255)
+        throw std::runtime_error("Client: worker identity must contain 1 to 255 UTF-8 bytes");
 }
 
 Client::~Client() {
@@ -214,8 +216,8 @@ bool Client::LoadPlugins() {
     for (const auto& entry : entries->items()) {
         if (entry.value().is_object() && entry.value().value("enabled", false)) ++enabled;
     }
-    if (enabled != 1) {
-        LOG_ERROR("Client: exactly one enabled plugin is required; multi-plugin scheduling is deferred");
+    if (enabled == 0 || (enabled > 1 && selected_plugin_.empty())) {
+        LOG_ERROR("Client: select one enabled plugin for each isolated worker process");
         return false;
     }
     if (!selected_plugin_.empty() &&
@@ -228,6 +230,7 @@ bool Client::LoadPlugins() {
     for (const auto& entry : entries->items()) {
         if (!entry.value().is_object() || !entry.value().value("enabled", false)) continue;
         if (!selected_plugin_.empty() && entry.key() != selected_plugin_) continue;
+        selected_plugin_ = entry.key();
         const auto dll = entry.value().value("dll", std::string());
         auto library = common::DynamicLibrary::load(dll);
         if (!library) {
@@ -313,6 +316,9 @@ void Client::RefreshRegistration() {
     registration_.set_type(common::REGISTER);
     registration_.set_plugin_type(plugin_->pluginType());
     registration_.mutable_register_()->set_payload(payload);
+    registration_.mutable_register_()->set_physical_client_id(
+        config_.get("client.worker_id", std::string("worker-1")));
+    registration_.mutable_register_()->set_plugin_key(selected_plugin_);
     registration_.mutable_register_()->set_protocol_version(common::kProtocolVersion);
     registration_.mutable_register_()->add_capabilities(common::kAttemptIdsCapability);
     registration_id_ = GenerateRegistrationId();

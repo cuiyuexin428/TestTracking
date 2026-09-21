@@ -14,6 +14,7 @@ EXCLUDED_DIRECTORIES = {
     ".vs",
     "build",
     "dist",
+    "real-test",
     "out",
     "runtime/logs",
     "runtime/pgdata",

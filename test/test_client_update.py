@@ -175,7 +175,7 @@ class ClientUpdateTests(unittest.TestCase):
         self.assertEqual(old_bytes, old_config.read_bytes())
         self.assertFalse((self.client / "deployments" / "objects" / second["sha256"] / "archive").exists())
 
-    def test_merged_multi_plugin_deployment_is_rejected_before_download(self):
+    def test_merged_multi_plugin_deployment_stages_without_disabling_existing_plugin(self):
         first = self.plan(self.artifact())
         staged = self.run_update()
         old_config = Path(staged["config_path"])
@@ -185,26 +185,34 @@ class ClientUpdateTests(unittest.TestCase):
         active_bytes = active.read_bytes()
         base_bytes = self.config.read_bytes()
         artifact = self.artifact(raw=b"new program", filename="tool.exe", version="2")
-        # The server sees only one enabled plugin in this partial patch. The
-        # client's base still enables custom, so the final configuration has two.
+        # A partial patch adds a second plugin while retaining the first.
         desired = self.plan(artifact, revision=first["revision"], patch={"plugins": {
             "replacement": {"enabled": True, "dll": "{artifact:dataset}/tool.exe"},
         }})
         self.requests.clear()
-        failed = self.run_update(expected=1, current=first["revision"])
-        self.assertEqual("failed", failed["status"])
-        self.assertIn("exactly one enabled plugin; found 2", failed["message"])
-        self.assertEqual([], self.downloads())
+        next_stage = self.run_update(current=first["revision"])
+        self.assertEqual("staged", next_stage["status"])
+        prepared = json.loads(Path(next_stage["config_path"]).read_text(encoding="utf-8"))
+        self.assertTrue(prepared["plugins"]["custom"]["enabled"])
+        self.assertTrue(prepared["plugins"]["replacement"]["enabled"])
+        self.assertEqual({"preserved": 1}, prepared["plugins"]["custom"]["nested"])
+        self.assertEqual(b"new program", Path(prepared["plugins"]["replacement"]["dll"]).read_bytes())
+        self.assertEqual(1, len(self.downloads()))
         self.assertEqual(old_bytes, old_config.read_bytes())
         self.assertEqual(active_bytes, active.read_bytes())
         self.assertEqual(base_bytes, self.config.read_bytes())
-        self.assertFalse((self.client / "deployments" / "releases" / desired["revision"]).exists())
+        self.assertTrue((self.client / "deployments" / "releases" / desired["revision"]).exists())
+        self.requests.clear()
+        cached = self.run_update(prepared=desired["revision"])
+        self.assertEqual("staged", cached["status"])
+        self.assertEqual(next_stage["config_path"], cached["config_path"])
+        self.assertEqual([], self.downloads())
 
     def test_deployment_with_no_enabled_plugin_is_rejected_before_download(self):
         self.plan(self.artifact(), patch={"plugins": {"custom": {"enabled": False}}})
         failed = self.run_update(expected=1)
         self.assertEqual("failed", failed["status"])
-        self.assertIn("exactly one enabled plugin; found 0", failed["message"])
+        self.assertIn("at least one enabled plugin; found 0", failed["message"])
         self.assertEqual([], self.downloads())
         self.assertTrue(json.loads(self.config.read_text(encoding="utf-8"))["plugins"]["custom"]["enabled"])
 
@@ -223,19 +231,39 @@ class ClientUpdateTests(unittest.TestCase):
         self.assertEqual(self.base_config["client"], config["client"])
         self.assertEqual(1, len(self.downloads()))
 
-    def test_prepared_release_cannot_bypass_single_plugin_validation(self):
+    def test_prepared_release_cannot_bypass_plugin_enabled_boolean_validation(self):
         desired = self.plan(self.artifact())
         staged = self.run_update()
         prepared = Path(staged["config_path"])
         config = json.loads(prepared.read_text(encoding="utf-8"))
-        config["plugins"]["legacy-second"] = {"enabled": True, "dll": "other.dll"}
+        config["plugins"]["legacy-second"] = {"enabled": "true", "dll": "other.dll"}
         prepared.write_text(json.dumps(config), encoding="utf-8")
         self.requests.clear()
         failed = self.run_update(expected=1, prepared=desired["revision"])
         self.assertEqual("failed", failed["status"])
-        self.assertIn("exactly one enabled plugin; found 2", failed["message"])
+        self.assertIn("Plugin enabled must be a boolean: legacy-second", failed["message"])
         self.assertEqual([], self.downloads())
         self.assertFalse((self.client / "deployments" / "active.json").exists())
+
+    def test_merged_configuration_rejects_non_boolean_enabled_before_download(self):
+        self.base_config["plugins"]["other"] = {"enabled": "false", "dll": "other.dll"}
+        self.write_config()
+        self.plan(self.artifact())
+        failed = self.run_update(expected=1)
+        self.assertIn("Plugin enabled must be a boolean: other", failed["message"])
+        self.assertEqual([], self.downloads())
+
+    def test_prepared_release_requires_at_least_one_enabled_plugin(self):
+        desired = self.plan(self.artifact())
+        staged = self.run_update()
+        prepared = Path(staged["config_path"])
+        config = json.loads(prepared.read_text(encoding="utf-8"))
+        config["plugins"]["custom"]["enabled"] = False
+        prepared.write_text(json.dumps(config), encoding="utf-8")
+        self.requests.clear()
+        failed = self.run_update(expected=1, prepared=desired["revision"])
+        self.assertIn("at least one enabled plugin; found 0", failed["message"])
+        self.assertEqual([], self.downloads())
 
     def test_outside_window_polls_and_reports_but_never_downloads(self):
         artifact = self.artifact()

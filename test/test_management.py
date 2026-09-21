@@ -208,14 +208,9 @@ class ManagementConfigTests(unittest.TestCase):
         with self.assertRaises(ManagementError):
             self.service.save_config("client", loaded)
 
-    def test_single_plugin_and_independent_windows_are_valid(self):
+    def test_multiple_plugins_and_independent_windows_are_valid(self):
         loaded = self.service.get_config("client")
         loaded["config"]["plugins"]["stpcompare"]["enabled"] = True
-        before = self.client.read_bytes()
-        with self.assertRaises(ManagementError):
-            self.service.save_config("client", loaded)
-        self.assertEqual(before, self.client.read_bytes())
-        loaded["config"]["plugins"]["coverage"]["enabled"] = False
         loaded["config"]["client"]["execution_windows"] = [
             {"days": [1, 2, 3, 4, 5], "start": "18:00", "end": "08:00"}
         ]
@@ -225,7 +220,7 @@ class ManagementConfigTests(unittest.TestCase):
         saved = self.service.save_config("client", loaded)
         self.assertTrue(saved["saved"])
         written = json.loads(self.client.read_text(encoding="utf-8"))
-        self.assertFalse(written["plugins"]["coverage"]["enabled"])
+        self.assertTrue(written["plugins"]["coverage"]["enabled"])
         self.assertTrue(written["plugins"]["stpcompare"]["enabled"])
         self.assertEqual("18:00", written["client"]["execution_windows"][0]["start"])
 

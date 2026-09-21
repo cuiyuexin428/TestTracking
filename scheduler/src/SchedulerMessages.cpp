@@ -22,6 +22,21 @@ bool Scheduler::IsCurrentSession(const IncomingMessage& msg) const {
            !msg.envelope.session_id().empty() && it->second.session_id == msg.envelope.session_id();
 }
 
+bool Scheduler::IsSelectedWorker(const std::string& identity,
+                                 const std::vector<std::string>& targets) const {
+    if (targets.empty() || std::find(targets.begin(), targets.end(), identity) != targets.end())
+        return true;
+    std::lock_guard<std::mutex> lock(clients_mutex_);
+    const auto client = clients_.find(identity);
+    if (client == clients_.end()) return false;
+    const auto& physical = client->second.physical_client_id;
+    const auto qualified = physical + "/" + client->second.plugin_key;
+    // A single-plugin deployment retains its historical transport identity.
+    // Existing targets for base/plugin must survive adding/removing siblings.
+    return std::find(targets.begin(), targets.end(), physical) != targets.end() ||
+           std::find(targets.begin(), targets.end(), qualified) != targets.end();
+}
+
 void Scheduler::HandleHeartbeat(const IncomingMessage& msg) {
     bool current = false;
     {
@@ -136,7 +151,9 @@ void Scheduler::HandleRegister(const IncomingMessage& msg) {
     {
         std::lock_guard<std::mutex> lock(clients_mutex_);
         clients_[msg.identity] = {client, Clock::now(), session,
-                                  msg.envelope.register_().registration_id(), validation};
+                                  msg.envelope.register_().registration_id(), validation,
+                                  request.physical_client_id().empty() ? msg.identity : request.physical_client_id(),
+                                  request.plugin_key().empty() ? type : request.plugin_key()};
     }
     SendRegisterResult(msg, true, validation, session);
     LOG_INFO("register: client " << msg.identity << " plugin_type=" << type
@@ -161,7 +178,7 @@ void Scheduler::HandleRequestTask(const IncomingMessage& msg) {
         return;
     }
     const auto& targets = active->second.worker_ids;
-    if (!targets.empty() && std::find(targets.begin(), targets.end(), msg.identity) == targets.end()) {
+    if (!IsSelectedWorker(msg.identity, targets)) {
         SendNoTask(msg);
         return;
     }

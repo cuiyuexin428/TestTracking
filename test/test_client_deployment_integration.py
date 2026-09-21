@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import threading
@@ -23,6 +24,173 @@ OPTIONS = None
 
 @unittest.skipUnless(os.name == 'nt', 'Windows Agent deployment')
 class ClientDeploymentIntegrationTests(unittest.TestCase):
+    def test_multiplugin_update_rolls_back_every_worker_and_retains_release_after_restart(self):
+        root = Path(tempfile.mkdtemp(prefix='deployment-multi-e2e-', dir=ROOT / 'build/test'))
+        client_root = root / '双插件 client'
+        client_root.mkdir()
+        service = ResultService(ServiceConfig(workspace=str(root), providers={},
+                                              artifact_store_dir=str(root / 'repository')))
+
+        class QuietHandler(Handler):
+            def log_message(self, *args):
+                pass
+
+        QuietHandler.service = service
+        server = ResultHTTPServer(('127.0.0.1', 0), QuietHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def close_server():
+            server.shutdown()
+            thread.join(5)
+            server.server_close()
+            service.close()
+
+        self.addCleanup(close_server)
+        endpoint = f'http://127.0.0.1:{server.server_port}'
+        scheduler_endpoint = f'tcp://127.0.0.1:{unused_port()}'
+        management = f'http://127.0.0.1:{unused_port()}'
+        entered = root / 'probe-result.txt'
+        scheduler_config = root / 'scheduler.json'
+        scheduler_config.write_text(json.dumps({
+            'server': {'router_endpoint': scheduler_endpoint, 'management_endpoint': management,
+                       'poll_timeout_ms': 5, 'client_timeout_ms': 1000},
+            'plugins': {
+                'demo': {'dll': str(OPTIONS.bin_dir / 'demo.dll'), 'enabled': True},
+                'probe': {'dll': str(OPTIONS.bin_dir / 'scheduler_probe.dll'), 'enabled': True,
+                          'plugin_type': 'client-retry-probe', 'entered_file': str(entered)},
+            }}), encoding='utf-8')
+        scheduler = CapturedProcess(OPTIONS.bin_dir / 'scheduler.exe', scheduler_config,
+                                    root, 'scheduler', os.environ.copy())
+        self.addCleanup(scheduler.close)
+        client_config = client_root / 'client.json'
+        client_config.write_text(json.dumps({
+            'scheduler': {'endpoint': scheduler_endpoint, 'poll_timeout_ms': 5},
+            'client': {'worker_id': 'multi-worker', 'heartbeat_interval_ms': 100,
+                       'task_threads': 2, 'deployment_endpoint': endpoint,
+                       'deployment_poll_seconds': 1, 'register_timeout_ms': 200,
+                       'register_max_attempts': 5, 'execution_windows': [], 'update_windows': []},
+            'plugins': {
+                'demo': {'dll': str(OPTIONS.bin_dir / 'demo.dll'), 'enabled': True, 'task_sleep_ms': 400},
+                'probe': {'dll': str(OPTIONS.bin_dir / 'client_retry_probe.dll'), 'enabled': True,
+                          'process_probe': True, 'task_sleep_ms': 1200},
+            }}), encoding='utf-8')
+        client = CapturedProcess(OPTIONS.bin_dir / 'client.exe', client_config,
+                                 client_root, 'client', os.environ.copy())
+        self.addCleanup(client.close)
+
+        def request(base, path, body=None, method=None):
+            req = Request(base + path, data=None if body is None else json.dumps(body).encode(),
+                          method=method, headers={'Content-Type': 'application/json'})
+            with urlopen(req, timeout=3) as response:
+                return json.load(response)
+
+        def wait(predicate, timeout=25):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                try:
+                    value = predicate()
+                    if value:
+                        return value
+                except (OSError, URLError, json.JSONDecodeError):
+                    pass
+                time.sleep(.1)
+            self.fail(f'condition not reached; artifacts: {root}\n{client.text()}\n{scheduler.text()}')
+
+        def active():
+            return json.loads((client_root / 'deployments/active.json').read_text(encoding='utf-8'))
+
+        def workers():
+            return {item['plugin_key']: item for item in request(management, '/status')['clients']
+                    if item['physical_client_id'] == 'multi-worker' and item['registered']}
+
+        def both_workers():
+            current = workers()
+            return current if set(current) == {'demo', 'probe'} else None
+
+        def worker_pids():
+            return {key: int(pid) for key, pid in re.findall(
+                r'client worker started: plugin=(\S+) pid=(\d+)', client.text())}
+
+        def upload(name, filename, contents, version):
+            req = Request(endpoint + f'/api/artifacts/upload?kind=plugin&name={name}&version={version}&filename={filename}',
+                          data=contents, method='POST', headers={'Content-Type': 'application/octet-stream'})
+            with urlopen(req, timeout=10) as response:
+                return json.load(response)
+
+        good_demo = upload('demo', 'demo.dll', (OPTIONS.bin_dir / 'demo.dll').read_bytes(), '1')
+        good_probe = upload('probe', 'client_retry_probe.dll', (OPTIONS.bin_dir / 'client_retry_probe.dll').read_bytes(), '1')
+        desired_path = '/api/deployments/multi-worker/desired'
+        state_path = '/api/deployments/multi-worker'
+
+        def publish(probe_artifact, revision, generation):
+            return request(endpoint, desired_path, {
+                'revision': revision,
+                'components': [{'slot': 'plugin.demo', 'artifact_id': good_demo['artifact_id']},
+                               {'slot': 'plugin.probe', 'artifact_id': probe_artifact['artifact_id']}],
+                'config_patch': {'plugins': {
+                    'demo': {'dll': '{artifact:plugin.demo}/demo.dll', 'generation': generation},
+                    'probe': {'dll': '{artifact:plugin.probe}/client_retry_probe.dll', 'generation': generation},
+                }}, 'reason': 'multi-plugin activation contract'}, 'PUT')['desired']['revision']
+
+        def run_both(label):
+            if entered.exists():
+                entered.unlink()
+            finished_before = scheduler.text().count('demo plugin: run finished')
+            run_ids = []
+            for plugin_type in ('demo', 'client-retry-probe'):
+                result = request(management, '/commands', {'action': 'run', 'plugin_type': plugin_type,
+                                 'dataset_version': label, 'worker_ids': ['multi-worker']})
+                self.assertTrue(result['ok'], result)
+                run_ids.append(result['run_id'])
+            def both_have_tasks():
+                current = both_workers()
+                return current and all(item['tasks'] for item in current.values())
+
+            wait(both_have_tasks)
+            wait(lambda: entered.is_file() and scheduler.text().count('demo plugin: run finished') > finished_before)
+            wait(lambda: not any(run['run_id'] in run_ids for run in request(management, '/status')['active_runs']))
+
+        initial = wait(both_workers)
+        self.assertEqual({'multi-worker/demo', 'multi-worker/probe'}, {item['worker_id'] for item in initial.values()})
+        self.assertEqual({'demo', 'client-retry-probe'}, {item['plugin_type'] for item in initial.values()})
+        first = publish(good_probe, None, 'healthy-v1')
+        wait(lambda: request(endpoint, state_path)['state'] == 'current')
+        self.assertEqual(first, active()['revision'])
+        old_release = Path(active()['config_path']).read_bytes()
+        effective = json.loads(old_release)
+        for key in ('demo', 'probe'):
+            self.assertEqual('healthy-v1', effective['plugins'][key]['generation'])
+            self.assertTrue(Path(effective['plugins'][key]['dll']).is_file())
+        run_both('healthy')
+        previous_pids = worker_pids()
+
+        bad_probe = upload('probe', 'client_retry_probe.dll', b'invalid second plugin DLL', '2')
+        rejected = publish(bad_probe, first, 'rejected-v2')
+        wait(lambda: request(endpoint, state_path)['state'] == 'failed')
+        wait(lambda: 'restoring previous configuration' in client.text())
+        wait(lambda: all(worker_pids().get(key) != pid for key, pid in previous_pids.items()))
+        wait(both_workers)
+        self.assertEqual(first, active()['revision'])
+        self.assertEqual(old_release, Path(active()['config_path']).read_bytes())
+        failed = json.loads((client_root / 'deployments/failed.json').read_text(encoding='utf-8'))
+        self.assertEqual(rejected, failed['revision'])
+        run_both('restored')
+
+        client.crash()
+        client = CapturedProcess(OPTIONS.bin_dir / 'client.exe', client_config,
+                                 client_root, 'restarted', os.environ.copy())
+        self.addCleanup(client.close)
+        wait(lambda: all(f'registered: plugin_type={plugin}' in client.text()
+                         for plugin in ('demo', 'client-retry-probe')))
+        wait(both_workers)
+        wait(lambda: request(endpoint, state_path)['state'] == 'failed')
+        self.assertEqual(first, active()['revision'])
+        self.assertEqual(old_release, Path(active()['config_path']).read_bytes())
+        self.assertNotIn('deployment activation failed', client.text())
+        run_both('restarted')
+        print(f'  multi-plugin deployment e2e artifacts: {root}', flush=True)
+
     def test_real_download_activation_failed_update_rollback_and_restart(self):
         root = Path(tempfile.mkdtemp(prefix='deployment-e2e-', dir=ROOT / 'build/test'))
         client_root = root / '客户端 运行目录'

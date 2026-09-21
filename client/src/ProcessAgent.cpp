@@ -69,8 +69,6 @@ std::vector<std::string> EnabledPlugins(const std::filesystem::path& config) {
         }
     }
     if (result.empty()) throw std::runtime_error("Client: no enabled plugin");
-    if (result.size() != 1)
-        throw std::runtime_error("Client: exactly one enabled plugin is required; multi-plugin scheduling is deferred");
     return result;
 }
 
@@ -268,6 +266,10 @@ private:
                 throw std::runtime_error("cannot create isolated client worker job");
             auto command = Quote(executable_.wstring()) + L" --worker-plugin " +
                 Quote(std::filesystem::u8path(worker.plugin).wstring()) + L" --config " + Quote(config_.wstring());
+            // One ROUTER identity may own only one registered plugin/session.
+            // Retain the historic identity for a single worker and qualify all
+            // workers when a physical client runs multiple plugins in parallel.
+            if (workers_.size() > 1) command += L" --qualify-worker-id";
             for (const auto& argument : std::vector<std::pair<std::wstring, HANDLE>>{
                     {L" --stop-event ", worker.stop}, {L" --drain-event ", worker.drain}, {L" --ready-event ", worker.ready}})
                 command += argument.first + std::to_wstring(reinterpret_cast<uintptr_t>(argument.second));

@@ -411,6 +411,84 @@ test('LAN HTTP artifact upload sends the file without relying on secure-context 
   assert.match(ui.get('artifact-status').textContent, /上传成功/);
 });
 
+test('multiple plugin workers are grouped by physical client and deployment targets use the physical identity', async () => {
+  const ui = await createConsole({ scheduler: { online: true, plugins: ['coverage', 'stpcompare'], clients: [
+    { worker_id: 'machine/cov', physical_client_id: 'machine', plugin_key: 'cov', plugin_type: 'coverage', registered: true, status: 'busy' },
+    { worker_id: 'machine/stp', physical_client_id: 'machine', plugin_key: 'stp', plugin_type: 'stpcompare', registered: true, status: 'idle' },
+  ], active_runs: [] } });
+  await ui.navigate('plugins');
+  assert.equal(ui.get('client-count').textContent, '1 台 · 2 个插件进程');
+  assert.equal((ui.get('client-list').innerHTML.match(/class="client-card"/g) || []).length, 1);
+  assert.match(ui.get('client-list').innerHTML, /machine\/cov/);
+  assert.match(ui.get('client-list').innerHTML, /machine\/stp/);
+  assert.match(ui.get('deployment-client-options').innerHTML, /value="machine"/);
+  assert.doesNotMatch(ui.get('deployment-client-options').innerHTML, /machine\//);
+});
+
+test('multi plugin deployment keeps both forms, execution modes and independent data selections', async () => {
+  const first = wizardArtifact('a', 'dataset', 'coverage-data');
+  const second = wizardArtifact('b', 'dataset', 'comparison-data');
+  const ui = await createConsole({ artifacts: [first, second] });
+  await ui.navigate('plugins');
+  ui.get('deployment-client').value = 'machine';
+  await ui.get('deployment-load').listeners.click();
+  ui.get('deployment-enabled-plugins').listeners.change({ target: { dataset: { deploymentEnable: 'stpcompare' }, checked: true } });
+  ui.get('deployment-artifact-dataset').value = first.artifact_id;
+  ui.get('deployment-dry-run').value = 'simulate';
+  ui.get('deployment-field-coverage-target_exe').value = 'D:/tools/coverage.exe';
+  ui.get('deployment-resource-plugin').value = 'stpcompare';
+  ui.get('deployment-resource-plugin').listeners.change();
+  ui.get('deployment-artifact-dataset').value = second.artifact_id;
+  ui.get('deployment-dry-run').value = 'real';
+  ui.get('deployment-field-baseline-programs-baseline-executable').value = 'D:/tools/old.exe';
+  ui.get('deployment-field-candidate-programs-candidate-executable').value = 'D:/tools/new.exe';
+  await ui.get('deployment-preview').listeners.click();
+  assert.equal(ui.deploymentPreviews.length, 1, ui.get('deployment-preview-status').textContent);
+  const plan = ui.deploymentPreviews[0];
+  assert.equal(plan.config_patch.plugins.coverage.enabled, true);
+  assert.equal(plan.config_patch.plugins.stpcompare.enabled, true);
+  assert.equal(plan.config_patch.plugins.coverage.dry_run, true);
+  assert.equal(plan.config_patch.plugins.stpcompare.dry_run, false);
+  assert.equal(plan.config_patch.plugins.coverage.target_exe, 'D:/tools/coverage.exe');
+  assert.equal(plan.config_patch.plugins.stpcompare.programs.baseline.executable, 'D:/tools/old.exe');
+  assert.notEqual(plan.config_patch.plugins.coverage.stp_root, plan.config_patch.plugins.stpcompare.stp_root);
+  assert.equal(new Set(plan.components.map(item => item.slot)).size, 2);
+  ui.get('deployment-resource-plugin').value = 'coverage';
+  ui.get('deployment-resource-plugin').listeners.change();
+  assert.equal(ui.get('deployment-artifact-dataset').value, first.artifact_id);
+  assert.equal(ui.get('deployment-dry-run').value, 'simulate');
+});
+
+test('editing one plugin keeps shared artifact bindings used by custom plugins and unedited fields', async () => {
+  const original = wizardArtifact('a', 'dataset', 'shared-data');
+  const replacement = wizardArtifact('b', 'dataset', 'coverage-data');
+  const ui = await createConsole();
+  const patch = { plugins: {
+    coverage: { enabled: true, stp_root: '{artifact:dataset.stp}', extra_inputs: ['{artifact:dataset.stp}/retained.json'] },
+    custom: { enabled: true, dll: 'custom.dll', data: '{artifact:dataset.stp}' },
+    stpcompare: { enabled: false, stp_root: '{artifact:dataset.stp}' },
+  } };
+  const components = [{ slot: 'dataset.stp', artifact_id: original.artifact_id }];
+  const model = ui.wizard.read(patch, components);
+  model.enabledPlugins = ['coverage', 'custom'];
+  model.groups.dataset.artifactId = replacement.artifact_id;
+  const result = ui.wizard.build(patch, components, model, [original, replacement]);
+  assert.deepEqual(result.config_patch.plugins.custom, patch.plugins.custom);
+  assert.deepEqual(result.config_patch.plugins.stpcompare, patch.plugins.stpcompare);
+  assert.deepEqual(result.config_patch.plugins.coverage.extra_inputs, patch.plugins.coverage.extra_inputs);
+  assert.equal(result.config_patch.plugins.coverage.stp_root, '{artifact:dataset.stp.coverage}');
+  assert.deepEqual(result.components, [
+    { slot: 'dataset.stp', artifact_id: original.artifact_id },
+    { slot: 'dataset.stp.coverage', artifact_id: replacement.artifact_id },
+  ]);
+  const roundTrip = ui.wizard.read(result.config_patch, result.components);
+  roundTrip.enabledPlugins = ['coverage', 'custom'];
+  assert.deepEqual(ui.wizard.build(result.config_patch, result.components, roundTrip, [original, replacement]), result);
+  patch.plugins.custom.other_data = '{artifact:dataset.stp.coverage}';
+  const occupied = [...components, { slot: 'dataset.stp.coverage', artifact_id: original.artifact_id }];
+  assert.throws(() => ui.wizard.build(patch, occupied, model, [original, replacement]), /高级 JSON 分配独立槽位/);
+});
+
 test('deployment publish retains the loaded revision and draft across polling and conflicts', async () => {
   const artifact = { artifact_id: 'a'.repeat(32), kind: 'dataset', name: 'stp', version: 'd1', size_bytes: 12, sha256: '1'.repeat(64) };
   const deployments = [{ client_id: 'worker-1', state: 'current', desired: { revision: 'original', config_patch: {}, components: [{ slot: 'dataset.stp', artifact_id: artifact.artifact_id, artifact }] } }];

@@ -259,8 +259,8 @@ def _validate(kind: str, value: dict[str, Any]) -> None:
             if plugin.get("enabled") and not plugin.get("dll"):
                 raise ManagementError(f"plugins.{name}.dll 不能为空")
         if kind == "client":
-            if sum(item.get("enabled", False) is True for item in value["plugins"].values()) != 1:
-                raise ManagementError("客户端必须恰好启用一个执行插件")
+            if not any(item.get("enabled", False) is True for item in value["plugins"].values()):
+                raise ManagementError("客户端至少启用一个执行插件")
             settings = value["client"]
             validate_windows(settings, "execution_windows")
             validate_windows(settings, "update_windows")

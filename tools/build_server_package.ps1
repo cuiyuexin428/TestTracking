@@ -636,7 +636,9 @@ Set client.deployment_endpoint=http://<server-LAN-IP>:56330 in the client base
 configuration and give each client a unique worker_id. The client Agent pulls
 artifacts over HTTP, checks SHA-256, then activates an immutable configuration
 after current tasks finish and the update window permits it. Execution and update
-windows are independent. Each client currently enables exactly one plugin.
+windows are independent. A client can enable multiple plugins; each plugin runs
+in its own worker process. Deployment waits for all workers to finish their current
+tasks before activating the new release. task_threads is the capacity per plugin.
 For built-in program artifacts, preview derives program identities from their
 content and execution settings. Save the matching scheduler configuration and
 restart the scheduler before submitting tasks with the new identities.
@@ -737,7 +739,11 @@ Write-TextFile (Join-Path $OutDir 'README.md') $packageReadme
 $files = @()
 Get-ChildItem -LiteralPath $OutDir -File -Recurse | Where-Object { $_.Name -ne 'release-manifest.json' } | ForEach-Object {
     $relative = $_.FullName.Substring($OutDir.Length + 1).Replace('\', '/')
-    $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    # Avoid depending on PowerShell module auto-loading in an offline shell.
+    $stream = [IO.File]::OpenRead($_.FullName)
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try { $hash = [BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
+    finally { $sha256.Dispose(); $stream.Dispose() }
     $files += [ordered]@{ path = $relative; size = $_.Length; sha256 = $hash }
 }
 $manifestObject = [ordered]@{

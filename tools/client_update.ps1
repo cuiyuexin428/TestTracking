@@ -181,10 +181,10 @@ function Merge-Config($Base, $Patch) {
     return $Base
 }
 
-function Assert-SinglePlugin($Config) {
+function Assert-EnabledPlugins($Config) {
     if ($Config -isnot [System.Collections.IDictionary] -or
         $Config.plugins -isnot [System.Collections.IDictionary]) {
-        throw 'Client deployment requires exactly one enabled plugin'
+        throw 'Client deployment requires at least one enabled plugin'
     }
     $enabledCount = 0
     foreach ($name in $Config.plugins.Keys) {
@@ -195,8 +195,8 @@ function Assert-SinglePlugin($Config) {
         }
         if ($plugin.enabled -eq $true) { $enabledCount++ }
     }
-    if ($enabledCount -ne 1) {
-        throw "Client deployment requires exactly one enabled plugin; found $enabledCount. Disable the previous plugin when switching."
+    if ($enabledCount -lt 1) {
+        throw "Client deployment requires at least one enabled plugin; found $enabledCount."
     }
 }
 
@@ -424,13 +424,13 @@ try {
         $slots[$component.slot] = $null
         $script:Components += @{ slot = $component.slot; artifact_id = $component.artifact_id; state = 'pending' }
     }
-    # A patch may enable one plugin while leaving another enabled in the base.
-    # Validate the merged configuration before downloading or reusing a release.
+    # Partial updates retain the other enabled plugins. Validate the merged
+    # configuration before downloading or reusing a release.
     $originalWorker = $base.client.worker_id
     $originalEndpoint = $base.client.deployment_endpoint
     $config = Merge-Config $base $(if ($desired.config_patch) { $desired.config_patch } else { @{} })
     if ($config.client -isnot [System.Collections.IDictionary]) { throw 'config_patch must preserve the client object' }
-    Assert-SinglePlugin $config
+    Assert-EnabledPlugins $config
     # The Agent supplies this only for its successfully activated local generation.
     # Polling a large current dataset must not re-hash all of its files every time.
     if ($CurrentRevision -and $CurrentRevision -ceq $script:Revision) {
@@ -447,7 +447,7 @@ try {
         if ($prepared -isnot [System.Collections.IDictionary] -or $prepared.client -isnot [System.Collections.IDictionary]) {
             throw 'Prepared deployment configuration is invalid'
         }
-        Assert-SinglePlugin $prepared
+        Assert-EnabledPlugins $prepared
         foreach ($component in $script:Components) { $component.state = 'staged' }
         $status = if (Test-UpdateWindow $effectiveWindows) { 'staged' } else { 'waiting_window' }
         Write-AtomicJson $ResultPath @{ status = $status; revision = $script:Revision; config_path = $preparedConfig; components = $script:Components }

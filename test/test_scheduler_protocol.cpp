@@ -22,8 +22,8 @@ struct Workspace {
 
 class Peer {
 public:
-    Peer(const std::string& endpoint) : dealer_(endpoint) {
-        const std::string identity="test-worker";
+    Peer(const std::string& endpoint, const std::string& identity="test-worker",
+         std::string type="scheduler-probe") : dealer_(endpoint), type_(std::move(type)) {
         dealer_.setOption(ZMQ_IDENTITY, identity.data(), identity.size());
         dealer_.connect();
     }
@@ -31,7 +31,7 @@ public:
         SendAs(std::move(envelope), session);
     }
     void SendAs(common::Envelope envelope, const std::string& session_id) {
-        envelope.set_plugin_type("scheduler-probe");
+        envelope.set_plugin_type(type_);
         envelope.set_session_id(session_id);
         dealer_.sendMsg(envelope.SerializeAsString());
     }
@@ -47,10 +47,13 @@ public:
     }
     common::Envelope Register(const std::string& nonce,
                               unsigned int protocol = common::kProtocolVersion,
-                              bool capability = true) {
+                              bool capability = true, const std::string& physical_client = {},
+                              const std::string& plugin_key = {}) {
         common::Envelope request; request.set_type(common::REGISTER);
         request.mutable_register_()->set_registration_id(nonce);
         request.mutable_register_()->set_protocol_version(protocol);
+        request.mutable_register_()->set_physical_client_id(physical_client);
+        request.mutable_register_()->set_plugin_key(plugin_key);
         if (capability) request.mutable_register_()->add_capabilities(common::kAttemptIdsCapability);
         Send(request);
         const auto result=Wait(common::REGISTER_RESULT);
@@ -87,6 +90,7 @@ public:
     std::string session;
 private:
     common::ZmqDealer dealer_;
+    std::string type_;
 };
 
 void Test(const std::filesystem::path& bin) {
@@ -219,10 +223,105 @@ void Test(const std::filesystem::path& bin) {
             "latest failed run hid an earlier complete success without framework storage");
     server->stop();
 }
+
+void TestParallelPlugins(const std::filesystem::path& bin) {
+    Workspace workspace;
+    auto& config = common::Config::instance();
+    const auto config_file = workspace.root / "scheduler.json";
+    std::unique_ptr<scheduler::Scheduler> server;
+    std::string endpoint;
+    for (int attempt = 0; attempt < 50; ++attempt) {
+        const auto port = 30000 + (std::chrono::steady_clock::now().time_since_epoch().count() % 20000);
+        endpoint = "tcp://127.0.0.1:" + std::to_string(port);
+        nlohmann::json settings = {
+            {"server", {{"router_endpoint", endpoint}, {"poll_timeout_ms", 5},
+                        {"client_timeout_ms", 0}, {"task_ack_timeout_ms", 10000}}},
+            {"plugins", nlohmann::json::object()}};
+        for (const std::string type : {"scheduler-probe", "other-probe"}) {
+            settings["plugins"][type] = {{"enabled", true},
+                {"dll", (bin / "scheduler_probe.dll").string()}, {"plugin_type", type},
+                {"entered_file", (workspace.root / (type + ".entered")).string()}};
+        }
+        std::ofstream(config_file) << settings.dump();
+        config.load(config_file.string());
+        server = std::make_unique<scheduler::Scheduler>(config);
+        try { server->start(); break; } catch (...) { server.reset(); }
+    }
+    Require(server != nullptr, "could not bind parallel scheduler test port");
+    Peer first(endpoint, "machine/first");
+    Peer second(endpoint, "machine/second", "other-probe");
+    Peer outside(endpoint, "other/first");
+    first.Register("first", common::kProtocolVersion, true, "machine", "first");
+    second.Register("second", common::kProtocolVersion, true, "machine", "second");
+    outside.Register("outside", common::kProtocolVersion, true, "other", "first");
+    const auto enqueue = [&](const char* type, const char* dataset) {
+        return server->managementCommand({{"action", "run"}, {"plugin_type", type},
+            {"dataset_version", dataset}, {"worker_ids", {"machine"}}});
+    };
+    const auto first_run = enqueue("scheduler-probe", "first-dataset");
+    const auto second_run = enqueue("other-probe", "first-dataset");
+    const auto first_queued = enqueue("scheduler-probe", "next-dataset");
+    const auto second_queued = enqueue("other-probe", "next-dataset");
+    Require(first_run.value("status", "") == "running" && second_run.value("status", "") == "running",
+            "different plugins did not activate simultaneously");
+    Require(first_queued.value("status", "") == "queued" && second_queued.value("status", "") == "queued",
+            "each plugin must retain its own ordered run queue");
+    common::Envelope request; request.set_type(common::REQUEST_TASK);
+    request.mutable_request_task()->set_count(1);
+    outside.Send(request);
+    outside.Wait(common::NO_TASK);
+    const auto one = first.Request();
+    const auto two = second.Request();
+    first.AckAs(one, one.attempt_id(), first.session);
+    second.AckAs(two, two.attempt_id(), second.session);
+    Require(one.run_id() == first_run["run_id"] && two.run_id() == second_run["run_id"] &&
+            server->inFlightCount() == 2, "physical client selection lost parallel plugin assignments");
+    first.Report(two, two.attempt_id());
+    Require(!first.Wait(common::TASK_REPORT_ACK).task_report_ack().accepted() && server->inFlightCount() == 2,
+            "one plugin worker accepted another plugin's task report");
+    first.Report(one, one.attempt_id());
+    Require(first.Wait(common::TASK_REPORT_ACK).task_report_ack().accepted(), "first parallel report rejected");
+    const auto next_one = first.Request();
+    Require(next_one.run_id() == first_queued["run_id"], "first plugin did not advance its own run queue");
+    first.AckAs(next_one, next_one.attempt_id(), first.session);
+    second.Report(two, two.attempt_id());
+    Require(second.Wait(common::TASK_REPORT_ACK).task_report_ack().accepted(), "second parallel report rejected");
+    const auto next_two = second.Request();
+    Require(next_two.run_id() == second_queued["run_id"], "second plugin did not advance its own run queue");
+    second.AckAs(next_two, next_two.attempt_id(), second.session);
+    const auto status = server->managementStatus();
+    bool mapped_first = false, mapped_second = false;
+    for (const auto& client : status["clients"]) {
+        if (client["worker_id"] == "machine/first")
+            mapped_first = client["physical_client_id"] == "machine" && client["plugin_key"] == "first";
+        if (client["worker_id"] == "machine/second")
+            mapped_second = client["physical_client_id"] == "machine" && client["plugin_key"] == "second";
+    }
+    Require(mapped_first && mapped_second, "management status lost physical client/plugin mapping");
+    Require(server->stopRun("scheduler-probe"), "stopping one plugin failed");
+    Require(server->activeRunCount() == 1 && server->inFlightCount() == 1,
+            "stopping one plugin interrupted the sibling plugin");
+    second.Report(next_two, next_two.attempt_id());
+    Require(second.Wait(common::TASK_REPORT_ACK).task_report_ack().accepted(),
+            "sibling report failed after another plugin stopped");
+    Peer single(endpoint, "machine");
+    single.Register("single", common::kProtocolVersion, true, "machine", "first");
+    const auto after_switch = server->managementCommand({{"action", "run"},
+        {"plugin_type", "scheduler-probe"}, {"dataset_version", "single-plugin-again"},
+        {"worker_ids", {"machine/first"}}});
+    Require(after_switch.value("ok", false), "run targeting the logical plugin worker was rejected");
+    const auto single_task = single.Request();
+    Require(single_task.run_id() == after_switch["run_id"],
+            "returning to one plugin lost the previously selected plugin worker");
+    single.Report(single_task, single_task.attempt_id());
+    Require(single.Wait(common::TASK_REPORT_ACK).task_report_ack().accepted(),
+            "single worker result after multi-plugin deployment was rejected");
+    server->stop();
+}
 }
 int main(int argc,char** argv) {
-    try { Test(std::filesystem::absolute(argv[0]).parent_path());
-        std::cout<<"PASS: session takeover, durable report identity, command barrier, independent heartbeat, business outcome deduplication\n";
+    try { const auto bin = std::filesystem::absolute(argv[0]).parent_path(); Test(bin); TestParallelPlugins(bin);
+        std::cout<<"PASS: session takeover, durable report identity, command barrier, independent heartbeat, business outcome deduplication, parallel plugin queues and physical client targeting\n";
         return 0;
     } catch(const std::exception& e) { std::cerr<<e.what()<<'\n';return 1; }
 }

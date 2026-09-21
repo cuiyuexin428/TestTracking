@@ -466,16 +466,28 @@ class DshWebManager:
                 raise ProviderError("dsh executable is not available")
 
             port = self._free_loopback_port()
-            extra_args: tuple[str, ...] = ()
-            context_patch = None
+            # DSH's default Web profile persists both session logs and workspace
+            # records in its shared home. Separate processes alone do not isolate
+            # users. Override only mutable conversation stores, retaining the
+            # installed model settings, credentials, skills and profile patches.
+            user_root = (Path(self.config.cwd or Path.cwd()).resolve() / "runtime"
+                         / "result_service" / "dsh_web" / operator)
+            user_root.mkdir(parents=True, exist_ok=True)
+            context_patch = tempfile.TemporaryDirectory(prefix="testtracking-dsh-")
+            overlay = Path(context_patch.name) / "context.json"
+            rows = [
+                {"id": "session-persistence-jsonl", "config": {"root": str(user_root / "sessions")}},
+                {"id": "storage-json", "config": {"root": str(user_root / "storages")}},
+                {"id": "session-query-sqlite", "config": {"path": ":memory:", "openAt": "never"}},
+                {"id": "attachment-local", "config": {"dshHome": str(user_root)}},
+            ]
             if self.service_url:
-                context_patch = tempfile.TemporaryDirectory(prefix="testtracking-dsh-")
-                overlay = Path(context_patch.name) / "context.json"
-                overlay.write_text(json.dumps([{"insert": [{
+                rows.append({"insert": [{
                     "id": "testtracking-result-context",
                     "name": Path(__file__).with_name("dsh_context.mjs").resolve().as_uri(),
-                }]}]), encoding="utf-8")
-                extra_args = ("--patch", str(overlay))
+                }]})
+            overlay.write_text(json.dumps(rows), encoding="utf-8")
+            extra_args = ("--patch", str(overlay))
             web_config = ProviderConfig(
                 name=self.config.name,
                 command=self.config.command,

@@ -280,6 +280,54 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.finished(first['run_id'])
         self.finished(second['run_id'])
 
+    def test_multiplugin_client_runs_independent_queues_and_recovers_both_after_restart(self):
+        self.configure(delay=2200, client_timeout_ms=1000)
+        coverage_server = dict(self.server_json['plugins']['coverage'])
+        coverage_client = dict(self.client_json['plugins']['coverage'])
+        self.use_stpcompare()
+        self.server_json['plugins']['coverage'] = coverage_server
+        self.client_json['plugins']['coverage'] = coverage_client
+        self.write_configs()
+        self.start_server()
+        self.start_client()
+        self.until(lambda: len(self.management_status()['clients']) == 2,
+                   'two isolated plugins registered on one physical client')
+        clients = self.management_status()['clients']
+        self.assertEqual({'runtime-client/coverage', 'runtime-client/stpcompare'},
+                         {client['worker_id'] for client in clients})
+        self.assertEqual({'runtime-client'}, {client['physical_client_id'] for client in clients})
+        self.assertEqual({'coverage', 'stpcompare'}, {client['plugin_key'] for client in clients})
+        runs = {}
+        for plugin in ('coverage', 'stpcompare'):
+            code, first = self.management_command(
+                action='run', plugin_type=plugin, dataset_version='d1', worker_ids=['runtime-client'])
+            self.assertEqual(200, code, first)
+            code, queued = self.management_command(
+                action='run', plugin_type=plugin, dataset_version='d1', worker_ids=['runtime-client'],
+                force_rerun=True, force_rerun_reason='multi-plugin durable queue recovery')
+            self.assertEqual(200, code, queued)
+            self.assertEqual('queued', queued['status'])
+            runs[plugin] = (first['run_id'], queued['run_id'])
+        self.until(lambda: self.sql("SELECT count(*) FROM tasks WHERE status='acked'") == '2',
+                   'both plugin tasks executing concurrently')
+        self.assertEqual('2', self.sql("SELECT count(*) FROM runs WHERE status='running'"))
+        self.assertEqual('2', self.sql("SELECT count(*) FROM runs WHERE status='queued'"))
+        self.server.crash()
+        self.client.crash()
+        self.start_server()
+        self.start_client()
+        for plugin, (first, queued) in runs.items():
+            self.assertIn('run restored: ' + first, self.server.text())
+            self.finished(first)
+            self.finished(queued)
+            for run in (first, queued):
+                self.assertEqual('runtime-client/' + plugin, self.sql(
+                    'SELECT DISTINCT client_identity FROM tasks WHERE run_id=' + sql_text(run)))
+                self.assertEqual('1', self.sql(
+                    'SELECT count(*) FROM plugin_task_completions WHERE run_id=' + sql_text(run)))
+        self.assertEqual('4', self.sql("SELECT count(*) FROM runs WHERE status='finished'"))
+        self.assertEqual('0', self.sql("SELECT count(*) FROM tasks WHERE status<>'reported'"))
+
     def test_finished_duplicate_is_blocked_and_forced_rerun_is_audited(self):
         self.configure(delay=100)
         self.start_server()
@@ -407,26 +455,27 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(['selected/coverage'], status['active_runs'][0]['worker_ids'])
         self.assertEqual(['later/coverage'], status['queued_runs'][0]['worker_ids'])
 
-        # The agent base ID is deliberately a prefix of the selected identity.
-        # It must not match the plugin-specific selection.
-        self.client_json['client']['worker_id'] = 'selected'
+        # Similar names must not match. The logical base/plugin target must,
+        # however, remain valid when the selected machine has one plugin and
+        # therefore retains its historical base transport identity.
+        self.client_json['client']['worker_id'] = 'selected-other'
         self.write_configs()
         self.start_client()
         time.sleep(.3)
         self.assertEqual('0', self.sql('SELECT count(*) FROM tasks'))
-        self.client_json['client']['worker_id'] = 'selected/coverage'
+        self.client_json['client']['worker_id'] = 'selected'
         self.write_configs()
         self.start_client()
         self.finished(first['run_id'])
-        self.assertEqual('selected/coverage', self.sql(
+        self.assertEqual('selected', self.sql(
             'SELECT DISTINCT client_identity FROM tasks WHERE run_id=' + sql_text(first['run_id'])))
         self.assertEqual('0', self.sql(
             'SELECT count(*) FROM tasks WHERE run_id=' + sql_text(second['run_id'])))
-        self.client_json['client']['worker_id'] = 'later/coverage'
+        self.client_json['client']['worker_id'] = 'later'
         self.write_configs()
         self.start_client()
         self.finished(second['run_id'])
-        self.assertEqual('later/coverage', self.sql(
+        self.assertEqual('later', self.sql(
             'SELECT DISTINCT client_identity FROM tasks WHERE run_id=' + sql_text(second['run_id'])))
         code, duplicate = self.management_command(
             action='run', plugin_type='coverage', dataset_version='d1',

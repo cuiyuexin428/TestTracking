@@ -181,21 +181,22 @@
                 <section data-deployment-stage="0" class="deployment-stage">
                   <div class="stage-heading"><h3>这次部署到哪台客户端？</h3><p>可选择已连接的客户端，也可填写稍后上线的客户端标识。</p></div>
                   <div class="management-form target-client-form"><div class="management-field grow-field"><label for="deployment-client">客户端 worker_id</label><input id="deployment-client" list="deployment-client-options" required placeholder="选择或输入客户端标识" autocomplete="off"><datalist id="deployment-client-options"></datalist></div><button class="button" type="button" id="deployment-load">读取当前部署</button></div>
-                  <div class="workspace-note"><span class="note-symbol">i</span><p>客户端首次使用时，需在基础配置中填写服务地址和独立的 worker_id。每台客户端启用一个任务插件。</p></div>
+                  <div class="workspace-note"><span class="note-symbol">i</span><p>填写物理客户端的基础 worker_id。每台客户端可同时启用多个插件，各插件独立执行；程序与数据统一更新。</p></div>
                 </section>
                 <section data-deployment-stage="1" class="deployment-stage" hidden>
                   <div class="stage-heading"><h3>选择任务执行插件</h3><p>插件决定程序的调用方式和结果入库方式。</p></div>
-                  <div class="management-form"><div class="management-field"><label for="deployment-plugin">客户端执行插件</label><select id="deployment-plugin"><option value="coverage">coverage · 覆盖率</option><option value="stpcompare">stpcompare · 新老程序结果采集</option></select></div></div>
+                  <div id="deployment-enabled-plugins" class="management-form" aria-label="启用的客户端插件"></div>
+                  <div class="management-form"><div class="management-field"><label for="deployment-plugin">正在配置的插件</label><select id="deployment-plugin"><option value="coverage">coverage · 覆盖率</option><option value="stpcompare">stpcompare · 新老程序结果采集</option></select></div></div><p class="config-help">勾选需要启用的插件，再分别配置每个插件的 DLL、程序和数据。其他插件使用高级 JSON 配置。</p>
                 </section>
                 <div id="deployment-wizard" class="deployment-wizard">
-                  <div data-deployment-stage="2" class="stage-heading" hidden><h3>配置程序与数据</h3><p>选择制品后填写包内路径；也可以使用客户端现有路径。</p></div>
+                  <div data-deployment-stage="2" class="stage-heading" hidden><h3>配置程序与数据</h3><p>选择制品后填写包内路径；也可以使用客户端现有路径。</p><label for="deployment-resource-plugin">正在配置的插件</label><select id="deployment-resource-plugin"><option value="coverage">coverage · 覆盖率</option><option value="stpcompare">stpcompare · 新老程序结果采集</option></select></div>
                   <div id="deployment-fields"></div>
                   <section data-deployment-stage="2" class="deployment-execution-options" hidden>
                     <div class="management-form"><div class="management-field"><label for="deployment-dry-run">执行模式</label><select id="deployment-dry-run"><option value="inherit">继承客户端基础配置</option><option value="simulate">模拟执行（不运行业务程序）</option><option value="real">真实执行</option></select></div><label id="deployment-store-cov-field" class="check-field"><input id="deployment-store-cov" type="checkbox">保留原始 cov（coverage）</label></div>
                   </section>
                   <section data-deployment-stage="3" class="deployment-stage" hidden>
                     <div class="stage-heading"><h3>安排执行和更新时间</h3><p>时间按客户端本机时区计算。执行窗口结束后，已开始的任务会继续完成。</p></div>
-                    <div class="management-form"><div class="management-field"><label for="deployment-threads">任务并发数</label><input id="deployment-threads" type="number" min="1" step="1" placeholder="留空继承基础配置"></div></div>
+                    <div class="management-form"><div class="management-field"><label for="deployment-threads">每插件任务并发数</label><input id="deployment-threads" type="number" min="1" step="1" placeholder="留空继承基础配置"></div></div><p class="config-help">每个启用插件分别使用此并发数。例如启用两个插件且设置为 2 时，总并发上限约为 4。</p>
                     <div class="deployment-window-grid"><section class="deployment-window"><h3>任务执行时间窗</h3><p class="workspace-help">控制何时领取新任务。</p><div id="deployment-execution-windows"></div><button class="button" type="button" id="deployment-execution-add">＋ 添加执行时段</button></section><section class="deployment-window"><h3>程序与数据更新时间窗</h3><p class="workspace-help">控制何时应用新部署。</p><div id="deployment-update-windows"></div><button class="button" type="button" id="deployment-update-add">＋ 添加更新时段</button></section></div>
                     <p class="config-help">跨午夜的时段归属开始日。修改更新时间窗也需等待当前生效窗口开放。</p>
                   </section>

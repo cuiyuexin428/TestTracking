@@ -130,8 +130,8 @@ def main():
         config["plugins"]["second"] = dict(config["plugins"]["demo"])
         path.write_text(json.dumps(config), encoding="utf-8")
         output = run_case(arguments.client.resolve(), path, 1)
-        assert "exactly one enabled plugin is required" in output, output
-        assert "client worker started:" not in output, output
+        assert "registration failed" in output, output
+        assert "client agent starting 2 plugin workers" in output, output
         config["plugins"]["second"]["enabled"] = False
         path.write_text(json.dumps(config), encoding="utf-8")
         output = run_case(arguments.client.resolve(), path, 1)
@@ -144,7 +144,7 @@ def main():
             assert time.monotonic() - started < 2, "quit was lost during startup"
         if os.name == "nt":
             test_update_without_scheduler(arguments.client.resolve(), directory, config)
-    print("PASS: registration failure, single-plugin validation, startup quit, real updater and reports without scheduler; artifacts:", directory)
+    print("PASS: registration failure, multi-plugin startup, startup quit, real updater and reports without scheduler; artifacts:", directory)
 
 
 if __name__ == "__main__":

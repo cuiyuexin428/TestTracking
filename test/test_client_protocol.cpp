@@ -534,6 +534,182 @@ void TestAgentProcesses(const std::filesystem::path& binaries) {
     }
 }
 
+void TestAgentMultiplePlugins(const std::filesystem::path& binaries) {
+    // Model independent scheduler sessions on one ROUTER, including identical
+    // business task IDs. No packet from one worker may complete its sibling.
+    const auto directory = std::filesystem::temp_directory_path() /
+        (L"agent-multiplugin-" + std::to_wstring(std::chrono::steady_clock::now().time_since_epoch().count()));
+    CopyAgentPackage(binaries, directory);
+    std::unique_ptr<common::ZmqRouter> socket;
+    std::string endpoint;
+    for (int port = 28800; port < 28900; ++port) {
+        try {
+            endpoint = "tcp://127.0.0.1:" + std::to_string(port);
+            auto candidate = std::make_unique<common::ZmqRouter>(endpoint);
+            candidate->bind(); socket = std::move(candidate); break;
+        } catch (const std::exception&) {}
+    }
+    Require(socket != nullptr, "cannot bind multi-plugin test endpoint");
+    nlohmann::json config = {
+        {"scheduler", {{"endpoint", endpoint}, {"poll_timeout_ms", 5}}},
+        {"client", {{"worker_id", "parallel"}, {"heartbeat_interval_ms", 40},
+                    {"request_timeout_ms", 500}, {"request_backoff_initial_ms", 10},
+                    {"request_backoff_max_ms", 30}, {"deployment_endpoint", "http://fixture"},
+                    {"deployment_poll_seconds", 1}}},
+        {"plugins", {{"first", {{"enabled", true}, {"dll", "demo.dll"}, {"task_sleep_ms", 800}}},
+                     {"second", {{"enabled", true}, {"dll", "client_retry_probe.dll"},
+                                 {"process_probe", true}, {"task_sleep_ms", 800}}}}}};
+    const auto path = directory / "client.json";
+    std::ofstream(path) << config.dump();
+    struct State {
+        std::string type, session, process;
+        int registrations = 0, heartbeats = 0, requests = 0, acknowledgements = 0;
+        std::map<std::string, common::TaskResult> reports;
+    };
+    std::map<std::string, State> states;
+    std::map<std::string, common::Task> pending;
+    const auto send = [&](const std::string& identity, common::Envelope message) {
+        const auto& state = states.at(identity);
+        message.set_plugin_type(state.type);
+        message.set_session_id(state.session);
+        Require(socket->trySendMsgParts({identity, message.SerializeAsString()}), "multi-plugin response blocked");
+    };
+    const auto poll = [&] {
+        if (!socket->waitReadable(10ms)) return;
+        const auto frames = socket->recvMsgParts();
+        Require(frames.size() == 2, "multi-plugin ROUTER frames invalid");
+        common::Envelope message;
+        Require(message.ParseFromString(frames[1]), "multi-plugin envelope invalid");
+        auto& state = states[frames[0]];
+        state.type = message.plugin_type();
+        common::Envelope reply;
+        switch (message.type()) {
+            case common::REGISTER:
+                Require(message.register_().physical_client_id() == "parallel",
+                        "plugin worker lost its physical deployment identity");
+                Require(message.register_().plugin_key() == "first" || message.register_().plugin_key() == "second",
+                        "plugin worker omitted its configured plugin key");
+                state.session = frames[0] + "-" + std::to_string(++state.registrations);
+                state.process = message.register_().payload();
+                reply.set_type(common::REGISTER_RESULT);
+                reply.mutable_register_result()->set_accepted(true);
+                reply.mutable_register_result()->set_plugin_found(true);
+                reply.mutable_register_result()->set_registration_id(message.register_().registration_id());
+                reply.mutable_register_result()->set_protocol_version(common::kProtocolVersion);
+                reply.mutable_register_result()->add_capabilities(common::kAttemptIdsCapability);
+                send(frames[0], reply); break;
+            case common::HEARTBEAT:
+                ++state.heartbeats;
+                reply.set_type(common::HEARTBEAT_ACK);
+                reply.mutable_heartbeat_ack()->set_registered(message.session_id() == state.session);
+                send(frames[0], reply); break;
+            case common::REQUEST_TASK: {
+                ++state.requests;
+                const auto task = pending.find(frames[0]);
+                if (task != pending.end()) {
+                    reply.set_type(common::TASK);
+                    reply.mutable_task()->set_run_id(task->second.run_id());
+                    *reply.mutable_task()->add_tasks() = task->second;
+                    pending.erase(task);
+                } else {
+                    reply.set_type(common::NO_TASK); reply.mutable_no_task();
+                }
+                send(frames[0], reply); break;
+            }
+            case common::TASK_ACK: ++state.acknowledgements; break;
+            case common::TASK_REPORT: {
+                const auto& result = message.task_report().result();
+                state.reports[result.attempt_id()] = result;
+                reply.set_type(common::TASK_REPORT_ACK);
+                reply.mutable_task_report_ack()->set_task_id(result.task_id());
+                reply.mutable_task_report_ack()->set_attempt_id(result.attempt_id());
+                reply.mutable_task_report_ack()->set_accepted(true);
+                send(frames[0], reply); break;
+            }
+            default: break;
+        }
+    };
+    const auto wait = [&](const std::function<bool()>& condition, const char* reason,
+                          std::chrono::milliseconds timeout = 6s) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (!condition() && std::chrono::steady_clock::now() < deadline) poll();
+        Require(condition(), reason);
+    };
+    AgentProcess agent(directory, path.filename());
+    wait([&] { return states["parallel/first"].requests && states["parallel/second"].requests; },
+         "both plugins did not register/request independently");
+    for (const std::string key : {"first", "second"}) {
+        auto& task = pending["parallel/" + key];
+        task.set_task_id("same-task-id"); task.set_run_id(key + "-run"); task.set_attempt_id(key + "-attempt");
+    }
+    wait([&] { return states["parallel/first"].acknowledgements && states["parallel/second"].acknowledgements; },
+         "both plugins did not accept tasks concurrently");
+    Require(states["parallel/first"].reports.empty() && states["parallel/second"].reports.empty(),
+            "plugin tasks were serialized instead of running concurrently");
+    wait([&] { return states["parallel/first"].reports.size() == 1 && states["parallel/second"].reports.size() == 1; },
+         "parallel plugin results did not complete");
+    Require(states["parallel/first"].reports.at("first-attempt").run_id() == "first-run" &&
+            states["parallel/second"].reports.at("second-attempt").run_id() == "second-run",
+            "parallel plugin task/report identities were mixed");
+
+    // Crash the process-probe worker. Its business process must be reaped,
+    // while the demo worker retains its live session and heartbeat.
+    const auto business_pid = std::stoul(states["parallel/second"].process);
+    DWORD worker_pid = 0;
+    const auto snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    PROCESSENTRY32W entry{}; entry.dwSize = sizeof(entry);
+    if (Process32FirstW(snapshot, &entry)) do {
+        if (entry.th32ProcessID == business_pid) worker_pid = entry.th32ParentProcessID;
+    } while (Process32NextW(snapshot, &entry));
+    CloseHandle(snapshot);
+    Require(worker_pid != 0, "cannot find isolated business process owner");
+    const auto business = OpenProcess(SYNCHRONIZE, FALSE, business_pid);
+    const auto worker = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, worker_pid);
+    Require(business && worker && TerminateProcess(worker, 9), "cannot crash second plugin worker");
+    CloseHandle(worker);
+    const auto first_session = states["parallel/first"].session;
+    const auto first_heartbeats = states["parallel/first"].heartbeats;
+    wait([&] { return states["parallel/second"].registrations == 2 &&
+                     states["parallel/first"].heartbeats > first_heartbeats; },
+         "plugin crash did not recover independently");
+    Require(states["parallel/first"].session == first_session,
+            "plugin crash replaced its healthy sibling's session");
+    Require(WaitForSingleObject(business, 1000) == WAIT_OBJECT_0,
+            "plugin crash left its business subprocess alive");
+    CloseHandle(business);
+
+    const auto offer = [&](char generation, const nlohmann::json& next) {
+        const auto target = directory / (std::string("deployment-") + generation + ".json");
+        std::ofstream(target) << next.dump();
+        std::ofstream(directory / "inbox.json") << nlohmann::json({{"status", "staged"},
+            {"revision", std::string(64, generation)}, {"config_path", target.u8string()},
+            {"components", nlohmann::json::array()}}).dump();
+    };
+    const auto active = [&](char generation) {
+        try {
+            std::ifstream input(directory / "deployments/active.json");
+            return nlohmann::json::parse(input).value("revision", "") == std::string(64, generation);
+        } catch (...) { return false; }
+    };
+    auto single = config; single["plugins"]["second"]["enabled"] = false;
+    offer('a', single);
+    wait([&] { return active('a') && states["parallel"].requests; },
+         "multi-plugin deployment could not switch to one compatible worker");
+    const auto previous_first = states["parallel/first"].registrations;
+    const auto previous_second = states["parallel/second"].registrations;
+    offer('b', config);
+    wait([&] { return active('b') && states["parallel/first"].registrations > previous_first &&
+                                  states["parallel/second"].registrations > previous_second; },
+         "multi-plugin deployment did not wait for all new workers to register");
+    auto workers = agent.Workers();
+    Require(workers.size() == 2, "multi-plugin deployment did not activate two isolated workers");
+    agent.Quit();
+    for (const auto handle : workers) {
+        Require(WaitForSingleObject(handle, 1000) == WAIT_OBJECT_0, "client exit left a plugin worker running");
+        CloseHandle(handle);
+    }
+}
+
 void TestAgentDeployment(const std::filesystem::path& binaries) {
     Peer peer;
     const auto directory = std::filesystem::temp_directory_path() /
@@ -552,10 +728,10 @@ void TestAgentDeployment(const std::filesystem::path& binaries) {
     auto broken = config;
     broken["plugins"]["demo"]["dll"] = "missing-plugin.dll";
     std::ofstream(bad_path) << broken.dump();
-    const auto multi_path = directory / "multiple-plugins.json";
-    auto multiple = config;
-    multiple["plugins"]["second"] = config["plugins"]["demo"];
-    std::ofstream(multi_path) << multiple.dump();
+    const auto empty_path = directory / "no-enabled-plugins.json";
+    auto empty = config;
+    empty["plugins"]["demo"]["enabled"] = false;
+    std::ofstream(empty_path) << empty.dump();
     const auto active_file = directory / "deployments/active.json";
     const auto await_file = [&](const std::filesystem::path& file, const std::string& revision) {
         const auto deadline = std::chrono::steady_clock::now() + 6s;
@@ -589,15 +765,15 @@ void TestAgentDeployment(const std::filesystem::path& binaries) {
         Require(!std::filesystem::exists(active_file), "Agent promoted a release before worker registration");
         peer.Register(registration, "deployment-session");
         await_file(active_file, std::string(64, 'a'));
-        // An unsupported prepared release must be rejected before draining or
+        // An invalid prepared release must be rejected before draining or
         // replacing the healthy single-plugin worker, even if a helper stages it.
-        offer('b', multi_path);
+        offer('b', empty_path);
         await_file(directory / "deployments/failed.json", std::string(64, 'b'));
         await_file(active_file, std::string(64, 'a'));
         const auto changed = peer.Receive([](const common::Envelope& envelope) {
             return envelope.type() == common::REGISTER;
         }, 200ms);
-        Require(changed.type() != common::REGISTER, "multi-plugin release replaced the healthy worker");
+        Require(changed.type() != common::REGISTER, "empty plugin release replaced the healthy worker");
         offer('c', bad_path);
         registration = peer.Wait(common::REGISTER, 6s);
         peer.Register(registration, "deployment-session");
@@ -732,12 +908,14 @@ int main(int argc, char** argv) {
         TestDeploymentDrain(binary_directory);
 #ifdef _WIN32
         TestAgentProcesses(binary_directory);
+        TestAgentMultiplePlugins(binary_directory);
         TestAgentDeployment(binary_directory);
         TestAgentLateUpdaterResults(binary_directory);
 #endif
         std::cout << "PASS: report retries, stale ACK, STOP heartbeat, re-registration, protocol "
                      "rejection, registration retry limit, graceful deployment drain, Agent process "
-                     "isolation/restart/cleanup, readiness-gated activation, late updater reports and rollback\n";
+                     "isolation/restart/cleanup, parallel plugins, one/many plugin deployment switching, "
+                     "readiness-gated activation, late updater reports and rollback\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

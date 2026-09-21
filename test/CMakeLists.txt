@@ -1,3 +1,17 @@
+# Native fixtures are compiled in Release with symbols for actual OpenCppCoverage
+# instrumentation during packaged acceptance. They are not business converters.
+if(WIN32)
+    add_library(acceptance_engine SHARED acceptance_engine.cpp)
+    add_executable(acceptance_program acceptance_program.cpp)
+    target_link_libraries(acceptance_program PRIVATE acceptance_engine)
+    if(MSVC)
+        foreach(fixture acceptance_engine acceptance_program)
+            target_compile_options(${fixture} PRIVATE /Zi /Od)
+            target_link_options(${fixture} PRIVATE /DEBUG /OPT:NOREF /OPT:NOICF)
+        endforeach()
+    endif()
+endif()
+
 foreach(name common zmq config messages)
     add_executable(test_${name} test_${name}.cpp)
     target_link_libraries(test_${name} PRIVATE common)

@@ -71,6 +71,10 @@ and WebSocket connections all use the main service port; remote browsers never
 need to connect to the server's loopback address. DSH owns its conversation UI and
 session handling. The service keeps an isolated DSH Web process per active browser
 operator, reclaims idle processes, limits concurrency, and stops them with the service.
+Native session logs, workspace records and attachments persist separately under
+`runtime/result_service/dsh_web/<operator_id>/` in the configured DSH working directory.
+Browser profiles receive distinct persistent operator IDs; tabs in one profile
+share that profile's identity and conversation history.
 Operators share the server account's model settings and filesystem permissions.
 
 DSH's directory picker runs in the browser. The native assistant receives the
@@ -94,7 +98,7 @@ server account; visitors do not need the CLI installed locally.
 Browser writes must come from the console's own HTTP origin. Foreign or opaque
 origins are rejected before commands run; CLI tools without browser origin headers
 remain supported. JSON API writes require `Content-Type: application/json`.
-Starting DSH may use an empty POST; its native HTTP bodies and WebSocket traffic
+Starting DSH requires a JSON POST with the browser's `operator_id`; native HTTP bodies and WebSocket traffic
 retain their protocols through the same-origin proxy. These checks are request
 validation, not login or isolation from other trusted LAN users.
 
@@ -268,10 +272,11 @@ value, and must name a component slot in the same desired plan. Relative paths
 cannot leave the artifact directory. The client updater assigns no plugin-specific
 meaning to slot names or configuration fields.
 
-The console offers a deployment form for coverage or stpcompare, including
+The console offers a deployment form for coverage and stpcompare, including
 artifact selection, package-relative paths, the two STP program argument arrays,
-task concurrency, and separate execution/update windows. It explicitly disables
-other known plugins while preserving unrelated configuration. Existing desired
+per-plugin task concurrency, and separate execution/update windows. The enabled
+plugin checklist supports concurrent workers and retains each plugin's form
+draft while switching the editor. Unrelated configuration is preserved. Existing desired
 plans open in the advanced JSON editor; new plans open in the form. Execution
 mode is inherited unless the operator chooses simulation or real execution;
 program artifacts require an explicit choice. Coverage also exposes `store_cov`,

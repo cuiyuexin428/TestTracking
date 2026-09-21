@@ -457,13 +457,11 @@ bool Scheduler::StartNextRun(common::TaskPlugin* plugin) {
         bool planned = false;
         try {
             auto selected_clients = clients();
-            if (!run.worker_ids.empty()) {
-                selected_clients.erase(std::remove_if(selected_clients.begin(), selected_clients.end(),
-                    [&run](const common::ClientInfo& client) {
-                        return std::find(run.worker_ids.begin(), run.worker_ids.end(), client.identity)
-                               == run.worker_ids.end();
-                    }), selected_clients.end());
-            }
+            selected_clients.erase(std::remove_if(selected_clients.begin(), selected_clients.end(),
+                [this, &run](const common::ClientInfo& client) {
+                    return client.plugin_type != run.plugin_type ||
+                           !IsSelectedWorker(client.identity, run.worker_ids);
+                }), selected_clients.end());
             planned = plugin->plan({run.run_id, run.dataset_version, run.params}, selected_clients);
         } catch (const std::exception& error) {
             LOG_ERROR("createRun: plan threw for " << run.plugin_type << ": " << error.what());

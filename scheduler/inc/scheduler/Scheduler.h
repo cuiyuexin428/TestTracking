@@ -56,6 +56,7 @@ class Scheduler {
         Clock::time_point last_seen;
         std::string session_id, registration_id;
         common::ValidationResult validation;
+        std::string physical_client_id, plugin_key;
     };
     struct InFlight {
         std::string identity, session_id, plugin_type, run_id, attempt_id;
@@ -131,6 +132,7 @@ class Scheduler {
     void ReclaimTasks(const std::vector<std::string>&);
     void ReclaimClientTasks(const std::string&, const std::string&);
     bool IsCurrentSession(const IncomingMessage&) const;
+    bool IsSelectedWorker(const std::string&, const std::vector<std::string>&) const;
     bool Matches(const InFlight&, const IncomingMessage&, const std::string&) const;
     void RunTimeoutChecks();
     void SendRegisterResult(const IncomingMessage&, bool, const common::ValidationResult&,

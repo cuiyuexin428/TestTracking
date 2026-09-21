@@ -17,6 +17,11 @@ message RegisterCommand {
   // value (zero) identifies a pre-handshake-version client and is rejected.
   uint32 protocol_version = 3;
   repeated string capabilities = 4;
+  // The installed client owns deployment settings; each enabled plugin runs
+  // in an isolated worker with its own transport identity and session.
+  // Older clients omit these fields and are treated as one physical client.
+  string physical_client_id = 5;
+  string plugin_key = 6;
 }
 
 // Registration validation result. payload is the opaque business reply

@@ -38,6 +38,7 @@ Desktop.ini
 
 # Generated offline client package (tools/setup_offline_server.ps1)
 /dist/
+/real-test/
 
 __pycache__/
 *.pyc

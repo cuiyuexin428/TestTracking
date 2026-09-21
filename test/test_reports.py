@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
@@ -65,6 +66,30 @@ class ReportStoreTests(unittest.TestCase):
         audit = json.loads((self.store.scripts_dir / "audit.jsonl").read_text(encoding="utf-8"))
         self.assertEqual("123e4567-e89b-42d3-a456-426614174000", audit["operator_id"])
         self.assertEqual(saved["revision"], audit["revision"])
+
+    def test_two_simultaneous_editors_have_one_success_and_one_conflict(self):
+        original = self.store.get_script("coverage")
+        barrier = threading.Barrier(3)
+        outcomes = []
+        def save(operator):
+            barrier.wait()
+            try:
+                self.store.save_script("coverage", f'def render(connection, context):\n    return "{operator}"\n',
+                                       original["revision"], operator)
+                outcomes.append((operator, 200))
+            except ReportError as error:
+                outcomes.append((operator, error.status))
+        workers = [threading.Thread(target=save, args=(f"operator-{index}",)) for index in range(2)]
+        for worker in workers:
+            worker.start()
+        barrier.wait()
+        for worker in workers:
+            worker.join(timeout=3)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual([200, 409], sorted(status for _, status in outcomes))
+        winner = next(operator for operator, status in outcomes if status == 200)
+        self.assertIn(winner, self.store.get_script("coverage")["source"])
+        self.assertEqual(1, len((self.store.scripts_dir / "audit.jsonl").read_text(encoding="utf-8").splitlines()))
 
     def test_template_directory_and_generic_template(self):
         templates = self.root / "templates"

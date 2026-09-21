@@ -12,10 +12,13 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import contextmanager, nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from dataclasses import replace
+from urllib.request import Request, urlopen
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -322,6 +325,47 @@ for (const [name, property] of [['HTMLScriptElement','src'],['HTMLLinkElement','
 
 
 class DshReadinessTests(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("TESTTRACKING_DSH_WEB_COMMAND"), "set TESTTRACKING_DSH_WEB_COMMAND for native two-user isolation test")
+    def test_native_dsh_users_have_private_workspaces_and_persistent_session_lists(self):
+        test_root = Path(__file__).resolve().parents[1] / "build/test"
+        test_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="dsh-users-", dir=test_root) as directory:
+            config = replace(ServiceConfig.defaults().providers["dsh"],
+                             command=os.environ["TESTTRACKING_DSH_WEB_COMMAND"], cwd=directory)
+            operators = ["123e4567-e89b-42d3-a456-426614174001", "123e4567-e89b-42d3-a456-426614174002"]
+            manager = DshWebManager(config, startup_timeout=40)
+            def rpc(url, method, payload):
+                request = Request(url + "api/" + method, data=json.dumps({
+                    "type": "client-request", "rpcId": "isolation-test", "method": method, "payload": payload,
+                }).encode(), headers={"Content-Type": "application/json"})
+                with urlopen(request, timeout=15) as response:
+                    result = json.load(response)["result"]
+                self.assertTrue(result["ok"], result)
+                return result["value"]
+            try:
+                urls = [manager.start(operator) for operator in operators]
+                self.assertNotEqual(*urls)
+                work = rpc(urls[0], "workspace.create", {"path": str(Path(__file__).resolve().parents[1])})["workspace"]
+                created = rpc(urls[0], "session.create", {"workspaceId": work["workspaceId"]})
+                rpc(urls[0], "session.rename", {"sessionId": created["sessionId"], "title": "User A private analysis"})
+                self.assertEqual([], rpc(urls[1], "workspace.list", {})["items"])
+                self.assertEqual([], rpc(urls[1], "session.list", {})["items"])
+                self.assertIn(created["sessionId"], [item["sessionId"] for item in rpc(urls[0], "session.list", {})["items"]])
+                # Native DSH batches persistence for 200 ms. Wait for its own
+                # durable artifact before testing a stopped process's reload.
+                root = Path(directory) / "runtime/result_service/dsh_web" / operators[0] / "sessions"
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not any(path.stat().st_size for path in root.rglob("*.jsonl*")):
+                    time.sleep(0.05)
+                self.assertTrue(any(path.stat().st_size for path in root.rglob("*.jsonl*")))
+                manager.close()
+                manager = DshWebManager(config, startup_timeout=40)
+                reloaded = manager.start(operators[0])
+                self.assertIn(created["sessionId"], [item["sessionId"] for item in rpc(reloaded, "session.list", {})["items"]])
+                self.assertEqual(work["workspaceId"], rpc(reloaded, "workspace.list", {})["items"][0]["workspaceId"])
+            finally:
+                manager.close()
+
     def test_managed_dsh_receives_bound_service_context_and_cleans_overlay(self):
         manager = DshWebManager(ServiceConfig.defaults().providers["dsh"])
         manager.service_url = "http://127.0.0.1:54321"
@@ -341,8 +385,13 @@ class DshReadinessTests(unittest.TestCase):
         overlays = [Path(argv[index + 1]) for index, arg in enumerate(argv) if arg == "--patch"]
         self.assertEqual(2, len(overlays))
         context = json.loads(overlays[1].read_text(encoding="utf-8"))
-        self.assertEqual("testtracking-result-context", context[0]["insert"][0]["id"])
-        self.assertTrue(context[0]["insert"][0]["name"].startswith("file:///"))
+        integration = next(row for row in context if "insert" in row)["insert"][0]
+        self.assertEqual("testtracking-result-context", integration["id"])
+        self.assertTrue(integration["name"].startswith("file:///"))
+        roots = {row["id"]: row["config"] for row in context if "config" in row}
+        self.assertIn(operator, roots["session-persistence-jsonl"]["root"])
+        self.assertIn(operator, roots["storage-json"]["root"])
+        self.assertIn(operator, roots["attachment-local"]["dshHome"])
         self.assertEqual(manager.service_url, popen.call_args.kwargs["env"]["RESULT_SERVICE_URL"])
         self.assertEqual(operator, popen.call_args.kwargs["env"]["TESTTRACKING_OPERATOR_ID"])
         with patch.object(manager, "_stop_process"):

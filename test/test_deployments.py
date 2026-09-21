@@ -234,20 +234,21 @@ class DeploymentStoreTests(unittest.TestCase):
         self.assertTrue(changed)
         self.assertNotEqual(first["desired"]["revision"], second["desired"]["revision"])
 
-    def test_patch_rejects_multiple_enabled_plugins_without_changing_desired(self) -> None:
+    def test_patch_accepts_multiple_enabled_plugins_with_revision(self) -> None:
         components = self.plan(("plugin", self.plugin))
         original, _ = self.store.put_desired("worker-1", {
             "revision": None, "components": components,
             "config_patch": {"plugins": {"coverage": {"enabled": True}}},
         })
-        with self.assertRaisesRegex(DeploymentError, "only one enabled plugin"):
-            self.store.put_desired("worker-1", {
-                "revision": original["desired"]["revision"], "components": components,
-                "config_patch": {"plugins": {
-                    "coverage": {"enabled": True}, "stpcompare": {"enabled": True},
-                }},
-            })
-        self.assertEqual(original, self.store.get("worker-1"))
+        saved, changed = self.store.put_desired("worker-1", {
+            "revision": original["desired"]["revision"], "components": components,
+            "config_patch": {"plugins": {
+                "coverage": {"enabled": True}, "stpcompare": {"enabled": True},
+            }},
+        })
+        self.assertTrue(changed)
+        self.assertTrue(saved["desired"]["config_patch"]["plugins"]["coverage"]["enabled"])
+        self.assertTrue(saved["desired"]["config_patch"]["plugins"]["stpcompare"]["enabled"])
 
     def test_partial_patch_leaves_final_enabled_count_to_client(self) -> None:
         patches = [
@@ -399,15 +400,15 @@ class DeploymentHTTPTests(unittest.TestCase):
         self.assertEqual(409, status)
         self.assertEqual(desired["desired"]["revision"], conflict["current_revision"])
 
-    def test_api_rejects_patch_explicitly_enabling_multiple_plugins(self) -> None:
+    def test_api_accepts_patch_explicitly_enabling_multiple_plugins(self) -> None:
         status, response = self.request("/api/deployments/worker-1/desired", "PUT", {
             "revision": None, "components": [], "config_patch": {"plugins": {
                 "coverage": {"enabled": True}, "stpcompare": {"enabled": True},
             }},
         })
-        self.assertEqual(400, status)
-        self.assertIn("only one enabled plugin", response["error"])
-        self.assertEqual([], self.service.deployments.list())
+        self.assertEqual(200, status)
+        self.assertTrue(response["desired"]["config_patch"]["plugins"]["coverage"]["enabled"])
+        self.assertTrue(response["desired"]["config_patch"]["plugins"]["stpcompare"]["enabled"])
 
     def test_config_patch_and_rollback_use_the_desired_endpoint(self) -> None:
         components = [{"slot": "worker-plugin", "artifact_id": self.artifact["artifact_id"]}]

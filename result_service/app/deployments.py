@@ -293,14 +293,6 @@ class DeploymentStore:
                 raise DeploymentError(
                     "config_patch cannot change client." + sorted(protected)[0]
                 )
-        plugins_patch = value.get("plugins")
-        if isinstance(plugins_patch, dict) and sum(
-            isinstance(plugin, dict) and plugin.get("enabled") is True
-            for plugin in plugins_patch.values()
-        ) > 1:
-            # Only the client has its base configuration. It validates the final
-            # merged count, including plugins omitted from this partial patch.
-            raise DeploymentError("Client deployment supports only one enabled plugin")
         slots = {item["slot"] for item in components}
 
         def validate(item: Any) -> None:

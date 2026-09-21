@@ -57,6 +57,15 @@ nlohmann::json Scheduler::BuildStatus() const {
                  {"blocked_reason", run.blocked_reason}});
     for (const auto& client : clients()) {
         const auto& heartbeat = client.heartbeat;
+        std::string physical_client_id = client.identity, plugin_key = client.plugin_type;
+        {
+            std::lock_guard<std::mutex> lock(clients_mutex_);
+            const auto entry = clients_.find(client.identity);
+            if (entry != clients_.end()) {
+                physical_client_id = entry->second.physical_client_id;
+                plugin_key = entry->second.plugin_key;
+            }
+        }
         nlohmann::json tasks = nlohmann::json::array();
         for (const auto& task : in_flight_) {
             if (task.second.identity == client.identity)
@@ -64,6 +73,7 @@ nlohmann::json Scheduler::BuildStatus() const {
                                  {"attempt_id", task.second.attempt_id}, {"acked", task.second.acked}});
         }
         result["clients"].push_back({{"worker_id", client.identity}, {"plugin_type", client.plugin_type},
+            {"physical_client_id", physical_client_id}, {"plugin_key", plugin_key},
             {"registered", client.registered}, {"status", !tasks.empty() || heartbeat.status() == common::Heartbeat::BUSY ? "busy" : "idle"},
             {"ip", heartbeat.ip()}, {"peer_address", client.peer_address},
             {"last_seen_age_ms", client.last_seen_age_ms}, {"memory_bytes", heartbeat.resource().memory_bytes()},
