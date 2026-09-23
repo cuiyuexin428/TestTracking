@@ -22,6 +22,9 @@ message RegisterCommand {
   // Older clients omit these fields and are treated as one physical client.
   string physical_client_id = 5;
   string plugin_key = 6;
+  // Stable per-plugin resource target, independent of whole-machine revisions.
+  // Missing is allowed for traditional deployments, but cannot pass a rollout gate.
+  string deployment_target_id = 7;
 }
 
 // Registration validation result. payload is the opaque business reply

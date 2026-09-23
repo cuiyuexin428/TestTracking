@@ -232,6 +232,111 @@ class RuntimeIntegrationTests(unittest.TestCase):
                  f"CREATE TRIGGER runtime_failure BEFORE INSERT OR UPDATE ON {table} "
                  "FOR EACH ROW EXECUTE FUNCTION inject_fault();")
 
+    def test_superseded_stopped_run_does_not_block_online_deployment(self):
+        self.configure(delay=10)
+        self.start_server()
+        code, first = self.management_command(action='run', plugin_type='coverage', dataset_version='d1')
+        self.assertEqual(200, code, first)
+        self.assertEqual(200, self.management_command(action='stop', plugin_type='coverage')[0])
+        self.until(lambda: not self.management_status()['active_runs'], 'old run stops')
+        code, replacement = self.management_command(action='run', plugin_type='coverage', dataset_version='d1',
+            force_rerun=True, force_rerun_reason='replace stopped run before upgrading')
+        self.assertEqual(200, code, replacement)
+        self.assertEqual('cancelled', self.sql('SELECT status FROM runs WHERE run_id=' + sql_text(first['run_id'])))
+        self.start_client()
+        self.finished(replacement['run_id'])
+        self.until(lambda: not self.management_status()['unfinished_runs'], 'runtime unfinished cache follows DB commit')
+        code, applied = self.management_command(action='apply_plugin_deployment',
+            config_path=str(self.scheduler_config),
+            config_revision=hashlib.sha256(self.scheduler_config.read_bytes()).hexdigest(),
+            plugins={'coverage': {'expected_program_version': 'v2'}})
+        self.assertEqual(200, code, applied)
+        self.assertTrue(applied['online_applied'])
+
+    def test_rollout_restart_reconciles_stopped_database_before_activating_old_queue(self):
+        self.configure(delay=20)
+        self.start_server()
+        code, first = self.management_command(action='run', plugin_type='coverage', dataset_version='d1')
+        self.assertEqual(200, code, first)
+        code, queued = self.management_command(action='run', plugin_type='coverage', dataset_version='d1',
+            force_rerun=True, force_rerun_reason='old queued batch after stopped work')
+        self.assertEqual(200, code, queued)
+        self.assertEqual('queued', queued['status'])
+        rollout = {'plugin_type': 'coverage', 'rollout_id': 'stopped-recovery-rollout'}
+        code, begun = self.management_command(action='begin_plugin_rollout', **rollout,
+            config_path=str(self.scheduler_config),
+            config_revision=hashlib.sha256(self.scheduler_config.read_bytes()).hexdigest(),
+            target_id='a' * 64, target_patch={})
+        self.assertEqual(200, code, begun)
+        self.assertEqual({first['run_id'], queued['run_id']}, set(begun['boundary']))
+        self.assertEqual(200, self.management_command(action='stop', plugin_type='coverage', run_id=first['run_id'])[0])
+        self.until(lambda: not self.management_status()['active_runs'], 'explicitly stopped rollout batch')
+        self.server.crash()
+        # Exact crash window: the database stop committed but the rollout
+        # sidecar still records the preceding running state. Only owned fixture
+        # state is changed; startup must reconcile it before starting B.
+        sidecar = self.scheduler_config.with_suffix('.json.rollouts.json')
+        saved = json.loads(sidecar.read_bytes())
+        saved['plugins']['coverage']['boundary'][first['run_id']] = 'running'
+        saved['plugins']['coverage']['resume_after_restart'] = {}
+        sidecar.write_text(json.dumps(saved), encoding='utf-8')
+        self.start_server()
+        self.assertEqual('stopped', self.sql('SELECT status FROM runs WHERE run_id=' + sql_text(first['run_id'])))
+        self.assertEqual([], self.management_status()['active_runs'])
+        self.assertEqual([queued['run_id']], [run['run_id'] for run in self.management_status()['queued_runs']])
+        code, waiting = self.management_command(action='get_plugin_rollout', **rollout)
+        self.assertEqual(200, code, waiting)
+        self.assertFalse(waiting['ready_to_switch'])
+        self.assertIn({'run_id': first['run_id'], 'status': 'stopped'},
+                      [{key: run[key] for key in ('run_id', 'status')} for run in waiting['blockers']])
+        code, resumed = self.management_command(action='resume_rollout_run', **rollout, run_id=first['run_id'])
+        self.assertEqual(200, code, resumed)
+        self.assertEqual(200, self.management_command(action='resume_rollout_run', **rollout, run_id=first['run_id'])[0])
+        self.start_client()
+        self.finished(first['run_id'])
+        self.finished(queued['run_id'])
+        self.until(lambda: self.management_command(action='get_plugin_rollout', **rollout)[1]['ready_to_switch'],
+                   'both old batches complete after explicit recovery')
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows exclusive file publication fault')
+    def test_rollout_stop_and_queue_cancel_retry_after_sidecar_publication_failure(self):
+        self.configure(delay=20)
+        self.start_server()
+        code, first = self.management_command(action='run', plugin_type='coverage', dataset_version='d1')
+        self.assertEqual(200, code, first)
+        code, queued = self.management_command(action='run', plugin_type='coverage', dataset_version='d1',
+            force_rerun=True, force_rerun_reason='queue cancellation publication fault')
+        self.assertEqual(200, code, queued)
+        rollout = {'plugin_type': 'coverage', 'rollout_id': 'sidecar-failure-rollout'}
+        code, begun = self.management_command(action='begin_plugin_rollout', **rollout,
+            config_path=str(self.scheduler_config),
+            config_revision=hashlib.sha256(self.scheduler_config.read_bytes()).hexdigest(),
+            target_id='a' * 64, target_patch={})
+        self.assertEqual(200, code, begun)
+        sidecar = self.scheduler_config.with_suffix('.json.rollouts.json')
+        with ExclusiveFile(sidecar):
+            self.assertEqual(503, self.management_command(action='stop', plugin_type='coverage', run_id=queued['run_id'])[0])
+            self.assertEqual('cancelled', self.sql('SELECT status FROM runs WHERE run_id=' + sql_text(queued['run_id'])))
+        # The queue entry must remain available for the command retry even
+        # though its database cancellation already committed.
+        self.assertEqual(200, self.management_command(action='stop', plugin_type='coverage', run_id=queued['run_id'])[0])
+        with ExclusiveFile(sidecar):
+            self.assertEqual(503, self.management_command(action='stop', plugin_type='coverage', run_id=first['run_id'])[0])
+            self.assertEqual('stopped', self.sql('SELECT status FROM runs WHERE run_id=' + sql_text(first['run_id'])))
+        # The plugin checkpoint must survive the publication failure, allowing
+        # the same process's periodic stop retry to finish without a restart.
+        self.until(lambda: not self.management_status()['active_runs'], 'same-process stop retry after sidecar becomes writable')
+        self.assertEqual([], self.management_status()['queued_runs'])
+        code, waiting = self.management_command(action='get_plugin_rollout', **rollout)
+        self.assertEqual(200, code, waiting)
+        self.assertEqual([first['run_id']], [run['run_id'] for run in waiting['blockers']])
+        code, resumed = self.management_command(action='resume_rollout_run', **rollout, run_id=first['run_id'])
+        self.assertEqual(200, code, resumed)
+        self.start_client()
+        self.finished(first['run_id'])
+        self.until(lambda: self.management_command(action='get_plugin_rollout', **rollout)[1]['ready_to_switch'],
+                   'recovered batch finish clears rollout blockers')
+
     def test_forced_rerun_queues_and_starts_after_original_run(self):
         self.start_server()
         self.start_client()

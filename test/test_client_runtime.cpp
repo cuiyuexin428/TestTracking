@@ -80,6 +80,19 @@ void TestQueueAndExecutor() {
             "closed queue did not wake waiter");
     Require(!queue.push(1), "closed queue accepted producer");
 
+    // Use the production timeout path without keeping the test idle for a day.
+    common::EventManager idle_events(2, 10ms);
+    std::atomic<int> after_idle{0};
+    for (int cycle = 1; cycle <= 3; ++cycle) {
+        std::this_thread::sleep_for(40ms);
+        Require(!idle_events.isStopped(), "idle timeout stopped the execution pool");
+        Require(idle_events.push(new Action([&] { ++after_idle; })), "idle pool rejected work");
+        Require(Until([&] { return after_idle == cycle; }), "idle pool accepted work without executing it");
+    }
+    idle_events.requestStop();
+    Require(Until([&] { return idle_events.isStopped(); }), "idle pool failed to stop");
+    idle_events.join();
+
     common::CancellationSource cancel;
     common::EventManager events(1);
     std::atomic<bool> entered{false};

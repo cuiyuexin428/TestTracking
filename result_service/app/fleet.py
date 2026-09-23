@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import threading
@@ -36,7 +37,7 @@ class ClientFleet:
         if not isinstance(body, dict):
             raise DeploymentError("heartbeat must be an object")
         allowed = {"instance_id", "hostname", "state", "plugin_keys", "agent_version",
-                   "active_revision", "update_window_open"}
+                   "active_revision", "update_window_open", "capabilities"}
         return self.management.client_control("agent_heartbeat", client_id=client,
                                               **{key: value for key, value in body.items() if key in allowed})
 
@@ -115,16 +116,21 @@ class ClientFleet:
             raise ManagementError("部分客户端当前不可配置，请重新选择空闲客户端", 409,
                                   details={"unavailable": unavailable})
 
-    def _plan(self, clients: list[str], components: Any, patch: Any) -> list[dict]:
+    def _plan(self, clients: list[str], components: Any, patch: Any, *,
+              defaults_override: dict | None = None, replace_plugins: bool = False) -> list[dict]:
         component_patch = self.deployments._plan_components(components)
         if not isinstance(patch, dict):
             raise DeploymentError("config_patch must be an object")
-        defaults = self.defaults(masked=False)["config_patch"]["plugins"]
+        defaults = (self.defaults(masked=False)["config_patch"]["plugins"]
+                    if defaults_override is None else defaults_override)
         plans = []
         for client in clients:
             state = self.deployments.get(client)
             desired = state["desired"] or {}
-            original = desired.get("config_patch", {})
+            original = copy.deepcopy(desired.get("config_patch", {}))
+            if replace_plugins:
+                for name in patch.get("plugins", {}):
+                    original.get("plugins", {}).pop(name, None)
             incoming = copy.deepcopy(patch)
             slots = {item["slot"]: {"slot": item["slot"], "artifact_id": item["artifact_id"]}
                      for item in desired.get("components", [])}
@@ -224,9 +230,20 @@ class ClientFleet:
         warnings = ["仅修改本次指定的配置；每台机器未指定的插件、程序、数据及运行安排保持原值。"]
         warnings.append("发布后客户端停止领取新任务；若当前不在更新时间窗内，将保持预占并等待窗口打开后更新。")
         if conflicts: warnings.append("不同客户端的程序内容身份不同，请分批核对服务端程序匹配。")
-        return {"clients": _masked(plans), "program_bindings": [binding for key, binding in bindings.items() if key not in conflicts],
+        return {"clients": _masked(plans), "plan_fingerprint": self._plan_fingerprint(plans),
+                "program_bindings": [binding for key, binding in bindings.items() if key not in conflicts],
                 "scheduler_plugins": expected, "scheduler_revision": scheduler.get("revision"),
                 "scheduler_restart_required": bool(expected), "warnings": warnings}
+
+    @staticmethod
+    def _plan_fingerprint(plans: list[dict]) -> str:
+        # Include the full unmasked effective plan. Client revisions alone do
+        # not detect template defaults changed between preview and publish.
+        value = [{key: plan[key] for key in ("client_id", "revision", "components", "config_patch")}
+                 for plan in sorted(plans, key=lambda item: item["client_id"])]
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=False, allow_nan=False).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     def _publish(self, plans: list[dict], body: dict) -> dict:
         clients = [plan["client_id"] for plan in plans]
@@ -251,12 +268,16 @@ class ClientFleet:
             raise DeploymentError("each target requires client_id and revision")
         clients = self._client_ids([item.get("client_id") for item in body["targets"]])
         with self._lock:
+            if getattr(self, "rollout_guard", None):
+                self.rollout_guard(body)
             plans = self._plan(clients, body.get("components", []), body.get("config_patch", {}))
             for target, plan in zip(body["targets"], plans):
                 expected = self.deployments._optional_revision(target["revision"], "revision")
                 if expected != plan["revision"]:
                     raise DeploymentError(f"{plan['client_id']} 的部署已改变，请重新预览", 409,
                                           current_revision=plan["revision"])
+            if body.get("plan_fingerprint") != self._plan_fingerprint(plans):
+                raise DeploymentError("部署计划或客户端模板已改变，请重新预览后发布", 409)
             return self._publish(plans, body)
 
     def publish_single(self, client: str, body: Any) -> dict:
@@ -264,6 +285,8 @@ class ClientFleet:
         if not isinstance(body, dict) or "revision" not in body:
             raise DeploymentError("revision is required")
         with self._lock:
+            if getattr(self, "rollout_guard", None):
+                self.rollout_guard(body, client=client)
             current = self.deployments.get(client)
             expected = self.deployments._optional_revision(body["revision"], "revision")
             revision = (current["desired"] or {}).get("revision")
@@ -289,7 +312,10 @@ class ClientFleet:
             desired = value["desired"] or {}
             token = desired.get("reservation_id")
             if token and value["state"] not in {"current", "failed"}:
-                self.management.client_control("reserve_clients", client_ids=[client], reservation_id=token)
+                managed = (self.rollout_delivery_guard(client, value)
+                           if getattr(self, "rollout_delivery_guard", None) else False)
+                self.management.client_control("reserve_clients", client_ids=[client], reservation_id=token,
+                    **({"require_update_window_open": True} if managed else {}))
                 self.management.client_control("commit_reservation", client_ids=[client], reservation_id=token)
             elif token:
                 try:

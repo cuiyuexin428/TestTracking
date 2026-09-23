@@ -18,6 +18,7 @@ using EventQueue = BlockingQueue<std::unique_ptr<Event>>;
 class EventManager {
 public:
     explicit EventManager(int thread_num);
+    EventManager(int thread_num, std::chrono::milliseconds idle_wait);
     ~EventManager();
 
     // Ownership always transfers, including when a closed queue rejects work.

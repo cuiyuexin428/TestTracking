@@ -319,6 +319,10 @@ void Client::RefreshRegistration() {
     registration_.mutable_register_()->set_physical_client_id(
         config_.get("client.worker_id", std::string("worker-1")));
     registration_.mutable_register_()->set_plugin_key(selected_plugin_);
+    const auto* configuration = config_.find("plugins");
+    if (configuration && configuration->contains(selected_plugin_))
+        registration_.mutable_register_()->set_deployment_target_id(
+            configuration->at(selected_plugin_).value("deployment_target_id", std::string()));
     registration_.mutable_register_()->set_protocol_version(common::kProtocolVersion);
     registration_.mutable_register_()->add_capabilities(common::kAttemptIdsCapability);
     registration_id_ = GenerateRegistrationId();

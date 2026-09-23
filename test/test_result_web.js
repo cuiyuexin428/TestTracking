@@ -216,7 +216,11 @@ async function createConsole({
           data = currentPlugins();
           break;
         case '/api/plugin-view-schema': data = pluginViewSchema; break;
-        case '/api/scheduler': data = typeof scheduler === 'function' ? scheduler() : scheduler; break;
+        case '/api/scheduler': {
+          const snapshot = typeof scheduler === 'function' ? scheduler() : scheduler;
+          data = { ...snapshot, run_datasets: snapshot.run_datasets ?? Object.fromEntries((snapshot.plugins || []).map((plugin) => [typeof plugin === 'string' ? plugin : plugin.name, { dataset_version: 'd1', name: 'parts', version: '1' }])) };
+          break;
+        }
         case '/api/agents': {
           status = agentsError ? 503 : 200;
           const snapshot = typeof scheduler === 'function' ? scheduler() : scheduler;
@@ -234,6 +238,7 @@ async function createConsole({
           const payload = JSON.parse(options.body); batchPreviews.push(payload);
           if (batchPreviewGate) await batchPreviewGate;
           data = batchPreviewResult ? batchPreviewResult(payload) : { clients: payload.client_ids.map((client_id, index) => ({ client_id, revision: `revision-${index}`, components: payload.components, config_patch: payload.config_patch })), program_bindings: [], scheduler_plugins: {}, warnings: [] };
+          data = { plan_fingerprint: 'f'.repeat(64), ...data };
           break;
         }
         case '/api/deployments/batch': {
@@ -401,6 +406,8 @@ async function createConsole({
   return { get, posts, requests, clipboardWrites, puts, reportPosts, scriptPuts, scriptSaveRequests, intervals, storage, windowListeners, documentElement, window: browserWindow,
     commands, logRequests, configSaves, configGets, artifactUploads, deploymentSaves, deploymentPreviews, schedulerBindings, serverPluginInstalls, batchPreviews, batchPublishes,
     openLegacyDeployment: (client = '') => context.openDeploymentEditor(client),
+    prepareDshDeploymentContext: (...args) => context.prepareDshDeploymentContext(...args),
+    returnToDeploymentPreview: () => context.returnToDeploymentPreview(),
     workspaceTabs, workspacePanels, deploymentSteps, deploymentStages,
     wizard: {
       read: (...args) => JSON.parse(JSON.stringify(context.readDeploymentWizard(...args))),
@@ -572,6 +579,19 @@ async function reviewFleet(ui) {
 }
 const submitFleet = (ui) => ui.get('deployment-form').listeners.submit({ preventDefault() {} });
 
+test('profile assignment can select busy and offline machines while retaining their deferred state', async () => {
+  const ui = await createConsole({ agents: [fleetAgent('busy', { workers: [{ status: 'busy', plugin_key: 'coverage' }] }), fleetAgent('offline', { online: false })] });
+  let selected;
+  ui.window.deploymentProfiles = { selectionChanged() {}, openApply(ids) { selected = [...ids]; } };
+  await ui.get('clients-refresh').listeners.click();
+  assert.match(ui.get('client-list').innerHTML, /正在执行任务，更新请求可先提交/);
+  assert.match(ui.get('client-list').innerHTML, /离线/);
+  assert.doesNotMatch(ui.get('client-list').innerHTML, /data-agent-select="(?:busy|offline)"[^>]*disabled/);
+  await selectFleet(ui);
+  assert.deepEqual(selected, ['busy', 'offline']);
+  assert.equal(ui.get('clients-configure').disabled, false);
+});
+
 test('independent Agents are visible without plugins and only wholly idle online machines can be selected', async () => {
   const agents = [fleetAgent('blank', { state: 'unconfigured' }), fleetAgent('idle'),
     fleetAgent('busy', { workers: [{ status: 'idle', plugin_key: 'coverage' }, { status: 'busy', plugin_key: 'stpcompare' }] }),
@@ -655,7 +675,7 @@ test('shared modal dialogs are body children and cannot inherit hidden page visi
     }
     if (!voidTags.has(name) && !tag[0].endsWith('/>')) ancestors.push({ name, markup: tag[0] });
   }
-  assert.deepEqual(dialogs, ['workspace-drawer', 'report-editor-dialog', 'view-editor-dialog']);
+  assert.deepEqual(dialogs, ['profile-apply', 'workspace-drawer', 'report-editor-dialog', 'view-editor-dialog']);
 });
 
 test('client deployment details open and close while the plugin page is hidden', async () => {
@@ -749,6 +769,7 @@ test('batch preview and publication use each revision and only the original patc
   await submitFleet(ui);
   assert.equal(ui.batchPublishes.length, 1);
   assert.deepEqual(ui.batchPublishes[0].targets, [{ client_id: 'A', revision: 'A-old' }, { client_id: 'B', revision: null }]);
+  assert.equal(ui.batchPublishes[0].plan_fingerprint, 'f'.repeat(64));
   assert.deepEqual(ui.batchPublishes[0].config_patch, ui.batchPreviews[0].config_patch);
   assert.doesNotMatch(JSON.stringify(ui.batchPublishes[0]), /machine-|\*\*\*/);
   assert.equal(ui.batchPublishes[0].reason, 'shared update');
@@ -1449,6 +1470,38 @@ test('a queued run blocked by changed inputs explains the cause and stays cancel
   assert.match(ui.get('active-runs').innerHTML, /data-stop-run="blocked-run"[^>]*>取消排队/);
 });
 
+test('pending rollout blocks new runs, keeps old queued batches visible and links to persistent progress', async () => {
+  const snapshot = { online: true, plugins: ['coverage'], clients: [], active_runs: [{ run_id: 'old-A', plugin_type: 'coverage' }],
+    queued_runs: [{ run_id: 'old-B', plugin_type: 'coverage', dataset_version: 'old' }], run_datasets: { coverage: { dataset_version: 'old' } },
+    rollout_blocks: { coverage: { rollout_id: 'update-1', reason: '等待旧批次完成并准备新版' } } };
+  const ui = await createConsole({ scheduler: () => snapshot });
+  let opened;
+  ui.window.deploymentProfiles = { openRollout(id) { opened = id; }, selectionChanged() {} };
+  assert.equal(ui.get('run-start').disabled, true);
+  assert.equal(ui.get('run-update-notice').hidden, false);
+  assert.match(ui.get('run-update-notice').textContent, /等待旧批次/);
+  assert.match(ui.get('active-runs').innerHTML, /old-A/); assert.match(ui.get('active-runs').innerHTML, /old-B/);
+  ui.get('run-update-progress').listeners.click(); assert.equal(opened, 'update-1');
+  await ui.get('run-start-form').listeners.submit({ preventDefault() {} });
+  assert.equal(ui.commands.length, 0);
+  snapshot.rollout_blocks = {}; snapshot.run_datasets.coverage.dataset_version = 'new';
+  snapshot.plugin_rollouts = [{ plugin_type: 'coverage', rollout_id: 'stale-native', phase: 'switching' }];
+  await ui.get('clients-refresh').listeners.click();
+  assert.equal(ui.get('run-start').disabled, false); assert.equal(ui.get('run-update-notice').hidden, true);
+  await ui.get('run-start-form').listeners.submit({ preventDefault() {} });
+  assert.equal(ui.commands.length, 1); assert.equal(ui.commands[0].dataset_version, 'new');
+});
+
+test('native rollout fallback also blocks custom plugin starts after manual data input', async () => {
+  const ui = await createConsole({ scheduler: { online: true, plugins: ['custom'], clients: [], active_runs: [],
+    plugin_rollouts: [{ plugin_type: 'custom', rollout_id: 'native-update', phase: 'waiting' }] } });
+  ui.get('run-dataset').value = 'custom-data'; ui.get('run-dataset').listeners.input();
+  assert.equal(ui.get('run-start').disabled, true);
+  await ui.get('run-start-form').listeners.submit({ preventDefault() {} });
+  assert.equal(ui.commands.length, 0);
+  assert.equal(ui.get('run-update-progress').dataset.rolloutId, 'native-update');
+});
+
 test('task targets use exact selected worker identities and cannot silently become unrestricted', async () => {
   const ui = await createConsole({ scheduler: { online: true, plugins: ['coverage'], active_runs: [], clients: [
     { worker_id: 'worker-1/coverage', plugin_type: 'coverage', registered: true, status: 'idle' },
@@ -1463,6 +1516,50 @@ test('task targets use exact selected worker identities and cannot silently beco
   ui.get('run-clients').listeners.change();
   await ui.get('run-start-form').listeners.submit({ preventDefault() {} });
   assert.deepEqual(ui.commands[0].worker_ids, ['worker-2/coverage']);
+});
+
+test('built-in runs use effective server data with friendly labels and ignore manual hash input', async () => {
+  const identity = `sha256:${'a'.repeat(64)}`;
+  const snapshot = { online: true, plugins: ['coverage', 'stpcompare'], clients: [], active_runs: [],
+    run_datasets: { coverage: { dataset_version: identity, name: 'sample-stp', version: 'demo-2' }, stpcompare: { dataset_version: 'other', name: 'other-parts', version: '3' } } };
+  const ui = await createConsole({ scheduler: () => snapshot });
+  assert.equal(ui.get('run-dataset-label').textContent, 'sample-stp · demo-2');
+  assert.equal(ui.get('run-dataset-identity').textContent, identity);
+  assert.equal(ui.get('run-dataset-manual-row').hidden, true);
+  ui.get('run-dataset').value = 'stale-manual-version';
+  await ui.get('run-start-form').listeners.submit({ preventDefault() {} });
+  assert.equal(ui.commands[0].dataset_version, identity);
+  ui.get('run-plugin').value = 'stpcompare'; ui.get('run-plugin').listeners.change();
+  assert.equal(ui.get('run-dataset-label').textContent, 'other-parts · 3');
+  assert.equal(ui.get('run-dataset').value, 'other');
+});
+
+test('missing or offline effective identity blocks built-in runs and never reuses an earlier value', async () => {
+  const snapshot = { online: true, plugins: ['coverage'], clients: [], active_runs: [], run_datasets: {} };
+  const ui = await createConsole({ scheduler: () => snapshot });
+  assert.equal(ui.get('run-start').disabled, true);
+  ui.get('run-dataset').value = 'manually-copied-hash';
+  await ui.get('run-start-form').listeners.submit({ preventDefault() {} });
+  assert.equal(ui.commands.length, 0);
+  snapshot.run_datasets.coverage = { dataset_version: 'now-effective' };
+  await ui.get('clients-refresh').listeners.click();
+  assert.equal(ui.get('run-start').disabled, false);
+  snapshot.online = false; await ui.get('clients-refresh').listeners.click();
+  assert.equal(ui.get('run-dataset').value, ''); assert.equal(ui.get('run-start').disabled, true);
+});
+
+test('custom plugin manual data drafts remain scoped to their plugin across polling', async () => {
+  const snapshot = { online: true, plugins: ['custom', 'coverage'], clients: [], active_runs: [], run_datasets: { coverage: { dataset_version: 'managed' } } };
+  const ui = await createConsole({ scheduler: () => snapshot });
+  assert.equal(ui.get('run-dataset-manual-row').hidden, false);
+  ui.get('run-dataset').value = 'custom-data'; ui.get('run-dataset').listeners.input();
+  await ui.get('clients-refresh').listeners.click();
+  assert.equal(ui.get('run-dataset').value, 'custom-data');
+  ui.get('run-plugin').value = 'coverage'; ui.get('run-plugin').listeners.change();
+  assert.equal(ui.get('run-dataset').value, 'managed');
+  ui.get('run-plugin').value = 'custom'; ui.get('run-plugin').listeners.change();
+  await ui.get('run-start-form').listeners.submit({ preventDefault() {} });
+  assert.equal(ui.commands[0].dataset_version, 'custom-data');
 });
 
 test('offline scheduler disables execution controls while reports and AI remain usable', async () => {
@@ -1506,7 +1603,7 @@ test('slow report workspace loading does not delay execution controls', async ()
 test('run command sends version and params once while pending and exposes command errors', async () => {
   let release;
   const commandGate = new Promise((resolve) => { release = resolve; });
-  const ui = await createConsole({ scheduler: { online: true, plugins: ['coverage'], active_runs: [], clients: [] }, commandGate, commandError: 'dataset mismatch' });
+  const ui = await createConsole({ scheduler: { online: true, plugins: ['coverage'], active_runs: [], clients: [], run_datasets: { coverage: { dataset_version: 'd7' } } }, commandGate, commandError: 'dataset mismatch' });
   ui.get('run-dataset').value = 'd7';
   ui.get('run-params').value = '--mode full';
   const pending = ui.get('run-start-form').listeners.submit({ preventDefault() {} });
@@ -1875,6 +1972,35 @@ test('context can be prepared without a selected run or an available DSH command
   assert.equal(ui.get('dsh-context-copy').disabled, false);
   assert.equal(ui.clipboardWrites.length, 0);
   assert.equal(ui.posts.length, 0);
+});
+
+test('deployment review context opens advisory DSH prompt and exposes an explicit route back', async () => {
+  const ui = await createConsole({ available: null });
+  let returned = 0;
+  ui.prepareDshDeploymentContext({
+    profile_name: '生产覆盖率方案',
+    plan_fingerprint: 'plan-1',
+    context_fingerprint: 'context-1',
+    context: {
+      profile: { name: '生产覆盖率方案', mode: 'update' },
+      targets: [{ client_id: 'offline-01', online: false }],
+      waiting_runs: [{ run_id: 'run-old', status: 'queued' }],
+      warnings: ['offline-01 将在上线后补齐'],
+      constraints: ['当前运行和提交前已排队批次继续旧资源'],
+    },
+  }, () => { returned += 1; return true; });
+  const prompt = ui.get('dsh-context-prompt').value;
+  assert.match(prompt, /只能提供建议/);
+  assert.match(prompt, /不能自动发布/);
+  assert.match(prompt, /生产覆盖率方案/);
+  assert.match(prompt, /plan-1/);
+  assert.match(prompt, /offline-01/);
+  assert.equal(ui.get('dsh-context-return').hidden, false);
+  assert.equal(ui.get('console').dataset.aiOpen, 'true');
+  assert.equal(ui.posts.length, 0);
+  assert.equal(ui.returnToDeploymentPreview(), true);
+  assert.equal(returned, 1);
+  assert.equal(ui.get('dsh-context-return').hidden, true);
 });
 
 test('LAN browsers without clipboard permission retain selectable context for manual copying', async () => {
@@ -2508,3 +2634,61 @@ test('report frame enables interaction without access to the host page', () => {
   const html = fs.readFileSync(path.join(__dirname, '../result_service/web/index.html'), 'utf8');
   assert.match(html, /id="report-frame"[^>]*sandbox="allow-scripts allow-downloads"/);
 });
+
+test('managed deployment datasets show the uploaded source name and stay out of the ordinary artifact list', async () => {
+  const source = wizardArtifact('a', 'dataset', 'parts');
+  const managed = { ...wizardArtifact('b', 'dataset', 'managed-dataset-technical-hash'), metadata: { managed: true, source_artifact_id: source.artifact_id } };
+  const components = [{ slot: 'profile.coverage.dataset', artifact_id: managed.artifact_id, artifact: managed }];
+  const ui = await createConsole({ artifacts: [source, managed], deployments: [{ client_id: 'worker-readable', state: 'current', desired: { revision: 'r1', components }, reported: { state: 'ready', components } }] });
+  await ui.get('artifacts-refresh').listeners.click();
+  assert.match(ui.get('deployment-list').innerHTML, /parts @/);
+  assert.doesNotMatch(ui.get('deployment-list').innerHTML, /managed-dataset-technical-hash/);
+  assert.match(ui.get('artifact-list').innerHTML, /parts/);
+  assert.doesNotMatch(ui.get('artifact-list').innerHTML, /managed-dataset-technical-hash/);
+});
+
+// Optional standards DOM suite. CI/local full UI verification can provide
+// TESTTRACKING_DOM_MODULE=<absolute path to jsdom> without a production dependency.
+if (process.env.TESTTRACKING_DOM_MODULE) {
+  const { JSDOM } = require(process.env.TESTTRACKING_DOM_MODULE);
+  test('DOM progress polling preserves rollout disclosure focus when requests reorder and machine state advances', () => {
+    const dom = new JSDOM('<main><div id="client-rollouts"></div></main>', { pretendToBeVisual: true });
+    const document = dom.window.document;
+    const context = vm.createContext({ document });
+    vm.runInContext(script.slice(script.indexOf('function patchClientList('), script.indexOf('function renderAgentClients(')), context);
+    const container = document.getElementById('client-rollouts');
+    const card = (id, state) => `<article data-rollout-row="${id}"><h3>${id}</h3><details><summary>资源版本</summary><p>converter version 2</p></details><details class="machines"><summary>逐台进度</summary><div data-rollout-client="machine-a">${state}</div></details></article>`;
+    context.patchClientList(card('update-a', '正在下载'), container);
+    const cardNode = document.querySelector('[data-rollout-row="update-a"]');
+    const details = cardNode.querySelector('.machines'), summary = details.querySelector('summary');
+    details.open = true; summary.focus();
+    context.patchClientList(card('update-b', '等待旧批次') + card('update-a', '已就绪'), container);
+    assert.equal(document.querySelector('[data-rollout-row="update-a"]'), cardNode);
+    assert.equal(cardNode.querySelector('.machines'), details); assert.equal(details.open, true);
+    assert.equal(document.activeElement, summary); assert.match(details.textContent, /已就绪/);
+    assert.equal(cardNode.querySelector('details').open, false);
+    dom.window.close();
+  });
+
+  test('DOM polling preserves client details, keyboard focus and selected text while facts update', () => {
+    const dom = new JSDOM('<main><div id="client-list"></div></main>', { pretendToBeVisual: true });
+    const document = dom.window.document;
+    const context = vm.createContext({ document, $: (id) => document.getElementById(id) });
+    vm.runInContext(script.slice(script.indexOf('function patchClientList('), script.indexOf('function renderAgentClients(')), context);
+    const cards = (age, extra = '') => `<article data-client-row="A"><p>心跳 ${age}</p><details class="client-workers"><summary>插件详情</summary><section data-worker-row="A/coverage"><p class="client-info">stable dataset identity</p></section></details>${extra}</article>`;
+    context.patchClientList(cards(1));
+    const details = document.querySelector('details'), summary = document.querySelector('summary'), text = document.querySelector('.client-info').firstChild;
+    details.open = true; summary.focus();
+    const range = document.createRange(); range.setStart(text, 0); range.setEnd(text, 6);
+    dom.window.getSelection().removeAllRanges(); dom.window.getSelection().addRange(range);
+    context.patchClientList(cards(5, '<p>部署等待应用</p>'));
+    assert.equal(document.querySelector('details'), details); assert.equal(details.open, true);
+    assert.equal(document.activeElement, summary); assert.equal(dom.window.getSelection().toString(), 'stable');
+    assert.match(document.getElementById('client-list').textContent, /心跳 5/);
+    details.open = false; context.patchClientList(cards(10)); assert.equal(details.open, false);
+    // A new/reordered machine must not redirect keyboard focus to its summary.
+    context.patchClientList('<article data-client-row="B"><details><summary>B</summary></details></article>' + cards(11));
+    assert.equal(document.activeElement, summary); assert.equal(document.querySelector('[data-client-row="A"] details'), details);
+    dom.window.close();
+  });
+}

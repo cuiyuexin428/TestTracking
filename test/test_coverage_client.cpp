@@ -14,6 +14,7 @@
 #include <fstream>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -66,6 +67,16 @@ int FakeCoverage(int argc, char** argv) {
         return 21;
     }
     const std::string file = fs::path(argv[separator + 2]).filename().string();
+    if (file == "overlap failed.stp" || file == "overlap success.stp") {
+        const auto directory=fs::path(argv[separator+2]).parent_path();
+        Write(directory/(file+".started"),"started");
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(10);
+        while (!fs::exists(directory/(file+".release")) &&
+               std::chrono::steady_clock::now()<deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (!fs::exists(directory/(file+".release"))) return 22;
+        if (file == "overlap failed.stp") return 1;
+    }
     if (file == "failed process.stp") {
         return 1;
     }
@@ -136,7 +147,7 @@ int main(int argc, char** argv) {
     const std::vector<std::string> files = {
         "ordinary file.stp", "zero lines.stp", "missing cov.stp", "empty cov.stp",
         "missing report.stp", "failed process.stp", "cov write fails.stp",
-        "points write fails.stp", "add cov later.stp"
+        "points write fails.stp", "add cov later.stp", "overlap failed.stp", "overlap success.stp"
     };
     for (const std::string& file : files) {
         Write(root / "input stp" / file, "stp");
@@ -221,6 +232,37 @@ int main(int argc, char** argv) {
     entry = Execute(client, "run", "add cov later.stp", 0);
     CHECK(entry.ok() && entry.covered_lines() == 2 && store->hasFileCov("run", "add cov later.stp"),
           "store_cov execution repairs cached points with a missing binary");
+
+    // Force cache miss -> external execution -> another successful publication
+    // -> this process completes. Both late failure and late success must report
+    // the winner's three points, not this attempt's failure or two-point report.
+    for (const std::string file : {"overlap failed.stp", "overlap success.stp"}) {
+        coverage::CoverageTask payload;
+        payload.set_run_id("overlap"); payload.add_files(file);
+        common::Task task;
+        task.set_run_id("overlap"); task.set_task_id(file); task.set_attempt_id("late");
+        payload.SerializeToString(task.mutable_payload());
+        common::TaskResult result;
+        bool executed=false;
+        std::thread worker([&] { executed=client.execute(task,result); });
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        const auto started=root/"input stp"/(file+".started");
+        while (!fs::exists(started) && std::chrono::steady_clock::now()<deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        CHECK(fs::exists(started), "overlapping attempt really started after a cache miss");
+        coverage_plugin::FileCoverageResult winner;
+        winner.run_id="overlap"; winner.file=file; winner.attempt_id="winner";
+        winner.successful=true; winner.points={17,23,29}; winner.cov="winning cov";
+        CHECK(store->publish(winner), "other attempt publishes success during execution");
+        Write(root/"input stp"/(file+".release"),"release");
+        worker.join();
+        coverage::CoverageResult decoded;
+        CHECK(executed && result.exit_code()==0 && decoded.ParseFromString(result.result()) &&
+                  decoded.files_size()==1 && decoded.files(0).ok() && decoded.files(0).covered_lines()==3,
+              "task summary and exit code describe the committed winner after overlapping execution");
+        CHECK(store->loadFileCoverage("overlap",file,&points) && points==std::set<std::uint64_t>({17,23,29}),
+              "overlapping execution leaves the original successful points unchanged");
+    }
 
 
     Write(PointPath(root, "run", "invalid json"), "{\"file\":12,\"points\":[1]}");

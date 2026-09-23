@@ -229,14 +229,14 @@ bool MergeSelected(PGconn* conn, const Args& args, size_t selected_count,
         out.write(PQgetvalue(covs.get(), row, 1), PQgetlength(covs.get(), row, 1));
         out.close();
         if (!out) return false;
-        paths.push_back(path.string());
+        paths.push_back(path.u8string());
     }
     covs.reset();
     const auto out_cov = work.path / "cumulative.cov";
     const auto out_xml = work.path / "summary.xml";
     if (!coverage_plugin::MergeCoverageFiles(args.opencppcoverage, paths,
-                                              out_cov.string(), out_xml.string()) ||
-        !coverage_plugin::ParseCoverageTotals(out_xml.string(), covered, total)) {
+                                              out_cov.u8string(), out_xml.u8string()) ||
+        !coverage_plugin::ParseCoverageTotals(out_xml.u8string(), covered, total)) {
         LOG_ERROR("coverage_settle: cov merge/report validation failed");
         return false;
     }

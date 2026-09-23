@@ -13,6 +13,7 @@ public:
         entered_ = settings.at("entered_file").get<std::string>();
         type_ = settings.value("plugin_type", std::string("scheduler-probe"));
         throw_plan_ = settings.value("throw_plan", false);
+        if (settings.value("expected_program_version", std::string()) == "reject-init") return false;
         return true;
     }
     bool validateClient(const common::ClientInfo&, const std::string&, common::ValidationResult& reply) override {

@@ -149,6 +149,15 @@ if (($OnlyClient -or $OnlyProgram -or $OnlyDataset) -and (Test-Path -LiteralPath
 }
 $preserveClientConfig = $OnlyClient -and $null -ne $previousConfig
 
+if (($OnlyProgram -or $OnlyDataset) -and $null -ne $previousConfig) {
+    $ignoredParameters = @('Endpoint', 'DeploymentEndpoint', 'ServerIp', 'ServerPort',
+        'DbConn', 'DbPort', 'DbName', 'DbUser', 'DbPassword') |
+        Where-Object { $PSBoundParameters.ContainsKey($_) }
+    if ($ignoredParameters.Count -gt 0) {
+        throw "Component updates do not rewrite deployment endpoints or database settings; remove: $($ignoredParameters -join ', ')"
+    }
+}
+
 $selectedPluginNames = if ($Plugin -eq 'all') { @('coverage', 'stpcompare') } else { @($Plugin) }
 $includeCoverage = 'coverage' -in $selectedPluginNames
 $includeStpCompare = 'stpcompare' -in $selectedPluginNames
@@ -523,7 +532,9 @@ pause
     Write-Host "built client package: $OutDir"
 }
 
-Write-Host "done. copy '$OutDir' to the target machine and run start_client.bat"
-if (-not $OnlyProgram -and -not $OnlyDataset) {
+if ($OnlyProgram -or $OnlyDataset) {
+    Write-Host "component update complete: copy '$OutDir' to the target package directory"
+} else {
+    Write-Host "done. copy '$OutDir' to the target machine and run start_client.bat"
     Write-Host 'Check config/client.json endpoint/db_conn for the deployment server before starting the client.'
 }

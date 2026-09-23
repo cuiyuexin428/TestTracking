@@ -4,6 +4,9 @@ add_library(scheduler_core STATIC
     src/SchedulerMessages.cpp
     src/SchedulerManagement.cpp
     src/SchedulerClientControl.cpp
+    src/SchedulerDeployment.cpp
+    src/SchedulerMaintenance.cpp
+    src/SchedulerRollout.cpp
     src/ManagementServer.cpp
     src/Storage.cpp
 )

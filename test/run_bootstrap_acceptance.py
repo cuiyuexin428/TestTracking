@@ -186,7 +186,7 @@ class BootstrapAcceptance(Acceptance):
         return self.request('/api/deployments/batch/preview', body)
 
     def publication(self, body, preview):
-        return {**copy.deepcopy(body), 'targets': [
+        return {**copy.deepcopy(body), 'plan_fingerprint': preview['plan_fingerprint'], 'targets': [
             {'client_id': row['client_id'], 'revision': row['revision']} for row in preview['clients']]}
 
     def publish(self, body):

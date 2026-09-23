@@ -44,7 +44,7 @@ class FleetTests(unittest.TestCase):
 
     def publish(self, request):
         preview = self.fleet.preview(request)
-        return self.fleet.publish({**request, "targets": [
+        return self.fleet.publish({**request, "plan_fingerprint": preview["plan_fingerprint"], "targets": [
             {"client_id": row["client_id"], "revision": row["revision"]} for row in preview["clients"]]})
 
     def ready(self, client):
@@ -106,7 +106,7 @@ class FleetTests(unittest.TestCase):
         preview = self.fleet.preview(request)
         self.management.rows["b"]["busy"] = True
         with self.assertRaises(ManagementError) as caught:
-            self.fleet.publish({**request, "targets": [{"client_id": r["client_id"], "revision": r["revision"]} for r in preview["clients"]]})
+            self.fleet.publish({**request, "plan_fingerprint": preview["plan_fingerprint"], "targets": [{"client_id": r["client_id"], "revision": r["revision"]} for r in preview["clients"]]})
         self.assertEqual(409, caught.exception.status)
         self.assertEqual([], self.store.list())
         self.assertEqual({}, self.management.reservations)
@@ -130,7 +130,7 @@ class FleetTests(unittest.TestCase):
 
     def test_two_operators_cannot_overwrite_same_preview(self):
         preview = self.fleet.preview(self.request())
-        payload = {**self.request(), "targets": [{"client_id": r["client_id"], "revision": r["revision"]} for r in preview["clients"]]}
+        payload = {**self.request(), "plan_fingerprint": preview["plan_fingerprint"], "targets": [{"client_id": r["client_id"], "revision": r["revision"]} for r in preview["clients"]]}
         outcomes = []
         barrier = threading.Barrier(3)
         def save():
@@ -145,6 +145,40 @@ class FleetTests(unittest.TestCase):
         for thread in threads: thread.join(5)
         self.assertEqual([200, 409], sorted(outcomes))
         self.assertTrue(all(not row["history"] for row in self.store.list()))
+
+    def test_template_change_invalidates_batch_preview_before_reservation(self):
+        request = self.request()
+        preview = self.fleet.preview(request)
+        publication = {**request, "plan_fingerprint": preview["plan_fingerprint"], "targets": [
+            {"client_id": row["client_id"], "revision": row["revision"]} for row in preview["clients"]]}
+        template = json.loads(self.template.read_text(encoding="utf-8"))
+        template["plugins"]["custom"]["db_conn"] = "host=other-db password=another-secret"
+        self.template.write_text(json.dumps(template), encoding="utf-8")
+        with self.assertRaises(DeploymentError) as rejected:
+            self.fleet.publish(publication)
+        self.assertEqual(409, rejected.exception.status)
+        self.assertEqual([], self.store.list())
+        self.assertEqual({}, self.management.reservations)
+        fresh = self.fleet.preview(request)
+        self.assertNotEqual(preview["plan_fingerprint"], fresh["plan_fingerprint"])
+        publication["plan_fingerprint"] = fresh["plan_fingerprint"]
+        result = self.fleet.publish(publication)
+        self.assertTrue(all(row["desired"]["config_patch"]["plugins"]["custom"]["db_conn"]
+                            == "host=other-db password=another-secret" for row in result["clients"]))
+
+    def test_batch_requires_fingerprint_and_checks_the_actual_requested_patch(self):
+        request = self.request()
+        preview = self.fleet.preview(request)
+        publication = {**request, "targets": [
+            {"client_id": row["client_id"], "revision": row["revision"]} for row in preview["clients"]]}
+        with self.assertRaises(DeploymentError):
+            self.fleet.publish(publication)
+        publication["plan_fingerprint"] = preview["plan_fingerprint"]
+        publication["config_patch"]["client"] = {"task_threads": 99}
+        with self.assertRaises(DeploymentError):
+            self.fleet.publish(publication)
+        self.assertEqual([], self.store.list())
+        self.assertEqual({}, self.management.reservations)
 
     def test_persistence_failure_releases_entire_reservation(self):
         with patch.object(self.store, "_write", side_effect=OSError("disk unavailable")):

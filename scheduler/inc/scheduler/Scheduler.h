@@ -56,7 +56,7 @@ class Scheduler {
         Clock::time_point last_seen;
         std::string session_id, registration_id;
         common::ValidationResult validation;
-        std::string physical_client_id, plugin_key;
+        std::string physical_client_id, plugin_key, deployment_target_id;
     };
     struct InFlight {
         std::string identity, session_id, plugin_type, run_id, attempt_id;
@@ -72,6 +72,7 @@ class Scheduler {
         bool update_window_open = false;
         long long last_seen_at_ms = 0;
         bool seen_since_start = true;
+        std::vector<std::string> capabilities;
     };
     struct ClientReservation {
         std::string reservation_id;
@@ -99,9 +100,18 @@ class Scheduler {
     struct LoadedPlugin {
         std::unique_ptr<common::DynamicLibrary> library;
         std::unique_ptr<common::TaskPlugin, PluginDeleter> instance;
+        std::string configuration_key, binary_sha256;
+    };
+    struct PluginIdentity {
+        std::string deployment, configuration, manifest;
+        bool duplicate_protection = true;
+    };
+    struct PluginMaintenance {
+        std::string reservation_id, original_revision, committed_revision, configuration_key;
+        nlohmann::json committed_configuration;
     };
     struct ControlCommand {
-        enum class Kind { Run, Stop, Wake, Shutdown, ClientControl };
+        enum class Kind { Run, Stop, Wake, Shutdown, ClientControl, ApplyPluginDeployment, PluginMaintenance, PluginRollout };
         Kind kind;
         std::string plugin_type, dataset_version, params;
         std::shared_ptr<std::promise<nlohmann::json>> completion;
@@ -120,6 +130,30 @@ class Scheduler {
     nlohmann::json SubmitDetailed(ControlCommand command, bool bounded = false);
     nlohmann::json BuildStatus() const;
     nlohmann::json HandleClientControl(const nlohmann::json&);
+    nlohmann::json ApplyPluginDeployment(const nlohmann::json&);
+    nlohmann::json HandlePluginMaintenance(const nlohmann::json&);
+    void LoadPluginMaintenance();
+    bool SavePluginMaintenance(const std::unordered_map<std::string, PluginMaintenance>&) const;
+    bool MaintenanceConfigurationMatches(const nlohmann::json&) const;
+    bool PluginUnderMaintenance(const std::string&) const;
+    void LoadPluginRollouts();
+    bool SavePluginRollouts(const nlohmann::json&) const;
+    nlohmann::json HandlePluginRollout(const nlohmann::json&);
+    nlohmann::json PluginRolloutStatus(const std::string&);
+    bool RolloutPending(const std::string&) const;
+    std::string RolloutKey(const std::string&) const;
+    bool RolloutSwitching(const std::string&) const;
+    bool RolloutAllowsWorker(const std::string&, const std::string&) const;
+    bool RolloutAllowsDeployment(const std::string&, const nlohmann::json&, const nlohmann::json&) const;
+    bool RolloutStopped(const std::string&) const;
+    bool RolloutBoundaryContains(const std::string&, const std::string&) const;
+    bool RolloutBlocksClientReservation(const std::string&) const;
+    void RestoreRolloutRunsWithoutStorage();
+    void PrepareRolloutShutdown();
+    bool RolloutAutoResume(const std::string&, const std::string&) const;
+    void UpdateRolloutRun(const std::string&, const std::string&);
+    static PluginIdentity DescribePlugin(const std::string&, const nlohmann::json&,
+                                        const std::string&);
     void LoadClientControl();
     bool SaveClientControl(const std::unordered_map<std::string, ClientReservation>&) const;
     void ExpireClientReservations();
@@ -140,6 +174,7 @@ class Scheduler {
                                      const std::string& work_fingerprint) const;
     bool ConfigurationMatches(const RunDefinition&) const;
     void SetRunStatus(const std::string&, const std::string&);
+    void SetRunStatusBestEffort(const std::string&, const std::string&);
     bool CommitStop(common::TaskPlugin*);
     bool CommitFinished(common::TaskPlugin*);
     void SendWake(const std::string&);
@@ -165,7 +200,13 @@ class Scheduler {
     bool HasInFlight(const std::string&) const;
 
     common::Config& config_;
+    // Owned by the processing thread. The shared startup Config stays immutable.
+    nlohmann::json effective_configuration_;
     std::string config_path_, instance_id_;
+    std::string startup_configuration_revision_;
+    std::unordered_map<std::string, PluginMaintenance> plugin_maintenance_;
+    nlohmann::json plugin_rollouts_ = nlohmann::json::object();
+    std::unordered_map<std::string, RunDefinition> run_definitions_;
     Server server_;
     Storage storage_;
     std::vector<LoadedPlugin> plugins_;

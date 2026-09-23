@@ -1,9 +1,12 @@
 #include "coverage/CoveragePostProcess.h"
 
 #include "coverage/CoverageUtil.h"
+#include "common/ProcessRunner.h"
+#include "common/Logger.h"
 #include "tinyxml2.h"
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <unordered_set>
 #include <utility>
@@ -51,30 +54,29 @@ bool MergeCoverageFiles(const std::string& opencppcoverage,
     if (cov_files.empty()) {
         return false;
     }
-    const auto quote = [](const std::string& value) {
-        std::string result = "\"";
-        for (const char ch : value) {
-            if (ch == '\"') {
-                result += "\\\"";
-            } else {
-                result += ch;
-            }
+    const auto run_merge = [&](const std::vector<std::string>& inputs,
+                               const std::string& output_cov,
+                               const std::string* output_xml) {
+        common::ProcessOptions options;
+        options.executable = opencppcoverage;
+        options.timeout = std::chrono::minutes(10);
+        options.arguments.push_back("--quiet");
+        for (const std::string& input : inputs)
+            options.arguments.push_back("--input_coverage=" + input);
+        options.arguments.push_back("--export_type=binary:" + output_cov);
+        if (output_xml != nullptr)
+            options.arguments.push_back("--export_type=cobertura:" + *output_xml);
+        const auto result = common::ProcessRunner::run(options);
+        if (result.timed_out) {
+            LOG_ERROR("coverage merge timed out after 10 minutes");
+            return false;
         }
-        result += '\"';
-        return result;
-    };
-    const auto build_command = [&](const std::vector<std::string>& inputs,
-                                   const std::string& output_cov,
-                                   const std::string* output_xml) {
-        std::string command = quote(opencppcoverage) + " --quiet";
-        for (const std::string& input : inputs) {
-            command += " --input_coverage=" + quote(input);
+        if (!result.started || result.exit_code != 0) {
+            LOG_ERROR("coverage merge failed: " << result.error
+                      << " exit=" << result.exit_code);
+            return false;
         }
-        command += " --export_type=binary:" + quote(output_cov);
-        if (output_xml != nullptr) {
-            command += " --export_type=cobertura:" + quote(*output_xml);
-        }
-        return command;
+        return true;
     };
 
     std::vector<std::string> inputs = cov_files;
@@ -88,17 +90,16 @@ bool MergeCoverageFiles(const std::string& opencppcoverage,
                 next_round.push_back(inputs[i]);
                 continue;
             }
-            const std::string merged_path =
-                (std::filesystem::path(out_cov).parent_path() /
-                 ("merge-r" + std::to_string(round) + "-p" + std::to_string(i / 2) + ".cov"))
-                    .string();
+            const auto merged_file =
+                std::filesystem::u8path(out_cov).parent_path() /
+                ("merge-r" + std::to_string(round) + "-p" + std::to_string(i / 2) + ".cov");
+            const std::string merged_path = merged_file.u8string();
             const std::vector<std::string> pair = {inputs[i], inputs[i + 1]};
-            const int exit_code = common::RunCommand(build_command(pair, merged_path, nullptr));
-            if (exit_code != 0) {
+            if (!run_merge(pair, merged_path, nullptr)) {
                 return false;
             }
             std::error_code exists_ec;
-            if (!std::filesystem::is_regular_file(merged_path, exists_ec) || exists_ec) {
+            if (!std::filesystem::is_regular_file(merged_file, exists_ec) || exists_ec) {
                 return false;
             }
             next_round.push_back(merged_path);
@@ -106,8 +107,7 @@ bool MergeCoverageFiles(const std::string& opencppcoverage,
         inputs.swap(next_round);
         ++round;
     }
-    const int exit_code = common::RunCommand(build_command(inputs, out_cov, &out_xml));
-    return exit_code == 0;
+    return run_merge(inputs, out_cov, &out_xml);
 }
 
 bool ParseCoverageTotals(const std::string& xml_path, std::int64_t* covered_lines,

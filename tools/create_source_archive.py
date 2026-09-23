@@ -11,6 +11,12 @@ from pathlib import Path, PurePosixPath
 
 
 EXCLUDED_DIRECTORIES = {
+
+    # These are workstation state and service-owned data, never source
+    # delivery.  Keeping them out by directory also protects future files
+    # added below the same roots.
+    ".git",
+    "service-workspace",
     ".vs",
     "build",
     "dist",
@@ -55,8 +61,14 @@ def iter_source_files(root: Path):
 
         for filename in files:
             path = current_path / filename
+            relative = normalized_relative(path, root)
+            # The runtime root contains generated launchers, PIDs, and server
+            # configuration.  Source inputs remain in its named subfolders
+            # (dataset/python/wheelhouse), which are intentionally retained.
+            if PurePosixPath(relative).parent.as_posix().casefold() == "runtime":
+                continue
             if (path.suffix.casefold() not in {".pyc", ".pid"}
-                    and normalized_relative(path, root).casefold() not in EXCLUDED_FILES):
+                    and relative.casefold() not in EXCLUDED_FILES):
                 yield path
 
 

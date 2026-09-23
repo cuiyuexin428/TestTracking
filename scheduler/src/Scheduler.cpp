@@ -8,7 +8,12 @@
 #include <utility>
 
 #include "common/Logger.h"
+#include "common/AtomicFile.h"
 #include "common/Util.h"
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace scheduler {
 namespace {
@@ -34,19 +39,56 @@ Scheduler::Scheduler(common::Config& config, std::string config_path)
       server_(config.get("server.router_endpoint", std::string("tcp://*:5555")),
               std::chrono::milliseconds(config.get("server.poll_timeout_ms", 50))) {
     server_.onHeartbeat([this](const IncomingMessage& msg) { HandleHeartbeat(msg); });
+    effective_configuration_ = nlohmann::json::object();
+    if (!config_path_.empty()) {
+        std::string bytes;
+        std::filesystem::path resolved;
+        bool readable = false;
+        try {
+            resolved = std::filesystem::u8path(config_path_);
+            readable = common::ReadCompleteFile(resolved, &bytes, 16 * 1024 * 1024);
+        } catch (const std::system_error&) {
+            // Older embedders still pass Windows ANSI paths, as Config::load
+            // historically allowed. Normalize once at this boundary.
+        }
+#ifdef _WIN32
+        if (!readable) {
+            const int length = MultiByteToWideChar(CP_ACP, 0, config_path_.data(),
+                                                   static_cast<int>(config_path_.size()), nullptr, 0);
+            if (length > 0) {
+                std::wstring wide(static_cast<size_t>(length), L'\0');
+                MultiByteToWideChar(CP_ACP, 0, config_path_.data(),
+                                    static_cast<int>(config_path_.size()), wide.data(), length);
+                resolved = std::filesystem::path(wide);
+                readable = common::ReadCompleteFile(resolved, &bytes, 16 * 1024 * 1024);
+            }
+        }
+#endif
+        if (!readable)
+            throw std::runtime_error("Scheduler: cannot snapshot its configuration file");
+        config_path_ = std::filesystem::absolute(resolved).u8string();
+        startup_configuration_revision_ = common::Sha256Hex(bytes);
+        effective_configuration_ = nlohmann::json::parse(bytes);
+    }
+    for (const auto* section : {"server", "plugins"}) {
+        if (const auto* value = config_.find(section)) effective_configuration_[section] = *value;
+        else effective_configuration_.erase(section);
+    }
 }
 Scheduler::~Scheduler() {
     stop();
 }
 
 void Scheduler::start() {
+    LoadPluginMaintenance();
+    LoadPluginRollouts();
     LoadClientControl();
     if (!LoadPlugins()) throw std::runtime_error("Scheduler: plugin loading failed");
     const auto connection = config_.get("server.db_conn", std::string());
     if (!connection.empty()) {
         if (!storage_.init(connection)) throw std::runtime_error("Scheduler: storage init failed");
         RestoreRuns();
-    }
+    } else RestoreRolloutRunsWithoutStorage();
     server_.start();
     running_.store(true);
     accepting_.store(true);
@@ -86,6 +128,7 @@ void Scheduler::RestoreRuns() {
     };
     std::unordered_set<std::string> restored;
     for (const auto& run : runs) {
+        if (PluginUnderMaintenance(run.plugin_type)) continue;
         const auto plugin = plugins_by_type_.find(run.plugin_type);
         if (plugin == plugins_by_type_.end()) {
             // The plugin may simply be disabled in this configuration, so keep
@@ -100,6 +143,17 @@ void Scheduler::RestoreRuns() {
             run.run_id, run.plugin_type, run.dataset_version, run.params, run.work_fingerprint,
             run.force_rerun, run.force_rerun_reason, run.rerun_of, run.worker_ids,
             run.execution_fingerprint};
+        run_definitions_[run.run_id] = definition;
+        if (run.status == "stopped" && RolloutBoundaryContains(run.plugin_type, run.run_id) &&
+            !RolloutAutoResume(run.plugin_type, run.run_id)) {
+            // The DB stop may have committed immediately before sidecar
+            // publication failed. Reconcile before any old queued run can
+            // activate and supersede this explicitly stopped batch.
+            UpdateRolloutRun(run.run_id, "stopped");
+            run_states_[run.run_id] = {run.plugin_type, run.work_fingerprint, "stopped"};
+            run_order_.push_back(run.run_id);
+            continue;
+        }
         if (!ConfigurationMatches(definition)) {
             abort_recovery("Scheduler: recovery blocked; original progress retained: "
                            "plugin configuration or manifest differs from saved run " + run.run_id +
@@ -131,6 +185,7 @@ void Scheduler::RestoreRuns() {
         }
         active_runs_[plugin->second] = {run.run_id, run.plugin_type, false, run.worker_ids};
         run_states_[run.run_id] = {run.plugin_type, run.work_fingerprint, "running"};
+        UpdateRolloutRun(run.run_id, "running");
         run_order_.push_back(run.run_id);
         restored.insert(run.plugin_type);
         LOG_INFO("run restored: " << run.run_id << " plugin_type=" << run.plugin_type);
@@ -147,6 +202,7 @@ void Scheduler::RestoreRuns() {
             {run.run_id, run.plugin_type, run.dataset_version, run.params,
              run.work_fingerprint, run.force_rerun, run.force_rerun_reason, run.rerun_of,
              run.worker_ids, run.execution_fingerprint});
+        run_definitions_[run.run_id] = queued_runs_[plugin->second].back();
         run_states_[run.run_id] = {run.plugin_type, run.work_fingerprint, "queued"};
         run_order_.push_back(run.run_id);
     }
@@ -258,6 +314,12 @@ void Scheduler::RunProcessing() {
 nlohmann::json Scheduler::HandleCommand(const ControlCommand& command) {
     if (command.kind == ControlCommand::Kind::ClientControl)
         return HandleClientControl(command.client_control);
+    if (command.kind == ControlCommand::Kind::ApplyPluginDeployment)
+        return ApplyPluginDeployment(command.client_control);
+    if (command.kind == ControlCommand::Kind::PluginMaintenance)
+        return HandlePluginMaintenance(command.client_control);
+    if (command.kind == ControlCommand::Kind::PluginRollout)
+        return HandlePluginRollout(command.client_control);
     const auto reject = [](const std::string& error) -> nlohmann::json {
         return {{"ok", false}, {"error", error}, {"http_status", 409}};
     };
@@ -290,6 +352,7 @@ nlohmann::json Scheduler::HandleCommand(const ControlCommand& command) {
             return {{"ok", true}};
         case ControlCommand::Kind::Shutdown: {
             shutting_down_ = true;
+            PrepareRolloutShutdown();
             bool ok = true;
             for (const auto& type : pluginTypes()) {
                 if (active_runs_.count(plugins_by_type_.at(type))) ok = HandleStopRun(type) && ok;
@@ -298,6 +361,9 @@ nlohmann::json Scheduler::HandleCommand(const ControlCommand& command) {
             return {{"ok", ok}};
         }
         case ControlCommand::Kind::ClientControl:
+        case ControlCommand::Kind::ApplyPluginDeployment:
+        case ControlCommand::Kind::PluginMaintenance:
+        case ControlCommand::Kind::PluginRollout:
             break;
     }
     return reject("unknown command");
@@ -309,6 +375,10 @@ nlohmann::json Scheduler::HandleCreateRun(const ControlCommand& request) {
     const auto reject = [](const std::string& error) -> nlohmann::json {
         return {{"ok", false}, {"error", error}, {"http_status", 409}};
     };
+    if (PluginUnderMaintenance(command.plugin_type))
+        return reject("plugin is reserved for maintenance; finish installation and restart scheduler: " + command.plugin_type);
+    if (RolloutPending(command.plugin_type))
+        return reject("plugin update is pending; existing batches continue and new batches wait for the new target");
     const auto found = plugins_by_type_.find(command.plugin_type);
     if (found == plugins_by_type_.end()) {
         LOG_ERROR("createRun: no plugin for plugin_type " << command.plugin_type);
@@ -379,6 +449,7 @@ nlohmann::json Scheduler::HandleCreateRun(const ControlCommand& request) {
     }
 
     queued_runs_[plugin].push_back(run);
+    run_definitions_[run.run_id] = run;
     run_states_[run.run_id] = {run.plugin_type, run.work_fingerprint, "queued"};
     run_order_.push_back(run.run_id);
     if (!active_runs_.count(plugin)) StartNextRun(plugin);
@@ -405,6 +476,9 @@ std::string Scheduler::WorkFingerprint(const ControlCommand& command) const {
         {"manifest_sha256", manifest_sha256},
         {"dataset_version", command.dataset_version},
         {"params_text", command.params}};
+    const auto rollout_key = RolloutKey(command.plugin_type);
+    if (plugin_rollouts_.contains(rollout_key) && plugin_rollouts_.at(rollout_key).at("admission_target") != "")
+        identity["deployment_target_id"] = plugin_rollouts_.at(rollout_key).at("admission_target");
     return common::Sha256Hex(identity.dump());
 }
 
@@ -432,12 +506,30 @@ bool Scheduler::ConfigurationMatches(const RunDefinition& run) const {
 }
 
 void Scheduler::SetRunStatus(const std::string& run_id, const std::string& status) {
+    UpdateRolloutRun(run_id, status);
+    const auto found = run_states_.find(run_id);
+    if (found != run_states_.end()) found->second.status = status;
+}
+
+void Scheduler::SetRunStatusBestEffort(const std::string& run_id, const std::string& status) {
+    try {
+        SetRunStatus(run_id, status);
+    } catch (const std::exception& error) {
+        // The database transition is already durable.  A rollout sidecar is
+        // repaired by the next status reconciliation; it must not strand the
+        // in-memory queue behind a run that has already reached a terminal
+        // state.
+        LOG_ERROR("run status sidecar publication failed for " << run_id << ": " << error.what());
+    } catch (...) {
+        LOG_ERROR("run status sidecar publication failed for " << run_id << ": unknown exception");
+    }
     const auto found = run_states_.find(run_id);
     if (found != run_states_.end()) found->second.status = status;
 }
 
 bool Scheduler::StartNextRun(common::TaskPlugin* plugin) {
-    if (shutting_down_ || active_runs_.count(plugin)) return true;
+    if (shutting_down_ || active_runs_.count(plugin) || PluginUnderMaintenance(plugin->pluginType())) return true;
+    if (RolloutSwitching(plugin->pluginType()) || RolloutStopped(plugin->pluginType())) return true;
     auto& queue = queued_runs_[plugin];
     while (!queue.empty() && !shutting_down_) {
         auto& next = queue.front();
@@ -457,7 +549,7 @@ bool Scheduler::StartNextRun(common::TaskPlugin* plugin) {
             LOG_ERROR("createRun: cannot begin planning queued run " << run.run_id);
             return false;
         }
-        SetRunStatus(run.run_id, "planning");
+        SetRunStatusBestEffort(run.run_id, "planning");
 
         bool planned = false;
         try {
@@ -465,6 +557,7 @@ bool Scheduler::StartNextRun(common::TaskPlugin* plugin) {
             selected_clients.erase(std::remove_if(selected_clients.begin(), selected_clients.end(),
                 [this, &run](const common::ClientInfo& client) {
                     return client.plugin_type != run.plugin_type ||
+                           !RolloutAllowsWorker(run.plugin_type, client.identity) ||
                            !IsSelectedWorker(client.identity, run.worker_ids);
                 }), selected_clients.end());
             planned = plugin->plan({run.run_id, run.dataset_version, run.params}, selected_clients);
@@ -477,7 +570,7 @@ bool Scheduler::StartNextRun(common::TaskPlugin* plugin) {
             if (storage_.enabled() && !storage_.FinishRun(run.run_id, "failed"))
                 LOG_ERROR("createRun: cannot mark failed run " << run.run_id
                                                                 << "; startup recovery will close it");
-            SetRunStatus(run.run_id, "failed");
+            SetRunStatusBestEffort(run.run_id, "failed");
             try {
                 plugin->cancel();
             } catch (const std::exception& error) {
@@ -496,7 +589,7 @@ bool Scheduler::StartNextRun(common::TaskPlugin* plugin) {
             LOG_ERROR("createRun: cannot activate run " << run.run_id << "; no task dispatched");
             if (!storage_.FinishRun(run.run_id, "failed"))
                 LOG_ERROR("createRun: cannot mark unactivated run " << run.run_id << " failed");
-            SetRunStatus(run.run_id, "failed");
+            SetRunStatusBestEffort(run.run_id, "failed");
             try {
                 plugin->cancel();
             } catch (const std::exception& error) {
@@ -510,14 +603,14 @@ bool Scheduler::StartNextRun(common::TaskPlugin* plugin) {
             continue;
         }
 
-        if (!storage_.enabled()) {
-            for (auto& state : run_states_)
-                if (state.second.plugin_type == run.plugin_type && state.second.status == "stopped")
-                    state.second.status = "cancelled";
-        }
+        // The successful database activation also superseded old stopped runs.
+        // Keep the runtime status/maintenance guards consistent with that commit.
+        for (auto& state : run_states_)
+            if (state.second.plugin_type == run.plugin_type && state.second.status == "stopped")
+                state.second.status = "cancelled";
         queue.pop_front();
         active_runs_[plugin] = {run.run_id, run.plugin_type, false, run.worker_ids};
-        SetRunStatus(run.run_id, "running");
+        SetRunStatusBestEffort(run.run_id, "running");
         active_run_count_.store(active_runs_.size());
         LOG_INFO("run started: " << run.run_id << " plugin_type=" << run.plugin_type);
         SendWake(run.plugin_type);
@@ -535,8 +628,8 @@ bool Scheduler::CancelQueuedRun(common::TaskPlugin* plugin, const std::string& r
     });
     if (found == queue.end()) return false;
     if (storage_.enabled() && !storage_.CancelQueuedRun(run_id, found->plugin_type)) return false;
+    SetRunStatusBestEffort(run_id, "cancelled");
     queue.erase(found);
-    SetRunStatus(run_id, "cancelled");
     if (!active_runs_.count(plugin)) StartNextRun(plugin);
     return true;
 }
@@ -594,9 +687,11 @@ bool Scheduler::CommitStop(common::TaskPlugin* plugin) {
     if (HasInFlight(run->second.run_id) || !plugin->saveCheckpoint(run->second.run_id))
         return false;
     if (storage_.enabled() && !storage_.FinishRun(run->second.run_id, "stopped")) return false;
+    // Publishing the rollout boundary can fail independently of the database.
+    // Retain the plugin checkpoint until that retryable publication succeeds.
+    SetRunStatus(run->second.run_id, "stopped");
     plugin->cancel();
     LOG_INFO("run stopped: " << run->second.run_id << " plugin_type=" << run->second.plugin_type);
-    SetRunStatus(run->second.run_id, "stopped");
     active_runs_.erase(run);
     active_run_count_.store(active_runs_.size());
     StartNextRun(plugin);
@@ -646,7 +741,16 @@ void Scheduler::ReclaimClientTasks(const std::string& identity, const std::strin
 }
 
 void Scheduler::RunTimeoutChecks() {
-    ExpireClientReservations();
+    try {
+        ExpireClientReservations();
+    } catch (const std::exception& error) {
+        // Reservation persistence is retryable.  Do not skip task reclaim,
+        // run completion, or queue advancement when its sidecar is briefly
+        // unavailable; the next maintenance tick retries expiration.
+        LOG_ERROR("cannot expire client reservations; retaining state for retry: " << error.what());
+    } catch (...) {
+        LOG_ERROR("cannot expire client reservations; retaining state for retry");
+    }
     std::vector<std::string> received;
     for (const auto& pair : in_flight_)
         if (pair.second.received) received.push_back(pair.first);
@@ -773,39 +877,18 @@ bool Scheduler::LoadPlugins() {
             destroy(plugin);
             return false;
         }
-        std::string manifest_sha256;
-        const std::string manifest_path = entry.value("stp_manifest", std::string());
-        if (!manifest_path.empty() && !common::FileSha256Hex(manifest_path, &manifest_sha256))
-            LOG_WARN("plugin " << name << ": manifest is not readable for deployment identity: "
-                               << manifest_path);
-        nlohmann::json versions = nlohmann::json::object();
-        for (const auto* key : {"expected_program_version", "expected_baseline_program_version",
-                                "expected_candidate_program_version"})
-            if (entry.contains(key) && entry[key].is_string()) versions[key] = entry[key];
-        const nlohmann::json deployment = {
-            {"plugin_type", plugin_type},
-            {"plugin_binary_sha256", plugin_sha256},
-            {"expected_program_versions", versions}};
-        deployment_identities_[plugin_type] = common::Sha256Hex(deployment.dump());
-        configuration_identities_[plugin_type] = common::Sha256Hex(entry.dump());
-        manifest_paths_[plugin_type] = manifest_path;
-        bool duplicate_protection = true;
-        if (plugin_type == "coverage")
-            duplicate_protection = versions.contains("expected_program_version") &&
-                                   !versions["expected_program_version"].get<std::string>().empty();
-        else if (plugin_type == "stpcompare")
-            duplicate_protection = versions.contains("expected_baseline_program_version") &&
-                                   versions.contains("expected_candidate_program_version") &&
-                                   !versions["expected_baseline_program_version"].get<std::string>().empty() &&
-                                   !versions["expected_candidate_program_version"].get<std::string>().empty();
-        duplicate_protection_enabled_[plugin_type] = duplicate_protection;
-        if (!duplicate_protection)
+        const auto identity = DescribePlugin(plugin_type, entry, plugin_sha256);
+        deployment_identities_[plugin_type] = identity.deployment;
+        configuration_identities_[plugin_type] = identity.configuration;
+        manifest_paths_[plugin_type] = identity.manifest;
+        duplicate_protection_enabled_[plugin_type] = identity.duplicate_protection;
+        if (!identity.duplicate_protection)
             LOG_WARN("plugin " << name << ": duplicate protection is disabled because expected "
                                << "program version fields are incomplete");
         plugins_by_type_[plugin_type] = plugin;
 
         plugins_.push_back({std::move(library), std::unique_ptr<common::TaskPlugin, PluginDeleter>(
-                                                    plugin, PluginDeleter{destroy})});
+                                                    plugin, PluginDeleter{destroy}), name, plugin_sha256});
         LOG_INFO("plugin loaded: " << name << " plugin_type=" << plugin->pluginType());
     }
     return true;

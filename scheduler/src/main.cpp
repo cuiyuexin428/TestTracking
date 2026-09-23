@@ -27,11 +27,10 @@ const char* kDefaultConfigPath = "config/scheduler.json";
 
 std::string ExeDirectory(const char* argv0) {
 #ifdef _WIN32
-    char buf[MAX_PATH] = {};
-    GetModuleFileNameA(nullptr, buf, MAX_PATH);
-    const std::string path(buf);
-    const size_t pos = path.find_last_of("\\/");
-    return pos == std::string::npos ? "." : path.substr(0, pos);
+    std::vector<wchar_t> buffer(32768);
+    const auto length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    return length && length < buffer.size()
+        ? std::filesystem::path(std::wstring(buffer.data(), length)).parent_path().u8string() : ".";
 #else
     char buf[4096] = {};
     const ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
@@ -49,7 +48,7 @@ std::string ExeDirectory(const char* argv0) {
 
 bool FileExists(const std::string& path) {
     std::error_code ec;
-    return std::filesystem::exists(path, ec) && !ec;
+    return std::filesystem::exists(std::filesystem::u8path(path), ec) && !ec;
 }
 
 std::string ResolveConfigPath(int argc, char* argv[]) {
@@ -109,7 +108,7 @@ std::string TrimLeft(const std::string& s) {
 
 }  // namespace
 
-int main(int argc, char* argv[]) {
+int RunMain(int argc, char* argv[]) {
     const std::string config_path = ResolveConfigPath(argc, argv);
 
     try {
@@ -130,7 +129,8 @@ int main(int argc, char* argv[]) {
             common::Logger::instance().setFile(log_file);
         }
 
-        scheduler::Scheduler sched(config, std::filesystem::absolute(config_path).string());
+        scheduler::Scheduler sched(config,
+            std::filesystem::absolute(std::filesystem::u8path(config_path)).u8string());
         sched.start();
         LOG_INFO("scheduler started, config=" << config_path);
         PrintHelp();
@@ -190,3 +190,16 @@ int main(int argc, char* argv[]) {
     }
     return 0;
 }
+
+#ifdef _WIN32
+int wmain(int argc, wchar_t* argv[]) {
+    std::vector<std::string> arguments;
+    std::vector<char*> pointers;
+    for (int index = 0; index < argc; ++index)
+        arguments.push_back(std::filesystem::path(argv[index]).u8string());
+    for (auto& argument : arguments) pointers.push_back(argument.data());
+    return RunMain(argc, pointers.data());
+}
+#else
+int main(int argc, char* argv[]) { return RunMain(argc, argv); }
+#endif

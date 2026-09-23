@@ -186,9 +186,17 @@ class ServerPluginInstaller:
         self.management = management
         self.root = artifacts.root / "server-plugins"
         self.journal = self.root / "pending-install.json"
+        self.maintenance_journal = self.root / "pending-maintenance.json"
         self.transaction_warning: str | None = None
         with self.management._lock:
             self.recovered_configuration = self._recover_transaction()
+            try:
+                self._recover_maintenance()
+            except ManagementError as error:
+                # A stopped scheduler must not prevent result browsing or
+                # service startup. The durable token blocks further installs;
+                # the next install request retries recovery before any writes.
+                self.transaction_warning = str(error)
 
     def _configuration(self) -> tuple[Path, Path, bytes, dict[str, Any], bytes, dict[str, Any]]:
         scheduler = self.management._path("scheduler")
@@ -260,6 +268,7 @@ class ServerPluginInstaller:
             raise ManagementError("operator_id 必须是不超过 128 字符的字符串")
         with self.management._lock:
             self._recover_transaction()
+            self._recover_maintenance()
             if self.journal.exists():
                 raise ManagementError("上次插件安装已完成，但事务日志尚未清理，请先检查文件写入权限", 409)
             scheduler, result, scheduler_raw, scheduler_config, result_raw, result_config = self._configuration()
@@ -267,11 +276,15 @@ class ServerPluginInstaller:
                     or body.get("result_service_revision") != _revision(result_raw)):
                 raise ManagementError("配置已被其他操作修改，请重新预览安装计划", 409)
             plugin = definition["plugin"]
-            self.management.require_plugin_idle(plugin)
+            runtime_keys = self.management.get_status().get("plugin_config_keys", {})
+            runtime_plugin = next((name for name, key in runtime_keys.items() if key == plugin), plugin)
+            self.management.require_plugin_idle(runtime_plugin)
             installation_id = uuid.uuid4().hex
             destination = self.root / "installations" / installation_id
             destination.mkdir(parents=True)
             package = destination / "package"
+            maintenance_started = False
+            configuration_committed = False
             try:
                 self._extract(archive_path, files, package)
                 self._snapshot_resources(result_config, result.parent, definition, package, destination)
@@ -291,9 +304,23 @@ class ServerPluginInstaller:
                 scheduler_encoded, result_encoded = _json_bytes(next_scheduler), _json_bytes(next_result)
                 # Recheck after preparing the immutable tree. No active or queued
                 # work may appear between a slow extraction and activation.
-                self.management.require_plugin_idle(plugin)
+                self.management.require_plugin_idle(runtime_plugin)
                 if (scheduler.read_bytes() != scheduler_raw or result.read_bytes() != result_raw):
                     raise ManagementError("配置在准备插件期间已变化，请重新预览", 409)
+                maintenance = {"plugin": runtime_plugin, "token": installation_id,
+                               "original_revision": _revision(scheduler_raw),
+                               "committed_revision": _revision(scheduler_encoded)}
+                # Persist ownership before calling the scheduler: a lost HTTP
+                # response or service crash must leave a recoverable token.
+                self.management._atomic_write(self.maintenance_journal, _json_bytes(maintenance))
+                try:
+                    self.management.plugin_maintenance("begin_plugin_maintenance", plugin=runtime_plugin,
+                        token=installation_id, revision=maintenance["original_revision"])
+                    maintenance_started = True
+                except ManagementError as error:
+                    if error.status < 500:
+                        self.maintenance_journal.unlink(missing_ok=True)
+                    raise
                 record = {"installation_id": installation_id, "artifact_id": artifact["artifact_id"],
                           "sha256": artifact["sha256"], "plugin": plugin,
                           "version": definition["version"], "operator_id": operator,
@@ -304,6 +331,13 @@ class ServerPluginInstaller:
                 self.management._atomic_write(destination / "installation.json", _json_bytes(record))
                 warnings = self._commit_configuration(scheduler, result, scheduler_raw, result_raw,
                                                       scheduler_encoded, result_encoded, destination)
+                configuration_committed = True
+                try:
+                    self._recover_maintenance()
+                except ManagementError:
+                    # The native begin barrier still blocks new work. Never
+                    # roll back a committed configuration on a lost end reply.
+                    warnings.append("配置已提交；调度器维护状态等待确认，重启前保持禁止创建该插件任务。")
                 return {**record, "installed": True, "installation_path": str(destination),
                         "enabled": bool(proposed.get("enabled", False)),
                         "warnings": warnings,
@@ -311,11 +345,42 @@ class ServerPluginInstaller:
             except Exception as exc:
                 # Keep failed trees for diagnosis if a journal still needs
                 # recovery. Otherwise they are unreferenced and safe to remove.
-                if not self.journal.exists():
+                if maintenance_started and not configuration_committed and not self.journal.exists():
+                    # Only release after exact original bytes were restored.
+                    try:
+                        self._recover_maintenance()
+                    except ManagementError:
+                        pass  # Persisted token is retried on the next request.
+                if not self.journal.exists() and not configuration_committed:
                     shutil.rmtree(destination, ignore_errors=True)
                 if isinstance(exc, ManagementError):
                     raise
                 raise ManagementError("插件安装失败，原配置已保留或恢复：" + str(exc), 500) from exc
+
+    def _recover_maintenance(self) -> None:
+        if not self.maintenance_journal.exists():
+            return
+        try:
+            record = _read_json(self.maintenance_journal.read_bytes(), "插件维护恢复记录")
+            path = self.management._path("scheduler")
+            if path is None:
+                raise ValueError("missing scheduler path")
+            revision = _revision(path.read_bytes())
+            if revision == record["committed_revision"]:
+                committed = True
+            elif revision == record["original_revision"] and not self.journal.exists():
+                committed = False
+            else:
+                raise ManagementError("插件维护事务尚未恢复，不能释放调度器屏障", 409)
+            result = self.management.plugin_maintenance("end_plugin_maintenance", plugin=record["plugin"],
+                token=record["token"], revision=revision, committed=committed)
+            if not committed and result.get("pending_restart"):
+                self.transaction_warning = "原配置已恢复；调度器曾加载替换配置，需要重启后才能继续该插件任务。"
+            self.maintenance_journal.unlink()
+        except ManagementError:
+            raise
+        except (OSError, KeyError, ValueError) as error:
+            raise ManagementError("插件维护状态尚未确认，请保留 pending-maintenance.json 并检查调度器", 503) from error
 
     def _scheduler_path(self, path: Path) -> str:
         return self._path_from(path, Path(self.config.workspace)) if self.config.workspace else path.as_posix()

@@ -16,7 +16,9 @@ class CoverageResultStore {
 public:
     virtual ~CoverageResultStore()=default;
     virtual bool init(const std::string& config)=0;
-    virtual bool publish(const FileCoverageResult& result)=0;
+    // On success, successful/points/detail describe the persisted winner,
+    // including when another attempt committed while this one was executing.
+    virtual bool publish(FileCoverageResult& result)=0;
     virtual bool loadFileCoverage(const std::string& run,const std::string& file,
                                   std::set<std::uint64_t>* points)=0;
     virtual bool hasFileCov(const std::string& run,const std::string& file)=0;

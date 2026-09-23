@@ -289,7 +289,8 @@ private:
             (mode_ == Mode::RollingBack ? "error" : (workers_.empty() ? "unconfigured" : (all_ready ? "ready" : "starting")));
         Json heartbeat = {{"instance_id", instance_id_}, {"hostname", hostname_}, {"state", status},
             {"plugin_keys", std::move(keys)}, {"agent_version", "2"},
-            {"active_revision", active_.value("revision", std::string())}, {"update_window_open", update_window_open_}};
+            {"active_revision", active_.value("revision", std::string())}, {"update_window_open", update_window_open_},
+            {"capabilities", Json::array({"deployment_target_id_v1"})}};
         std::lock_guard<std::mutex> lock(heartbeat_mutex_);
         heartbeat_snapshot_ = std::move(heartbeat);
     }

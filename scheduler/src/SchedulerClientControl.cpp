@@ -32,11 +32,12 @@ void Scheduler::LoadClientControl() {
     // Production always supplies its resolved config path. Embedders without a
     // path cannot publish durable deployment reservations into an arbitrary cwd.
     if (config_path_.empty()) return;
-    client_control_path_ = (std::filesystem::absolute(config_path_).parent_path() /
-                            "runtime" / "client_control.json").string();
-    if (!std::filesystem::exists(client_control_path_)) return;
+    client_control_path_ = (std::filesystem::u8path(config_path_).parent_path() /
+                            "runtime" / "client_control.json").u8string();
+    const auto state_path = std::filesystem::u8path(client_control_path_);
+    if (!std::filesystem::exists(state_path)) return;
     std::string bytes;
-    if (!common::ReadCompleteFile(client_control_path_, &bytes, 4 * 1024 * 1024))
+    if (!common::ReadCompleteFile(state_path, &bytes, 4 * 1024 * 1024))
         throw std::runtime_error("cannot read client control state: " + client_control_path_);
     const auto saved = nlohmann::json::parse(bytes, nullptr, false);
     if (!saved.is_object() || saved.value("version", 0) != 1 ||
@@ -69,6 +70,7 @@ void Scheduler::LoadClientControl() {
                 value.at("agent_version").get<std::string>(), value.at("active_revision").get<std::string>(),
                 value.at("plugin_keys").get<std::vector<std::string>>(), {},
                 value.at("update_window_open").get<bool>(), value.at("last_seen_at_ms").get<long long>(), false};
+            agents_.at(it.key()).capabilities = value.value("capabilities", std::vector<std::string>{});
         }
     }
 }
@@ -86,9 +88,9 @@ bool Scheduler::SaveClientControl(
         saved["agents"][entry.first] = {{"instance_id", agent.instance_id}, {"hostname", agent.hostname},
             {"state", agent.state}, {"agent_version", agent.agent_version}, {"active_revision", agent.active_revision},
             {"plugin_keys", agent.plugin_keys}, {"update_window_open", agent.update_window_open},
-            {"last_seen_at_ms", agent.last_seen_at_ms}};
+            {"last_seen_at_ms", agent.last_seen_at_ms}, {"capabilities", agent.capabilities}};
     }
-    return common::WriteAtomicFile(client_control_path_, saved.dump(2));
+    return common::WriteAtomicFile(std::filesystem::u8path(client_control_path_), saved.dump(2));
 }
 
 void Scheduler::ExpireClientReservations() {
@@ -151,6 +153,7 @@ void Scheduler::AppendAgentStatus(nlohmann::json& result) const {
             {"online", found != agents_.end() && agent.seen_since_start && age < timeout}, {"last_seen_age_ms", age},
             {"busy", PhysicalClientBusy(id)}, {"plugin_keys", agent.plugin_keys},
             {"agent_version", agent.agent_version}, {"active_revision", agent.active_revision},
+            {"capabilities", agent.capabilities},
             {"update_window_open", agent.update_window_open},
             {"reservation_id", reservation == client_reservations_.end() ? "" : reservation->second.reservation_id},
             {"reservation_committed", reservation != client_reservations_.end() && reservation->second.committed}});
@@ -177,6 +180,11 @@ nlohmann::json Scheduler::HandleClientControl(const nlohmann::json& request) {
             if (!ValidIdentity(key)) return Error("plugin_keys must contain nonempty plugin identities");
         if (request.contains("update_window_open") && !request["update_window_open"].is_boolean())
             return Error("update_window_open must be a boolean");
+        if (request.contains("capabilities")) {
+            if (!request["capabilities"].is_array()) return Error("capabilities must be an array");
+            for (const auto& value : request["capabilities"])
+                if (!ValidIdentity(value)) return Error("capabilities must contain identities");
+        }
         const auto id = request["client_id"].get<std::string>();
         const auto previous = agents_.find(id);
         const bool existed = previous != agents_.end();
@@ -185,6 +193,7 @@ nlohmann::json Scheduler::HandleClientControl(const nlohmann::json& request) {
             request.value("agent_version", std::string()), request.value("active_revision", std::string()),
             request["plugin_keys"].get<std::vector<std::string>>(), Clock::now(),
             request.value("update_window_open", false), NowMilliseconds(), true};
+        agents_.at(id).capabilities = request.value("capabilities", std::vector<std::string>{});
         if (!SaveClientControl(client_reservations_)) {
             if (existed) agents_[id] = old;
             else agents_.erase(id);
@@ -194,6 +203,8 @@ nlohmann::json Scheduler::HandleClientControl(const nlohmann::json& request) {
     }
     if (!request.contains("reservation_id") || !ValidIdentity(request["reservation_id"]))
         return Error("reservation_id must be a nonempty identity of at most 255 bytes");
+    if (request.contains("require_update_window_open") && !request["require_update_window_open"].is_boolean())
+        return Error("require_update_window_open must be a boolean");
     if (!request.contains("client_ids") || !request["client_ids"].is_array() || request["client_ids"].empty())
         return Error("client_ids must be a nonempty array of client identities");
     std::set<std::string> ids;
@@ -217,7 +228,10 @@ nlohmann::json Scheduler::HandleClientControl(const nlohmann::json& request) {
                 Clock::now() - agent->second.last_seen >= timeout)
                 reason = "offline";
             else if (PhysicalClientBusy(id)) reason = "busy";
+            else if (RolloutBlocksClientReservation(id)) reason = "old_plugin_batches_pending";
             else if (agent->second.state == "updating") reason = "updating";
+            else if (request.value("require_update_window_open", false) && !agent->second.update_window_open)
+                reason = "waiting_window";
             // A registered Agent can repair workers whose startup is blocked
             // by the server's newly bound program version. The authoritative
             // busy checks above still protect every plugin on that machine.

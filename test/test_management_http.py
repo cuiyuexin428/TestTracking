@@ -44,7 +44,7 @@ class ManagementHTTPTests(unittest.TestCase):
 
     def test_management_routes_delegate_and_preserve_rejections(self):
         with patch.object(self.service.management, 'get_status', return_value={'online': True}):
-            self.assertEqual((200, {'online': True}), self.request('/api/scheduler'))
+            self.assertEqual((200, {'online': True, 'run_datasets': {}, 'rollout_blocks': {}}), self.request('/api/scheduler'))
         command = {'action': 'stop', 'plugin_type': 'coverage', 'run_id': 'old-run'}
         with patch.object(self.service.management, 'command',
                           side_effect=ManagementError('run changed', status=409)) as execute:
@@ -54,6 +54,34 @@ class ManagementHTTPTests(unittest.TestCase):
         with patch.object(self.service.management, 'logs', return_value={'lines': ['hello']}) as logs:
             self.assertEqual(200, self.request('/api/logs?file=scheduler.log&limit=20')[0])
             logs.assert_called_once_with({'file': ['scheduler.log'], 'limit': ['20']})
+
+    def test_run_dataset_choices_use_only_effective_online_configuration(self):
+        effective = {'online': True, 'plugins': ['coverage', 'scheduler-probe'],
+                     'plugin_config_keys': {'coverage': 'coverage', 'scheduler-probe': 'probe'},
+                     'configuration': {'plugins': {
+                         'coverage': {'enabled': True, 'expected_dataset_version': 'sha256:current'},
+                         'probe': {'enabled': True, 'expected_dataset_version': 'effective-custom'},
+                         'disabled': {'enabled': False, 'expected_dataset_version': 'unused'}}}}
+        catalog = [{'artifact_id': 'source', 'name': 'parts', 'version': '2', 'metadata': {}},
+                   {'artifact_id': 'managed', 'metadata': {'managed': True,
+                    'source_artifact_id': 'source', 'dataset_version': 'sha256:current'}}]
+        with patch.object(self.service.management, 'get_status', return_value=effective), \
+             patch.object(self.service.management, 'get_config', side_effect=AssertionError('must not read pending disk config')), \
+             patch.object(self.service.artifacts, 'list', return_value=catalog):
+            status, result = self.request('/api/scheduler')
+        self.assertEqual(200, status)
+        self.assertEqual({'dataset_version': 'sha256:current', 'name': 'parts', 'version': '2',
+                          'artifact_id': 'source'}, result['run_datasets']['coverage'])
+        self.assertEqual('effective-custom', result['run_datasets']['scheduler-probe']['dataset_version'])
+        self.assertNotIn('probe', result['run_datasets'])
+        with patch.object(self.service.management, 'get_status', return_value={**effective, 'online': False}):
+            self.assertEqual({}, self.request('/api/scheduler')[1]['run_datasets'])
+
+    def test_aliases_without_a_runtime_mapping_are_not_guessed(self):
+        with patch.object(self.service.management, 'get_status', return_value={
+                'online': True, 'plugins': ['scheduler-probe'], 'configuration': {'plugins': {
+                    'probe': {'enabled': True, 'expected_dataset_version': 'custom'}}}}):
+            self.assertEqual({}, self.request('/api/scheduler')[1]['run_datasets'])
 
     def test_duplicate_metadata_survives_scheduler_proxy_and_public_http(self):
         class SchedulerHandler(BaseHTTPRequestHandler):

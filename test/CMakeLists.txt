@@ -45,12 +45,15 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME test_plugin_views COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/test_plugin_views.py -v)
     set_tests_properties(test_plugin_views PROPERTIES TIMEOUT 30)
-    foreach(name dsh_proxy reports analysis_catalog python_analysis_dependencies ai_providers management management_http artifacts deployments fleet program_bindings server_plugins)
+    foreach(name dsh_proxy reports analysis_catalog python_analysis_dependencies ai_providers management management_http artifacts deployments fleet program_bindings server_plugins deployment_profiles deployment_profiles_http deployment_rollouts deployment_ai)
         add_test(NAME test_${name} COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/test_${name}.py -v)
         set_tests_properties(test_${name} PROPERTIES TIMEOUT 90)
     endforeach()
     if(WIN32)
+        add_test(NAME test_deployment_profile_update COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_deployment_profile_update.py -v)
+        set_tests_properties(test_deployment_profile_update PROPERTIES TIMEOUT 90)
         add_test(NAME test_client_bootstrap COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/test_client_bootstrap.py --client $<TARGET_FILE:client> -v)
         set_tests_properties(test_client_bootstrap PROPERTIES TIMEOUT 90)
@@ -72,6 +75,9 @@ if(NodeJS_EXECUTABLE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_result_web.js"
     add_test(NAME test_result_web COMMAND ${NodeJS_EXECUTABLE}
         --test ${CMAKE_CURRENT_SOURCE_DIR}/test_result_web.js)
     set_tests_properties(test_result_web PROPERTIES TIMEOUT 30)
+    add_test(NAME test_deployment_profiles_web COMMAND ${NodeJS_EXECUTABLE}
+        --test ${CMAKE_CURRENT_SOURCE_DIR}/test_deployment_profiles_web.js)
+    set_tests_properties(test_deployment_profiles_web PROPERTIES TIMEOUT 30)
 endif()
 add_executable(test_client_runtime test_client_runtime.cpp ../client/src/TaskExecutor.cpp)
 target_include_directories(test_client_runtime PRIVATE ../client/inc)
@@ -93,7 +99,7 @@ add_executable(test_scheduler_protocol test_scheduler_protocol.cpp)
 target_link_libraries(test_scheduler_protocol PRIVATE scheduler_core)
 add_dependencies(test_scheduler_protocol scheduler_probe)
 add_test(NAME test_scheduler_protocol COMMAND test_scheduler_protocol)
-set_tests_properties(test_scheduler_protocol PROPERTIES TIMEOUT 20)
+set_tests_properties(test_scheduler_protocol PROPERTIES TIMEOUT 40)
 add_executable(test_plugin_runtime test_plugin_runtime.cpp)
 target_include_directories(test_plugin_runtime PRIVATE ../plugins/coverage/inc ../plugins/stpcompare/inc)
 target_link_libraries(test_plugin_runtime PRIVATE common coverage_core stpcompare_core ${PG_LIBRARY})
@@ -116,6 +122,10 @@ if(WIN32 AND Python3_Interpreter_FOUND AND EXISTS "${PG_BIN_DIR}/initdb.exe")
         ${CMAKE_CURRENT_SOURCE_DIR}/test_runtime_integration.py
         --bin-dir $<TARGET_FILE_DIR:scheduler> --pg-bin ${PG_BIN_DIR} -v)
     set_tests_properties(test_runtime_integration PROPERTIES TIMEOUT 300)
+    add_test(NAME test_deployment_rollout_integration COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_deployment_rollout_integration.py
+        --bin-dir $<TARGET_FILE_DIR:scheduler> --pg-bin ${PG_BIN_DIR} -v)
+    set_tests_properties(test_deployment_rollout_integration PROPERTIES TIMEOUT 300)
     add_test(NAME test_tools_integration COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/test_tools_integration.py --pg-bin ${PG_BIN_DIR} -v)
     set_tests_properties(test_tools_integration PROPERTIES TIMEOUT 120)

@@ -49,7 +49,7 @@
             <div class="panel-head"><h2>调度控制</h2><span class="chip" id="scheduler-status">正在连接调度器</span></div>
             <form class="management-form" id="run-start-form">
               <div class="management-field"><label for="run-plugin">执行插件</label><select id="run-plugin" disabled></select></div>
-              <div class="management-field"><label for="run-dataset">数据版本</label><input id="run-dataset" placeholder="例如 d1" required disabled></div>
+              <div class="management-field run-dataset-field"><label>执行数据</label><output id="run-dataset-label">等待调度器提供数据配置</output><details class="run-dataset-details"><summary>数据身份与高级设置</summary><p id="run-dataset-help" class="workspace-help"></p><code id="run-dataset-identity"></code><label id="run-dataset-manual-row" hidden>自定义插件的数据版本<input id="run-dataset" placeholder="填写此插件约定的数据版本" disabled></label></details></div>
               <div class="management-field grow-field"><label for="run-params">运行参数（可选）</label><input id="run-params" placeholder="仅填写插件支持的参数；coverage、stpcompare 留空" disabled></div>
               <label class="check-field" for="run-all-clients"><input id="run-all-clients" type="checkbox" checked>全部匹配客户端</label>
               <div class="management-field grow-field" id="run-clients-field" hidden><label for="run-clients">选择空闲客户端（可多选）</label><select id="run-clients" multiple size="3" aria-label="选择执行客户端"></select></div>
@@ -59,7 +59,7 @@
               <button type="button" class="button" id="run-wakeup" disabled>唤醒客户端</button>
             </form>
             <p class="management-status" id="scheduler-command-status" role="status"></p>
-            <div id="active-runs" class="active-runs"></div>
+            <p id="run-update-notice" class="rollout-notice" hidden></p><button type="button" class="button" id="run-update-progress" hidden>查看更新进度</button><div id="active-runs" class="active-runs"></div>
           </section>
           <div class="metrics">
             <div class="metric"><span>最近运行</span><strong id="metric-runs">0<small>个运行</small></strong><em>最多加载 100 条</em></div>
@@ -111,9 +111,12 @@
         <section class="page plugin-workspace" id="page-clients" hidden>
           <div class="section-head"><h2>客户端机器<span class="count" id="client-count"></span></h2><button type="button" class="button" id="clients-refresh">刷新客户端</button></div>
           <p class="management-status" id="clients-status" role="status"></p>
-          <div class="clients-toolbar"><label class="check-field"><input type="checkbox" id="clients-select-all">选择全部可用机器</label><span id="clients-selected-count">未选择客户端</span><button type="button" class="button primary" id="clients-configure" disabled>配置所选客户端</button></div>
+          <div class="clients-toolbar"><label class="check-field"><input type="checkbox" id="clients-select-all">选择全部机器</label><span id="clients-selected-count">未选择客户端</span><button type="button" class="button primary" id="clients-configure" disabled>分配部署方案</button></div>
           <div id="client-list" class="client-list"></div>
-          <div class="workspace-heading clients-deployment-heading"><div><h2>部署与更新</h2><p>按机器选择资源，预览差异后统一发布，逐台追踪应用状态。</p></div><button type="button" class="button" id="deployment-new">从客户端列表选择</button></div>
+          <section class="rollout-section"><div class="section-head"><h2>更新进度</h2><button type="button" class="button" id="client-rollouts-refresh">刷新进度</button></div><p class="management-status" id="client-rollouts-status" role="status"></p><div id="client-rollouts"></div></section>
+          <section id="rollout-abandon-panel" class="workspace-surface rollout-abandon" hidden><h3>处理已停止批次</h3><p>批次 <strong id="rollout-abandon-run"></strong> 的已保存结果保留，放弃后不再执行剩余任务。此处理会记录原因。</p><form id="rollout-abandon-form"><label for="rollout-abandon-reason">放弃剩余任务的原因</label><textarea id="rollout-abandon-reason" required rows="3"></textarea><p id="rollout-abandon-status" class="management-status" role="status"></p><div class="head-actions"><button type="button" class="button" id="rollout-abandon-close">返回</button><button type="submit" class="button" id="rollout-abandon-confirm">确认放弃剩余任务</button></div></form></section>
+
+          <details class="workspace-advanced profile-legacy"><summary>高级维护 <span>增量配置与历史恢复</span></summary><p class="config-help">需要单独调整配置或恢复历史部署时使用。</p><div class="head-actions"><button type="button" class="button" id="profiles-advanced-open">打开高级配置</button><button type="button" class="button" id="deployment-new">返回客户端选择</button></div></details>
             <p class="management-status workspace-status" id="deployment-status" role="status"></p>
             <section class="workspace-surface deployment-editor" id="deployment-editor" hidden aria-label="客户端部署向导">
               <div class="deployment-editor-head"><div><span class="workspace-eyebrow">部署向导</span><h3>配置客户端</h3></div><div class="head-actions"><button type="button" class="button" id="deployment-reset" hidden>清空本次修改</button><button type="button" class="button" id="deployment-close">收起配置</button></div></div>
@@ -178,13 +181,31 @@
         </section>
         <section class="page plugin-workspace" id="page-plugins" hidden>
           <div class="workspace-nav" role="tablist" aria-label="插件与部署">
-            <button type="button" role="tab" id="workspace-tab-plugins" data-workspace-tab="plugins" aria-controls="workspace-panel-plugins" aria-selected="true">插件</button>
+            <button type="button" role="tab" id="workspace-tab-profiles" data-workspace-tab="profiles" aria-controls="workspace-panel-profiles" aria-selected="true">部署方案</button>
+            <button type="button" role="tab" id="workspace-tab-plugins" data-workspace-tab="plugins" aria-controls="workspace-panel-plugins" aria-selected="false" tabindex="-1">插件</button>
             <button type="button" role="tab" id="workspace-tab-artifacts" data-workspace-tab="artifacts" aria-controls="workspace-panel-artifacts" aria-selected="false" tabindex="-1">制品库</button>
             <button type="button" role="tab" id="workspace-tab-deployments" data-workspace-tab="deployments" aria-controls="workspace-panel-deployments" aria-selected="false" tabindex="-1">客户端部署</button>
             <button type="button" role="tab" id="workspace-tab-settings" data-workspace-tab="settings" aria-controls="workspace-panel-settings" aria-selected="false" tabindex="-1">服务配置</button>
           </div>
 
-          <section id="workspace-panel-plugins" class="workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-plugins" data-workspace-panel="plugins">
+          <section id="workspace-panel-profiles" class="workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-profiles" data-workspace-panel="profiles">
+            <div class="workspace-heading"><div><span class="workspace-eyebrow">配置一次，重复使用</span><h2>部署方案</h2><p>维护资源组合，统一发布到使用该插件的机器。忙碌时也可先提交更新。</p></div><div class="head-actions"><button type="button" class="button" id="profiles-refresh">刷新</button><button type="button" class="button primary" id="profiles-create">＋ 创建方案</button></div></div>
+            <p id="profiles-status" class="management-status" role="status"></p><div id="profiles-list" class="profiles-grid"></div><section class="rollout-section"><div class="section-head"><h2>发布记录与进度</h2><button type="button" class="button" id="profile-rollouts-refresh">刷新进度</button></div><p class="management-status" id="profile-rollouts-status" role="status"></p><div id="profile-rollouts"></div></section>
+            <section id="profile-editor" class="workspace-surface profile-editor" hidden aria-label="维护部署方案">
+              <div class="workspace-heading"><h3 id="profile-editor-title">创建部署方案</h3><button type="button" class="button" id="profile-editor-close">收起草稿</button></div>
+              <form id="profile-form">
+                <div id="profile-replacement-notice" class="rollout-notice error" hidden>正在修正失败的统一更新。保存并发布后，新请求接替原请求继续推进。<button type="button" class="workspace-table-link" id="profile-replacement-cancel">仅维护草稿，取消修复发布</button></div>
+                <div class="profile-fields"><div class="management-field"><label for="profile-name">方案名称</label><input id="profile-name" required maxlength="120" placeholder="例如 标准覆盖率分析"></div><div class="management-field"><label for="profile-description">说明（可选）</label><input id="profile-description" maxlength="1000" placeholder="这个方案适用于哪些机器或任务"></div></div>
+                <fieldset class="profile-plugin-picker"><legend>包含的插件</legend><label class="check-field"><input type="checkbox" data-profile-plugin="coverage">coverage · 覆盖率</label><label class="check-field"><input type="checkbox" data-profile-plugin="stpcompare">stpcompare · 新老程序采集</label></fieldset>
+                <div id="profile-resources"></div>
+                <p class="config-help">缺少需要的版本？<button type="button" class="workspace-table-link" id="profile-go-artifacts">进入制品库上传资源</button></p>
+                <details id="profile-settings" class="workspace-advanced"><summary>资源入口与运行设置 <span>自动识别入口，默认真实执行、全天运行</span></summary><div id="profile-resource-entries"></div><div class="management-field profile-thread-field"><label for="profile-threads">每插件任务并发数</label><input type="number" id="profile-threads" min="1" step="1" value="1"></div><div id="profile-windows" class="deployment-window-grid"></div><p class="config-help">这些安排仅在高级机器配置中应用；统一版本更新保留每台机器现有安排。不设置时段表示全天，时间按客户端本机时区计算。</p></details>
+                <p id="profile-editor-status" class="management-status" role="status"></p><div class="head-actions"><button type="button" class="button" id="profile-conflict-copy" hidden>复制当前草稿</button><button type="button" class="button" id="profile-load-latest" hidden>载入最新版本并保留草稿</button><button type="submit" class="button primary" id="profile-save">保存草稿</button><button type="button" class="button primary" id="profile-save-publish">保存并发布更新</button></div>
+                <details id="profile-conflict" class="workspace-advanced" hidden><summary>冲突前的草稿（供合并）</summary><textarea id="profile-conflict-draft" readonly spellcheck="false" aria-label="冲突前的方案草稿"></textarea></details>
+              </form>
+            </section>
+          </section>
+          <section id="workspace-panel-plugins" class="workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-plugins" data-workspace-panel="plugins" hidden>
             <div class="workspace-heading"><div><span class="workspace-eyebrow">执行与分析</span><h2>插件</h2><p>管理任务执行能力及配套的结果分析资源。</p></div><button type="button" class="button primary" id="plugin-install-open">＋ 安装插件</button></div>
             <div class="workspace-plugin-grid" id="plugin-grid"></div>
             <details class="workspace-surface workspace-disclosure" id="server-plugin-section">
@@ -223,7 +244,7 @@
 
           <section id="workspace-panel-deployments" class="workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-deployments" data-workspace-panel="deployments" hidden>
             <div class="workspace-heading"><div><span class="workspace-eyebrow">发布与更新</span><h2>客户端部署</h2><p>为客户端选择程序和数据，跟踪更新直到生效。</p></div></div>
-            <p class="workspace-help">客户端部署已移至客户端页面。先选择在线空闲机器，再配置和发布。</p><button type="button" class="button primary" id="deployment-go-clients">打开客户端</button>
+            <p class="workspace-help">客户端部署已移至客户端页面。为新机器分配方案；版本更新在部署方案中统一发布。</p><button type="button" class="button primary" id="deployment-go-clients">打开客户端</button>
           </section>
 
           <section id="workspace-panel-settings" class="workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-settings" data-workspace-panel="settings" hidden>
@@ -267,7 +288,7 @@
           <div class="dsh-context-body">
             <p class="ai-context" id="ai-context">上下文：尚未选择运行</p>
             <textarea id="dsh-context-prompt" rows="5" readonly aria-label="发送给 DSH 的分析提示" placeholder="点击“生成当前提示”，或在结果分析中选择“用 DSH 生成报告”。"></textarea>
-            <div class="dsh-context-actions"><button type="button" class="button" id="dsh-context-current">生成当前提示</button><button type="button" class="button" id="dsh-context-copy">复制提示</button></div>
+            <div class="dsh-context-actions"><button type="button" class="button" id="dsh-context-current">生成当前提示</button><button type="button" class="button" id="dsh-context-copy">复制提示</button><button type="button" class="button primary" id="dsh-context-return" hidden>返回部署预览</button></div>
             <p id="dsh-context-status" role="status">复制后粘贴到下方 DSH 会话中发送。新建和切换会话由 DSH 管理。</p>
           </div>
         </details>
@@ -288,6 +309,15 @@
   </div>
   <!-- Shared modal dialogs stay outside pages: opening a dialog inside a hidden
        page can make the rest of the document inert without displaying it. -->
+  <dialog id="profile-apply" class="profile-apply" hidden aria-labelledby="profile-apply-title">
+    <header class="profile-apply-header"><div><h2 id="profile-apply-title" tabindex="-1">确认发布更新</h2><p>核对资源与影响范围后，一次确认提交。</p></div><button type="button" class="button" id="profile-apply-close">返回</button></header>
+    <div class="profile-apply-body">
+      <div id="profile-apply-targets" class="profile-targets"></div>
+      <div class="management-form"><div class="management-field grow-field"><label for="profile-apply-select">部署方案</label><select id="profile-apply-select"><option value="">选择方案</option></select></div><button type="button" class="button" id="profile-apply-manage">维护方案</button><button type="button" class="button" id="profile-apply-preview">重新核对范围</button></div>
+      <div id="profile-apply-summary" class="profile-review"></div>
+    </div>
+    <footer class="profile-apply-footer"><div><p class="config-help">提交后自动进入更新进度，关闭页面不影响推进。</p><p id="profile-apply-status" class="management-status" role="status"></p><p id="profile-apply-ai-status" class="management-status profile-ai-status" role="status"></p></div><div class="head-actions"><button type="button" class="button" id="profile-apply-bind" hidden>同步服务端配置</button><button type="button" class="button" id="profile-apply-ai-review" hidden>让 DSH 分析本次发布</button><label id="profile-apply-confirm-row" class="check-field" hidden><input type="checkbox" id="profile-apply-confirm">确认应用到上述全部客户端</label><button type="button" class="button primary" id="profile-apply-publish" hidden disabled>确认发布</button></div></footer>
+  </dialog>
   <dialog id="workspace-drawer" class="workspace-drawer" aria-labelledby="workspace-drawer-title" hidden><header class="workspace-drawer-head"><div><span class="workspace-eyebrow">详细信息</span><h2 id="workspace-drawer-title"></h2></div><button type="button" class="icon-button" id="workspace-drawer-close" aria-label="关闭详情">×</button></header><div id="workspace-drawer-content" class="workspace-drawer-content"></div></dialog>
   <dialog class="view-editor-dialog" id="report-editor-dialog">
     <div class="view-editor-head"><div><strong id="report-editor-title">编辑 Python 报告脚本</strong><span id="report-editor-plugin"></span></div><button type="button" class="icon-button" id="close-report-editor" title="关闭" aria-label="关闭">×</button></div>
@@ -302,5 +332,6 @@
     <div class="view-editor-actions"><span id="view-editor-status">保存后立即应用到结果页</span><button type="button" class="button primary" id="save-view-editor">保存并应用</button></div>
   </dialog>
   <script src="/app.js"></script>
+  <script src="/profiles.js"></script>
 </body>
 </html>

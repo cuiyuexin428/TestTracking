@@ -1,6 +1,7 @@
 """Exercise the real local management listener and scheduler/client lifecycle."""
 import argparse
 from contextlib import contextmanager
+import hashlib
 import json
 from pathlib import Path
 import socket
@@ -85,6 +86,305 @@ class SchedulerManagementTests(unittest.TestCase):
 
     def command(self, action, **fields):
         return self.request({'action': action, **fields}, '/commands')
+
+    def apply_deployment(self, patch, **fields):
+        return self.command('apply_plugin_deployment',
+            **{'config_path': str(self.config),
+               'config_revision': hashlib.sha256(self.config.read_bytes()).hexdigest(),
+               'plugins': patch, **fields})
+
+    def builtins(self):
+        manifest = self.root / 'manifest.txt'
+        manifest.write_text('original.stp,1\n', encoding='utf-8')
+        self.settings['plugins'] = {
+            plugin: {'enabled': True, 'dll': str(SCHEDULER.parent / (plugin + '.dll')),
+                     'stp_manifest': str(manifest), 'store_type': 'file',
+                     'store_dir': str(self.root / plugin), 'expected_dataset_version': 'd1',
+                     'expected_program_version': 'v1',
+                     'expected_baseline_program_version': 'v1',
+                     'expected_candidate_program_version': 'v1'}
+            for plugin in ('coverage', 'stpcompare')}
+
+    def test_online_deployment_applies_both_builtin_plugins_and_preserves_exact_backup(self):
+        self.builtins()
+        self.start()
+        before = self.config.read_bytes()
+        instance = self.request()[1]['instance_id']
+        manifest = self.root / '新数据清单.txt'
+        manifest.write_text('new-a.stp,10\nnew-b.stp,20\n', encoding='utf-8')
+        patch = {'coverage': {'expected_program_version': 'coverage-v2',
+                             'expected_dataset_version': 'd2', 'stp_manifest': str(manifest)},
+                 'stpcompare': {'expected_baseline_program_version': 'old-v2',
+                                'expected_candidate_program_version': 'new-v2',
+                                'expected_dataset_version': 'd2', 'stp_manifest': str(manifest)}}
+        code, applied = self.apply_deployment(patch)
+        self.assertEqual(200, code, applied)
+        self.assertTrue(applied['online_applied'])
+        self.assertEqual(hashlib.sha256(self.config.read_bytes()).hexdigest(), applied['configuration_revision'])
+        self.assertEqual(before, self.config.with_suffix('.json.bak').read_bytes())
+        status = self.request()[1]
+        self.assertEqual(instance, status['instance_id'])
+        self.assertEqual(json.loads(self.config.read_bytes()), status['configuration'])
+        for plugin in patch:
+            for key, value in patch[plugin].items():
+                self.assertEqual(value, status['configuration']['plugins'][plugin][key])
+            code, old = self.command('run', plugin_type=plugin, dataset_version='d1')
+            self.assertEqual(409, code, old)
+            code, new = self.command('run', plugin_type=plugin, dataset_version='d2')
+            self.assertEqual(200, code, new)
+            self.assertEqual('running', new['status'])
+        self.assertEqual(409, self.apply_deployment(patch,
+            config_revision=hashlib.sha256(before).hexdigest())[0])
+
+    def test_unicode_configuration_directory_starts_and_applies_online(self):
+        directory = self.root / '中文配置目录'
+        directory.mkdir()
+        self.config = directory / '调度配置.json'
+        self.start()
+        original = self.config.read_bytes()
+        status = self.request()[1]
+        self.assertEqual(str(self.config), status['config_path'])
+        self.assertEqual(str(directory / 'runtime' / 'client_control.json'), status['client_control_path'])
+        code, heartbeat = self.command('agent_heartbeat', client_id='unicode-machine',
+            instance_id='unicode-instance', hostname='test-host', state='unconfigured',
+            plugin_keys=[], agent_version='2', active_revision='', update_window_open=True)
+        self.assertEqual(200, code, heartbeat)
+        self.assertTrue((directory / 'runtime' / 'client_control.json').is_file())
+        code, applied = self.apply_deployment({'scheduler-probe': {'expected_program_version': 'v2'}})
+        self.assertEqual(200, code, applied)
+        self.assertEqual(hashlib.sha256(self.config.read_bytes()).hexdigest(), applied['configuration_revision'])
+        self.assertEqual(original, self.config.with_suffix('.json.bak').read_bytes())
+        self.assertEqual('v2', self.request()[1]['configuration']['plugins']['probe']['expected_program_version'])
+        self.server.stdin.write(b'quit\n')
+        self.server.stdin.flush()
+        self.assertEqual(0, self.server.wait(timeout=5))
+        self.server = self.spawn(SCHEDULER, self.config, 'scheduler-restarted')
+        restarted = self.wait_for(lambda: self.request()[1])
+        self.assertEqual('v2', restarted['configuration']['plugins']['probe']['expected_program_version'])
+        self.assertEqual('unicode-machine', restarted['agents'][0]['client_id'])
+
+    def test_online_deployment_rejects_invalid_paths_fields_revisions_and_pending_settings(self):
+        self.start()
+        before = self.config.read_bytes()
+        patch = {'scheduler-probe': {'expected_program_version': 'v2'}}
+        for fields, expected in [({'config_path': str(self.root / 'different.json')}, 409),
+                                 ({'config_path': 'scheduler.json'}, 409),
+                                 ({'config_revision': '0' * 64}, 409),
+                                 ({'config_revision': 'bad'}, 400),
+                                 ({'plugins': {}}, 400),
+                                 ({'plugins': {'missing': {'expected_program_version': 'v2'}}}, 409),
+                                 ({'plugins': {'scheduler-probe': {'dll': 'other.dll'}}}, 400),
+                                 ({'plugins': {'scheduler-probe': {'expected_dataset_version': 2}}}, 400)]:
+            with self.subTest(fields=fields):
+                code, result = self.apply_deployment(patch, **fields)
+                self.assertEqual(expected, code, result)
+                self.assertEqual(before, self.config.read_bytes())
+        self.settings['server']['client_timeout_ms'] = 9000
+        self.config.write_text(json.dumps(self.settings), encoding='utf-8')
+        pending = self.config.read_bytes()
+        code, rejected = self.apply_deployment(patch)
+        self.assertEqual(409, code, rejected)
+        self.assertIn('unapplied', rejected['error'])
+        self.assertEqual(pending, self.config.read_bytes())
+        self.assertEqual(600, self.request()[1]['configuration']['server']['client_timeout_ms'])
+
+    def test_online_deployment_is_atomic_on_manifest_initialization_and_publication_failures(self):
+        self.settings['plugins']['second'] = dict(self.settings['plugins']['probe'], plugin_type='second-probe')
+        self.start()
+        before = self.config.read_bytes()
+        for patch in [
+            {'scheduler-probe': {'expected_program_version': 'v2'},
+             'second-probe': {'stp_manifest': str(self.root / 'missing.txt')}},
+            {'scheduler-probe': {'expected_program_version': 'v2'},
+             'second-probe': {'expected_program_version': 'reject-init'}},
+        ]:
+            with self.subTest(patch=patch):
+                code, rejected = self.apply_deployment(patch)
+                self.assertEqual(422, code, rejected)
+                self.assertEqual(before, self.config.read_bytes())
+                self.assertEqual(self.settings, self.request()[1]['configuration'])
+        self.config.with_suffix('.json.bak').mkdir()
+        code, rejected = self.apply_deployment({'scheduler-probe': {'expected_program_version': 'v2'}})
+        self.assertEqual(503, code, rejected)
+        self.assertEqual(before, self.config.read_bytes())
+        self.assertEqual(self.settings, self.request()[1]['configuration'])
+        for plugin in ('scheduler-probe', 'second-probe'):
+            self.assertEqual(200, self.command('run', plugin_type=plugin, dataset_version='d1')[0])
+
+    def test_online_deployment_rejects_active_queued_and_stopped_work(self):
+        self.start()
+        before = self.config.read_bytes()
+        patch = {'scheduler-probe': {'expected_program_version': 'v2'}}
+        code, first = self.command('run', plugin_type='scheduler-probe', dataset_version='d1')
+        self.assertEqual(200, code, first)
+        self.assertEqual(409, self.apply_deployment(patch)[0])
+        self.assertEqual(409, self.maintenance('begin_plugin_maintenance')[0])
+        code, queued = self.command('run', plugin_type='scheduler-probe', dataset_version='d2')
+        self.assertEqual(200, code, queued)
+        self.assertEqual('queued', queued['status'])
+        self.assertEqual(409, self.apply_deployment(patch)[0])
+        self.assertEqual(409, self.maintenance('begin_plugin_maintenance')[0])
+        self.assertEqual(200, self.command('stop', plugin_type='scheduler-probe', run_id=queued['run_id'])[0])
+        self.assertEqual(200, self.command('stop', plugin_type='scheduler-probe', run_id=first['run_id'])[0])
+        self.assertEqual([], self.request()[1]['active_runs'])
+        code, rejected = self.apply_deployment(patch)
+        self.assertEqual(409, code, rejected)
+        self.assertIn('unfinished', rejected['error'])
+        self.assertEqual(409, self.maintenance('begin_plugin_maintenance')[0])
+        self.assertEqual(before, self.config.read_bytes())
+
+    def maintenance(self, action, plugin='scheduler-probe', token='installation-one', **fields):
+        return self.command(action, **{'plugin_type': plugin, 'reservation_id': token,
+            'config_path': str(self.config),
+            'config_revision': hashlib.sha256(self.config.read_bytes()).hexdigest(), **fields})
+
+    def restart_scheduler(self):
+        self.server.stdin.write(b'quit\n')
+        self.server.stdin.flush()
+        self.assertEqual(0, self.server.wait(timeout=5))
+        self.server = self.spawn(SCHEDULER, self.config, 'scheduler-restarted-' + str(len(self.processes)))
+        self.wait_for(lambda: self.request()[0] == 200)
+
+    def test_plugin_maintenance_blocks_cli_and_http_until_committed_restart(self):
+        self.settings['plugins']['second'] = dict(self.settings['plugins']['probe'], plugin_type='second-probe')
+        self.start()
+        original = self.config.read_bytes()
+        self.assertEqual(409, self.maintenance('begin_plugin_maintenance', config_revision='0' * 64)[0])
+        self.assertEqual(200, self.maintenance('begin_plugin_maintenance')[0])
+        self.assertEqual(200, self.maintenance('begin_plugin_maintenance')[0])
+        self.assertEqual(409, self.maintenance('begin_plugin_maintenance', token='other')[0])
+        self.assertEqual(409, self.command('run', plugin_type='scheduler-probe', dataset_version='d1')[0])
+        self.server.stdin.write(b'run scheduler-probe cli-must-not-start\n')
+        self.server.stdin.flush()
+        self.assertEqual(200, self.maintenance('begin_plugin_maintenance')[0])
+        self.assertEqual([], self.request()[1]['active_runs'])
+        self.assertEqual(409, self.apply_deployment({'scheduler-probe': {'expected_program_version': 'v2'}})[0])
+        self.assertEqual(200, self.command('run', plugin_type='second-probe', dataset_version='sibling')[0])
+        self.assertEqual(409, self.maintenance('end_plugin_maintenance', token='other', committed=False)[0])
+        changed = json.loads(original)
+        changed['plugins']['probe']['expected_program_version'] = 'new-installed-version'
+        self.config.write_text(json.dumps(changed), encoding='utf-8')
+        self.assertEqual(409, self.maintenance('end_plugin_maintenance', committed=False)[0])
+        code, result = self.maintenance('end_plugin_maintenance', committed=True)
+        self.assertEqual(200, code, result)
+        self.assertTrue(result['pending_restart'])
+        self.assertEqual(200, self.maintenance('end_plugin_maintenance', committed=True)[0])
+        self.assertEqual(409, self.command('run', plugin_type='scheduler-probe', dataset_version='new')[0])
+        self.restart_scheduler()
+        self.assertEqual([], self.request()[1]['plugin_maintenance'])
+        self.assertEqual(200, self.command('run', plugin_type='scheduler-probe', dataset_version='new')[0])
+
+    def test_interrupted_maintenance_survives_restart_and_can_release_only_original(self):
+        self.start()
+        self.assertEqual(200, self.maintenance('begin_plugin_maintenance')[0])
+        self.restart_scheduler()
+        self.assertEqual(409, self.command('run', plugin_type='scheduler-probe', dataset_version='d1')[0])
+        code, ended = self.maintenance('end_plugin_maintenance', committed=False)
+        self.assertEqual(200, code, ended)
+        self.assertFalse(ended['pending_restart'])
+        self.assertEqual(200, self.maintenance('end_plugin_maintenance', committed=False)[0])
+        self.assertEqual(200, self.command('run', plugin_type='scheduler-probe', dataset_version='d1')[0])
+        self.assertEqual(409, self.maintenance('begin_plugin_maintenance')[0])
+
+    def test_maintenance_configuration_alias_rejects_active_and_stopped_work(self):
+        self.start()
+        self.assertEqual({'scheduler-probe': 'probe'}, self.request()[1]['plugin_config_keys'])
+        code, run = self.command('run', plugin_type='scheduler-probe', dataset_version='d1')
+        self.assertEqual(200, code, run)
+        self.assertEqual(409, self.maintenance('begin_plugin_maintenance', plugin='probe')[0])
+        self.assertEqual(200, self.command('stop', plugin_type='scheduler-probe', run_id=run['run_id'])[0])
+        self.assertEqual(409, self.maintenance('begin_plugin_maintenance', plugin='probe')[0])
+        self.assertEqual([], self.request()[1]['plugin_maintenance'])
+
+    def test_maintenance_configuration_alias_reserves_runtime_type_and_correct_entry(self):
+        self.start()
+        code, begun = self.maintenance('begin_plugin_maintenance', plugin='probe')
+        self.assertEqual(200, code, begun)
+        self.assertEqual('scheduler-probe', begun['plugin_type'])
+        self.assertEqual('scheduler-probe', self.request()[1]['plugin_maintenance'][0]['plugin_type'])
+        self.assertEqual(200, self.maintenance('begin_plugin_maintenance')[0])
+        self.assertEqual(409, self.maintenance('begin_plugin_maintenance', plugin='probe', token='other')[0])
+        self.assertEqual(409, self.command('run', plugin_type='scheduler-probe', dataset_version='d1')[0])
+        self.assertEqual(409, self.apply_deployment({'scheduler-probe': {'expected_program_version': 'v2'}})[0])
+        changed = json.loads(self.config.read_bytes())
+        changed['plugins']['probe']['expected_program_version'] = 'alias-installed-v2'
+        self.config.write_text(json.dumps(changed), encoding='utf-8')
+        code, ended = self.maintenance('end_plugin_maintenance', plugin='probe', committed=True)
+        self.assertEqual(200, code, ended)
+        self.assertTrue(ended['pending_restart'])
+        self.restart_scheduler()
+        self.assertEqual([], self.request()[1]['plugin_maintenance'])
+        self.assertEqual(200, self.command('run', plugin_type='scheduler-probe', dataset_version='d1')[0])
+
+    def test_interrupted_maintenance_blocks_replacement_with_changed_runtime_type(self):
+        self.start()
+        self.assertEqual(200, self.maintenance('begin_plugin_maintenance', plugin='probe')[0])
+        changed = json.loads(self.config.read_bytes())
+        changed['plugins']['probe']['plugin_type'] = 'replacement-probe'
+        self.config.write_text(json.dumps(changed), encoding='utf-8')
+        self.restart_scheduler()
+        self.assertEqual(['replacement-probe'], self.request()[1]['plugins'])
+        self.assertEqual(409, self.command('run', plugin_type='replacement-probe', dataset_version='d1')[0])
+        self.assertEqual(409, self.apply_deployment({'replacement-probe': {'expected_program_version': 'v2'}})[0])
+        for identity in ('probe', 'scheduler-probe', 'replacement-probe'):
+            with self.subTest(identity=identity):
+                self.assertEqual(409, self.maintenance('begin_plugin_maintenance', plugin=identity, token='other')[0])
+        # Recovery pins the original runtime identity even though the new DLL
+        # now advertises another type under the same configuration entry.
+        code, ended = self.maintenance('end_plugin_maintenance', committed=True)
+        self.assertEqual(200, code, ended)
+        self.assertTrue(ended['pending_restart'])
+        self.assertEqual(409, self.command('run', plugin_type='replacement-probe', dataset_version='d1')[0])
+        self.restart_scheduler()
+        self.assertEqual([], self.request()[1]['plugin_maintenance'])
+        self.assertEqual(200, self.command('run', plugin_type='replacement-probe', dataset_version='d1')[0])
+
+    def test_maintenance_rejects_ambiguous_type_and_configuration_alias(self):
+        self.settings['plugins']['scheduler-probe'] = dict(self.settings['plugins']['probe'], plugin_type='second-probe')
+        self.start()
+        code, rejected = self.maintenance('begin_plugin_maintenance')
+        self.assertEqual(409, code, rejected)
+        self.assertIn('ambiguous', rejected['error'])
+        self.assertEqual([], self.request()[1]['plugin_maintenance'])
+
+    def test_several_plugin_installations_can_share_one_restart(self):
+        self.settings['plugins']['second'] = dict(self.settings['plugins']['probe'], plugin_type='second-probe')
+        self.start()
+        for plugin, key in [('scheduler-probe', 'probe'), ('second-probe', 'second'), ('new-plugin', 'new-plugin')]:
+            self.assertEqual(200, self.maintenance('begin_plugin_maintenance', plugin=plugin, token=plugin)[0])
+            changed = json.loads(self.config.read_bytes())
+            changed['plugins'].setdefault(key, {'enabled': False})['expected_program_version'] = 'installed-v2'
+            self.config.write_text(json.dumps(changed), encoding='utf-8')
+            self.assertEqual(200, self.maintenance('end_plugin_maintenance', plugin=plugin, token=plugin, committed=True)[0])
+        self.assertEqual(3, len(self.request()[1]['plugin_maintenance']))
+        self.restart_scheduler()
+        self.assertEqual([], self.request()[1]['plugin_maintenance'])
+        self.assertEqual(200, self.command('run', plugin_type='scheduler-probe', dataset_version='d1')[0])
+        self.assertEqual(200, self.command('run', plugin_type='second-probe', dataset_version='d1')[0])
+
+    def test_maintenance_rollback_after_restart_requires_loading_restored_configuration(self):
+        self.start()
+        original = self.config.read_bytes()
+        self.assertEqual(200, self.maintenance('begin_plugin_maintenance')[0])
+        changed = json.loads(original)
+        changed['plugins']['probe']['expected_program_version'] = 'replacement'
+        self.config.write_text(json.dumps(changed), encoding='utf-8')
+        self.restart_scheduler()
+        self.config.write_bytes(original)
+        code, ended = self.maintenance('end_plugin_maintenance', committed=False)
+        self.assertEqual(200, code, ended)
+        self.assertTrue(ended['pending_restart'])
+        self.assertEqual(409, self.command('run', plugin_type='scheduler-probe', dataset_version='d1')[0])
+        self.restart_scheduler()
+        self.assertEqual([], self.request()[1]['plugin_maintenance'])
+        self.assertEqual(200, self.command('run', plugin_type='scheduler-probe', dataset_version='d1')[0])
+
+    def test_failed_maintenance_persistence_does_not_reserve_plugin(self):
+        self.start()
+        self.config.with_suffix('.json.maintenance.json').mkdir()
+        self.assertEqual(503, self.maintenance('begin_plugin_maintenance')[0])
+        self.assertEqual([], self.request()[1]['plugin_maintenance'])
+        self.assertEqual(200, self.command('run', plugin_type='scheduler-probe', dataset_version='d1')[0])
 
     def test_status_queue_duplicate_stale_stop_and_actual_run_id(self):
         self.settings['server']['secret'] = 'do-not-expose'

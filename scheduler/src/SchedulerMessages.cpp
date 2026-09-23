@@ -153,7 +153,8 @@ void Scheduler::HandleRegister(const IncomingMessage& msg) {
         clients_[msg.identity] = {client, Clock::now(), session,
                                   msg.envelope.register_().registration_id(), validation,
                                   request.physical_client_id().empty() ? msg.identity : request.physical_client_id(),
-                                  request.plugin_key().empty() ? type : request.plugin_key()};
+                                  request.plugin_key().empty() ? type : request.plugin_key(),
+                                  request.deployment_target_id()};
     }
     SendRegisterResult(msg, true, validation, session);
     LOG_INFO("register: client " << msg.identity << " plugin_type=" << type
@@ -171,6 +172,10 @@ void Scheduler::SendNoTask(const IncomingMessage& msg) {
 
 void Scheduler::HandleRequestTask(const IncomingMessage& msg) {
     if (!IsCurrentSession(msg)) return;
+    if (!RolloutAllowsWorker(msg.envelope.plugin_type(), msg.identity)) {
+        SendNoTask(msg);
+        return;
+    }
     ExpireClientReservations();
     std::string physical_client_id;
     {

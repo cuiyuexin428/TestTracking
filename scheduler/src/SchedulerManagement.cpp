@@ -57,13 +57,14 @@ nlohmann::json Scheduler::BuildStatus() const {
                  {"blocked_reason", run.blocked_reason}});
     for (const auto& client : clients()) {
         const auto& heartbeat = client.heartbeat;
-        std::string physical_client_id = client.identity, plugin_key = client.plugin_type;
+        std::string physical_client_id = client.identity, plugin_key = client.plugin_type, deployment_target_id;
         {
             std::lock_guard<std::mutex> lock(clients_mutex_);
             const auto entry = clients_.find(client.identity);
             if (entry != clients_.end()) {
                 physical_client_id = entry->second.physical_client_id;
                 plugin_key = entry->second.plugin_key;
+                deployment_target_id = entry->second.deployment_target_id;
             }
         }
         nlohmann::json tasks = nlohmann::json::array();
@@ -74,6 +75,8 @@ nlohmann::json Scheduler::BuildStatus() const {
         }
         result["clients"].push_back({{"worker_id", client.identity}, {"plugin_type", client.plugin_type},
             {"physical_client_id", physical_client_id}, {"plugin_key", plugin_key},
+            {"deployment_target_id", deployment_target_id},
+            {"rollout_eligible", RolloutAllowsWorker(client.plugin_type, client.identity)},
             {"registered", client.registered}, {"status", !tasks.empty() || heartbeat.status() == common::Heartbeat::BUSY ? "busy" : "idle"},
             {"ip", heartbeat.ip()}, {"peer_address", client.peer_address},
             {"last_seen_age_ms", client.last_seen_age_ms}, {"memory_bytes", heartbeat.resource().memory_bytes()},
@@ -81,9 +84,26 @@ nlohmann::json Scheduler::BuildStatus() const {
             {"plugin_info", heartbeat.plugin_info()}, {"tasks", std::move(tasks)}});
     }
     AppendAgentStatus(result);
+    result["plugin_config_keys"] = nlohmann::json::object();
+    for (const auto& plugin : plugins_)
+        result["plugin_config_keys"][plugin.instance->pluginType()] = plugin.configuration_key;
+    result["plugin_maintenance"] = nlohmann::json::array();
+    result["plugin_rollouts"] = nlohmann::json::array();
+    for (const auto& entry : plugin_rollouts_.items()) {
+        const auto& saved = entry.value();
+        auto boundary = nlohmann::json::array();
+        for (const auto& run : saved.at("boundary").items()) boundary.push_back(run.key());
+        result["plugin_rollouts"].push_back({{"plugin_type", entry.key()}, {"rollout_id", saved.at("rollout_id")},
+            {"target_id", saved.at("target_id")}, {"phase", saved.at("phase")}, {"boundary", boundary},
+            {"admission_target", saved.at("admission_target")}});
+    }
+    for (const auto& entry : plugin_maintenance_)
+        result["plugin_maintenance"].push_back({{"plugin_type", entry.first},
+            {"reservation_id", entry.second.reservation_id},
+            {"pending_restart", !entry.second.committed_revision.empty()}});
     nlohmann::json configuration = nlohmann::json::object();
     for (const auto* key : {"server", "plugins"}) {
-        if (const auto* section = config_.find(key)) configuration[key] = *section;
+        if (effective_configuration_.contains(key)) configuration[key] = effective_configuration_[key];
     }
     RedactConfiguration(configuration);
     result["configuration"] = std::move(configuration);
@@ -119,6 +139,26 @@ nlohmann::json Scheduler::managementCommand(const nlohmann::json& request) {
     if (!request.is_object() || !request.contains("action") || !request["action"].is_string())
         return invalid("action must be a string");
     const auto action = request["action"].get<std::string>();
+    if (action == "begin_plugin_rollout" || action == "get_plugin_rollout" || action == "activate_plugin_rollout" ||
+        action == "finish_plugin_rollout" || action == "cancel_plugin_rollout" ||
+        action == "resume_rollout_run" || action == "abandon_rollout_run") {
+        ControlCommand command{};
+        command.kind = ControlCommand::Kind::PluginRollout;
+        command.client_control = request;
+        return SubmitDetailed(std::move(command), true);
+    }
+    if (action == "begin_plugin_maintenance" || action == "end_plugin_maintenance") {
+        ControlCommand command{};
+        command.kind = ControlCommand::Kind::PluginMaintenance;
+        command.client_control = request;
+        return SubmitDetailed(std::move(command), true);
+    }
+    if (action == "apply_plugin_deployment") {
+        ControlCommand command{};
+        command.kind = ControlCommand::Kind::ApplyPluginDeployment;
+        command.client_control = request;
+        return SubmitDetailed(std::move(command), true);
+    }
     if (action == "agent_heartbeat" || action == "reserve_clients" ||
         action == "commit_reservation" || action == "release_clients") {
         ControlCommand command{};

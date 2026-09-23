@@ -77,6 +77,20 @@ Browser profiles receive distinct persistent operator IDs; tabs in one profile
 share that profile's identity and conversation history.
 Operators share the server account's model settings and filesystem permissions.
 
+For a deployment review, click “让 DSH 分析本次发布” in the deployment preview.
+The service rechecks the preview fingerprint and prepares a prompt using an
+allowlisted, sanitized snapshot from `POST /api/deployment-ai/review-context`.
+Copy that prompt into the native DSH conversation and send it, then use
+“返回部署预览” to review the advice and explicitly confirm publication. The
+console does not automatically send the prompt or publish the deployment.
+Changed previews invalidate the prepared review; return to the page to generate
+a fresh snapshot when information is missing or stale.
+
+This advisory workflow is not a permission sandbox. Native DSH still inherits
+the server account's permissions and installed tool access. The deployment
+review instructions restrict it to the supplied snapshot and treat labels as
+untrusted data; they do not technically revoke its existing capabilities.
+
 DSH's directory picker runs in the browser. The native assistant receives the
 service API address, instructions to read each plugin's versioned `AI_CONTEXT.md`,
 and the report-generation contract. Reports generated there appear in the result

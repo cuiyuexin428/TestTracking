@@ -1,6 +1,7 @@
 #include "common/Manifest.h"
 #include "common/Util.h"
 #include <fstream>
+#include <filesystem>
 #include <algorithm>
 #include <cctype>
 #include <unordered_set>
@@ -26,7 +27,15 @@ bool ReadManifest(const std::string& path, std::vector<ManifestEntry>* entries,
                   std::string* fingerprint) {
     if (!entries) return false;
     entries->clear();
-    std::ifstream input(path, std::ios::binary);
+    std::ifstream input;
+    try { input.open(std::filesystem::u8path(path), std::ios::binary); }
+    catch (const std::system_error&) {}
+#ifdef _WIN32
+    if (!input.is_open()) {
+        input.clear();
+        input.open(path, std::ios::binary);
+    }
+#endif
     if (!input) return false;
     std::string data((std::istreambuf_iterator<char>(input)), {});
     if (fingerprint) *fingerprint = std::to_string(data.size()) + ":" + std::to_string(Fnv1a64(data));

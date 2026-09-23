@@ -6,18 +6,25 @@
 
 namespace common {
 
-EventManager::EventManager(int thread_num) {
+EventManager::EventManager(int thread_num) : EventManager(thread_num, std::chrono::hours(24)) {}
+
+EventManager::EventManager(int thread_num, std::chrono::milliseconds idle_wait) {
     if (thread_num < 1) {
         throw std::invalid_argument("EventManager: thread_num must be >= 1");
     }
+    if (idle_wait.count() <= 0) throw std::invalid_argument("EventManager: idle wait must be positive");
     thread_group.reserve(thread_num);
     try {
         for (int i = 0; i < thread_num; ++i) {
             running_workers_.fetch_add(1);
             try {
-                thread_group.emplace_back([this] {
+                thread_group.emplace_back([this, idle_wait] {
                     std::unique_ptr<Event> event;
-                    while (queue_.pop(event, std::chrono::hours(24))) {
+                    while (!stop_.load(std::memory_order_acquire)) {
+                        if (!queue_.pop(event, idle_wait)) {
+                            if (queue_.isClosed()) break;
+                            continue;
+                        }
                         if (stop_.load(std::memory_order_acquire)) break;
                         try {
                             event->execute();

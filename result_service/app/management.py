@@ -10,6 +10,7 @@ import os
 import re
 import tempfile
 import threading
+from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -389,7 +390,25 @@ class ManagementService:
                                   details={"unavailable": result.get("unavailable", [])})
         return result
 
+    def plugin_maintenance(self, action: str, *, plugin: str, token: str,
+                           revision: str, committed: bool | None = None) -> dict[str, Any]:
+        if action not in {"begin_plugin_maintenance", "end_plugin_maintenance"}:
+            raise ManagementError("unknown plugin maintenance action")
+        path = self._path("scheduler")
+        if path is None:
+            raise ManagementError("插件安装需要可管理的在线调度器", 409)
+        payload = {"action": action, "plugin_type": plugin, "reservation_id": token,
+                   "config_path": str(path), "config_revision": revision}
+        if committed is not None:
+            payload["committed"] = committed
+        result = self._request("/commands", payload)
+        if result.get("ok") is not True:
+            raise ManagementError(result.get("error", "调度器未确认插件维护屏障"), 409)
+        return result
+
     def command(self, body: dict[str, Any]) -> dict[str, Any]:
+        if getattr(self, "rollout_run_guard", None):
+            self.rollout_run_guard(body)
         # Installation/binding and UI task submission share the same lock.
         with self._lock:
             if isinstance(body, dict) and body.get("action") == "run":
@@ -397,6 +416,56 @@ class ManagementService:
                 if path and path.is_file() and self.get_config("scheduler")["restart_required"]:
                     raise ManagementError("服务端配置已修改，请重启调度器使新配置生效后再创建任务", 409)
             return self._command(body)
+
+    def plugin_rollout(self, action: str, plugin: str, rollout_id: str, **values: Any) -> dict[str, Any]:
+        if action not in {"begin_plugin_rollout", "get_plugin_rollout", "activate_plugin_rollout",
+                          "finish_plugin_rollout", "cancel_plugin_rollout", "resume_rollout_run",
+                          "abandon_rollout_run"}:
+            raise ManagementError("unknown plugin rollout action")
+        if action == "begin_plugin_rollout":
+            path = self._path("scheduler")
+            if path is None:
+                raise ManagementError("统一部署需要可管理的在线调度器", 409)
+            values["config_path"] = str(path)
+        result = self._request("/commands", {"action": action, "plugin_type": plugin,
+            "rollout_id": rollout_id, **values})
+        if result.get("ok") is not True:
+            raise ManagementError(result.get("error", "调度器未确认部署协调操作"), 409)
+        return result
+
+    def apply_plugin_deployment(self, revision: str, plugins: dict[str, Any], *,
+                                rollout_id: str | None = None) -> dict[str, Any]:
+        """Let the scheduler validate, persist and activate one resource change.
+
+        The scheduler command shares the run/CLI queue. Saving the file here
+        first would allow an old run to start between persistence and activation.
+        """
+        with self._lock:
+            path = self._path("scheduler")
+            if path is None:
+                raise ManagementError("未配置可管理的调度服务配置文件", 409)
+            current = self.get_config("scheduler")
+            if revision != current["revision"]:
+                raise ManagementError("服务端配置已改变，请重新预览后同步", 409)
+            if current["restart_required"]:
+                raise ManagementError("服务端还有其他未生效配置，请先重启调度服务后再应用方案", 409)
+            try:
+                result = self._request("/commands", {
+                    "action": "apply_plugin_deployment", "config_path": str(path),
+                    "config_revision": revision, "plugins": plugins,
+                    **({"rollout_id": rollout_id} if rollout_id else {})})
+            except ManagementError as exc:
+                if exc.status == 400 and "action must be" in str(exc):
+                    raise ManagementError("当前调度器不支持在线应用方案，请先升级服务端程序", 409) from exc
+                raise
+            if result.get("ok") is not True or result.get("online_applied") is not True:
+                raise ManagementError(result.get("error", "调度器尚未支持在线应用部署方案，请升级服务端"), 409)
+            data, _ = self._read_config(path)
+            applied_revision = _revision(data)
+            if applied_revision != result.get("configuration_revision"):
+                raise ManagementError("配置在应用后再次改变，请重新读取并核对服务端状态", 409)
+            self._initial["scheduler"] = applied_revision
+            return self.get_config("scheduler")
 
     def _command(self, body: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(body, dict):
@@ -569,6 +638,12 @@ class ManagementService:
         return []
 
     def save_config(self, kind: str, body: dict[str, Any]) -> dict[str, Any]:
+        with getattr(self, "rollout_guard_lock", nullcontext()):
+            if getattr(self, "rollout_config_guard", None):
+                self.rollout_config_guard(kind, body)
+            return self._save_config(kind, body)
+
+    def _save_config(self, kind: str, body: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             path = self._path(kind)
             if path is None:

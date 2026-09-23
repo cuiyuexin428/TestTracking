@@ -224,11 +224,17 @@ void resultTests(const fs::path& root) {
                row["cov"] == std::vector<unsigned char>{'B'}),
           "points and binary come from one winning attempt");
     const auto winner = read(path);
+    CHECK(a.points == b.points && row["points"] == a.points,
+          "both concurrent summaries use the persisted winner's coverage points");
     a.successful = false;
+    a.points.clear();
     a.detail = "late failure";
     CHECK(first->publish(a) && read(path) == winner,
           "late failure never overwrites accepted success");
+    CHECK(a.successful && a.detail.empty() && row["points"] == a.points,
+          "late failure returns the persisted success and its points for the task summary");
     a.file = "retry.stp";
+    a.successful = false;
     CHECK(first->publish(a), "failure outcome recorded");
     a.successful = true;
     CHECK(second->publish(a), "failed result may retry successfully");
@@ -589,6 +595,18 @@ void postgresTests(const std::string& connection) {
     CHECK(common::PgCell(row.get(), 0, 1) == (attempt == "A" ? "AAA" : "BBB") &&
               common::PgCell(row.get(), 0, 2) == (attempt == "A" ? "16" : "24"),
           "cov and points same database attempt");
+    const auto winner_points = attempt == "A" ? std::vector<std::uint64_t>{11,12}
+                                               : std::vector<std::uint64_t>{21,22,23};
+    CHECK(a.points == winner_points && b.points == winner_points,
+          "postgres concurrent publishers receive the same durable point set");
+    auto late = a;
+    late.attempt_id = "late-failure";
+    late.successful = false;
+    late.points.clear();
+    late.detail = "conversion failed after another attempt succeeded";
+    CHECK(second->publish(late) && late.successful && late.detail.empty() &&
+              late.points == winner_points,
+          "postgres late failure returns the successful durable result");
     CHECK(common::PgExec(conn,
                          "CREATE FUNCTION fail_cov() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
                          "RAISE EXCEPTION 'injected'; END; $$;"

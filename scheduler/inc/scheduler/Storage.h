@@ -3,6 +3,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 #include "common/PgUtil.h"
 #include "communication.pb.h"
@@ -56,6 +57,12 @@ class Storage {
     bool FinishRun(const std::string& run_id, const std::string& status);
     bool CancelQueuedRun(const std::string& run_id, const std::string& plugin_type);
     bool LoadUnfinishedRuns(std::vector<RunRecord>& active, std::vector<RunRecord>& queued);
+    // Read-only runtime guard; unlike startup recovery, never changes planning rows.
+    bool HasUnfinishedRuns(const std::string& plugin_type, bool& has_unfinished);
+    bool ReadUnfinishedRuns(const std::string&, std::vector<RunRecord>&);
+    bool AbandonStoppedRun(const std::string&, const std::string&);
+    bool ReadRolloutRunStatuses(const std::string&, const std::vector<std::string>&,
+                               std::unordered_map<std::string, std::string>&);
     bool RestoreRun(const std::string& run_id, const std::string& plugin_type);
     bool SaveTask(const std::string& task_id, const std::string& run_id,
                   const std::string& client_identity, const std::string& payload,

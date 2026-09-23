@@ -36,8 +36,12 @@ class SourceArchiveTests(unittest.TestCase):
                 'runtime/deployment_ui_review/artifacts/catalog.json',
                 'runtime/deployment_ui_review/artifacts/deployments.json',
                 'runtime/deployment_ui_review/artifacts/objects/test-object',
+                'runtime/scheduler.json',
+                'runtime/source_launch.json',
                 'runtime/pgdata/postgresql.conf',
                 'runtime/logs/service.log',
+                '.git/config',
+                'service-workspace/server/runtime/result_service.json',
                 'build/stale.exe',
                 'real-test/state.db',
             }
@@ -343,6 +347,11 @@ class ClientPackageTests(unittest.TestCase):
         self.assertEqual(config['plugins']['coverage']['target_exe'], 'testenv/program/RunnerV2.exe')
         self.assertTrue((output / config['plugins']['coverage']['target_exe']).exists())
         self.assertTrue((output / 'testenv/dataset/sample.stp').exists())
+        _, result = self.build('-OnlyProgram', '-StepTestExe', replacement,
+                               '-OpenCppCoverageDir', self.coverage,
+                               '-ServerIp', '192.0.2.99', '-ServerPort', 6789,
+                               succeeds=False)
+        self.assertIn('do not rewrite deployment endpoints', result.stderr)
 
     def test_program_update_retains_custom_engine_symbols_when_module_option_is_omitted(self):
         engine = self.program / 'FixtureEngine.dll'

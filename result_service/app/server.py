@@ -15,6 +15,9 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 from .artifacts import ArtifactError, ArtifactStore
 from .config import ServiceConfig
 from .deployments import DeploymentError, DeploymentStore
+from .deployment_ai import deployment_review_context
+from .deployment_profiles import ProfileStore
+from .deployment_rollouts import DeploymentRollouts
 from .fleet import ClientFleet
 from .dsh_proxy import DSH_PROXY_PATH, http_origin, proxy_request
 from .management import ManagementError, ManagementService
@@ -98,6 +101,7 @@ class ResultService:
         self.repository = create_repository(config.db_conn, self.plugins)
         self.deployments = DeploymentStore(self.artifacts.root / "deployments.json", self.artifacts)
         self.fleet = ClientFleet(self.deployments, self.management)
+        self.profiles = ProfileStore(self.artifacts.root / "deployment-profiles.json", self.deployments)
         self.reports = ReportStore(
             config.analysis_scripts_dir or runtime / "analysis_scripts",
             config.analysis_reports_dir or runtime / "reports",
@@ -107,14 +111,32 @@ class ResultService:
         self.dsh_web = DshWebManager(replace(dsh, cwd=dsh.cwd or config.workspace)) if dsh else None
         static_dir = config.static_dir or str(Path(__file__).resolve().parents[1] / "web")
         self.static_dir = Path(static_dir).resolve()
+        self.rollouts = DeploymentRollouts(self.artifacts.root / "deployment-rollouts.json", self.profiles, self.fleet)
+        self.management.rollout_run_guard = self.rollouts.guard_run
+        self.management.rollout_config_guard = self.rollouts.guard_config
+        # guard_config reads the atomically published rollout store itself;
+        # do not make ordinary scheduler configuration saves wait for a tick's
+        # management HTTP request.
+        self.rollouts.start()
 
     def payload(self, path: str, query: dict[str, list[str]]) -> tuple[int, Any]:
         if path == "/api/scheduler":
-            return self.management_request(self.management.get_status)
+            return self.management_request(self.scheduler_status)
         if path == "/api/agents":
             return self.fleet_request(self.fleet.agents)
         if path == "/api/deployments/batch/defaults":
             return self.fleet_request(self.fleet.defaults)
+        if path == "/api/deployment-profiles":
+            return self.fleet_request(lambda: {"profiles": self.profiles.list()})
+        if path == "/api/deployment-rollouts":
+            return self.fleet_request(self.rollouts.list)
+        if path.startswith("/api/deployment-rollouts/"):
+            return self.fleet_request(self.rollouts.get, unquote(path.removeprefix("/api/deployment-rollouts/")))
+        if path.startswith("/api/deployment-profiles/"):
+            identifier = path.removeprefix("/api/deployment-profiles/")
+            if "/" in identifier:
+                return 404, {"error": "not found"}
+            return self.fleet_request(self.profiles.get, identifier)
         if path == "/api/logs":
             return self.management_request(self.management.logs, query)
         if path.startswith("/api/config/"):
@@ -161,6 +183,9 @@ class ResultService:
             except (DeploymentError, ArtifactError) as exc:
                 return exc.status, {"error": str(exc)}
         if path.startswith("/api/artifacts/"):
+            parts = path.removeprefix("/api/artifacts/").split("/")
+            if len(parts) == 2 and parts[1] == "resources":
+                return self.fleet_request(self.profiles.resources, parts[0])
             artifact_id = path.removeprefix("/api/artifacts/")
             artifact = self.artifacts.get(artifact_id)
             return (200, artifact) if artifact else (404, {"error": "artifact not found"})
@@ -226,6 +251,45 @@ class ResultService:
             return 200, operation(*args)
         except ManagementError as exc:
             return exc.status, {**exc.details, "error": str(exc)}
+
+    def scheduler_status(self) -> dict[str, Any]:
+        status = self.management.get_status()
+        status["rollout_blocks"] = self.rollouts.blocks()
+        status["run_datasets"] = {}
+        if not status.get("online"):
+            return status
+        configuration = status.get("configuration")
+        plugins = configuration.get("plugins", {}) if isinstance(configuration, dict) else {}
+        # Labels are catalog metadata only. Never compile profiles or read the
+        # saved scheduler file to guess which dataset is currently effective.
+        labels = {}
+        try:
+            artifacts = {row["artifact_id"]: row for row in self.artifacts.list()}
+            for row in artifacts.values():
+                metadata = row.get("metadata", {})
+                source_id = metadata.get("source_artifact_id")
+                source = artifacts.get(source_id) if isinstance(source_id, str) else None
+                if metadata.get("managed") and source and isinstance(metadata.get("dataset_version"), str):
+                    labels.setdefault(metadata["dataset_version"], source)
+        except ArtifactError:
+            LOG.warning("Could not read dataset labels", exc_info=True)
+        for key, plugin in plugins.items():
+            if not isinstance(plugin, dict) or not plugin.get("enabled"):
+                continue
+            version = plugin.get("expected_dataset_version")
+            if not isinstance(version, str) or not version:
+                continue
+            mapping = status.get("plugin_config_keys", {})
+            name = next((name for name, config_key in mapping.items() if config_key == key),
+                        plugin.get("plugin_type", key))
+            if name not in status.get("plugins", []):
+                continue
+            resource = labels.get(version)
+            value = {"dataset_version": version, "name": "", "version": ""}
+            if resource:
+                value.update(name=resource["name"], version=resource["version"], artifact_id=resource["artifact_id"])
+            status["run_datasets"][name] = value
+        return status
 
     def analysis_catalog(self, plugin: str | None = None, limit: int = 100,
                          offset: int = 0, search: str = "") -> dict[str, Any]:
@@ -321,11 +385,42 @@ class ResultService:
         return {**prepared, "scheduler_revision": scheduler["revision"],
                 "scheduler_restart_required": scheduler["restart_required"], "warnings": warnings}
 
+    def profile_operation(self, path: str, body: Any, *, method: str = "POST") -> tuple[int, Any]:
+        """Compile a saved, versioned recipe; browsers never supply execution paths."""
+        prefix = "/api/deployment-profiles"
+        if path == prefix:
+            if method != "POST":
+                return 404, {"error": "not found"}
+            return self.fleet_request(self.profiles.save, None, body)
+        parts = path.removeprefix(prefix + "/").split("/")
+        if method == "PUT" and len(parts) == 1:
+            return self.fleet_request(self.profiles.save, parts[0], body)
+        if method != "POST" or len(parts) != 2 or parts[1] not in {"preview", "bind-scheduler", "publish"}:
+            return 404, {"error": "not found"}
+        return self.fleet_request(self._apply_profile, parts[0], parts[1], body)
+
+    def _apply_profile(self, profile_id: str, action: str, body: Any) -> dict[str, Any]:
+        if action == "preview":
+            return self.rollouts.preview(profile_id, body)
+        if action == "publish":
+            return self.rollouts.publish(profile_id, body)
+        raise DeploymentError("服务端同步已纳入统一更新，请预览后提交更新请求", 409)
+
+    def rollout_operation(self, path: str, body: Any) -> tuple[int, Any]:
+        parts = path.removeprefix("/api/deployment-rollouts/").split("/")
+        if len(parts) != 2:
+            return 404, {"error": "not found"}
+        return self.fleet_request(self.rollouts.operation, unquote(parts[0]), parts[1], body)
+
+    def deployment_ai_context(self, body: Any) -> tuple[int, Any]:
+        return self.fleet_request(deployment_review_context, self.rollouts, body)
+
     def bind_deployment_scheduler(self, body: Any) -> dict[str, Any]:
         if not isinstance(body, dict):
             raise ManagementError("request body must be an object")
+        self.rollouts.guard_advanced(body)
         # Serialize against config edits, plugin installation and UI task creation.
-        with self.management._lock:
+        with self.rollouts._lock, self.management._lock:
             prepared = (self.fleet.preview(body) if "client_ids" in body
                         else self.preview_deployment(body))
             if body.get("scheduler_revision") != prepared["scheduler_revision"]:
@@ -395,6 +490,7 @@ class ResultService:
             return 502, {"error": str(exc)}
 
     def close(self) -> None:
+        self.rollouts.close()
         if self.dsh_web:
             self.dsh_web.close()
 
@@ -535,6 +631,18 @@ class Handler(BaseHTTPRequestHandler):
             self._send(status, value)
             return
         parsed = urlparse(self.path)
+        if parsed.path == "/api/deployment-ai/review-context":
+            if not self._allow_json_body():
+                return
+            try:
+                status, value = self.service.deployment_ai_context(self._read_json_body())
+            except (ValueError, json.JSONDecodeError) as exc:
+                status, value = 400, {"error": str(exc)}
+            except (RuntimeError, OSError):
+                LOG.exception("deployment AI context failed")
+                status, value = 500, {"error": "无法读取部署审查上下文，请刷新后重试"}
+            self._send(status, value)
+            return
         if parsed.path == "/api/artifacts/upload":
             media_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
             if media_type != "application/octet-stream":
@@ -582,6 +690,30 @@ class Handler(BaseHTTPRequestHandler):
             self._send(status, value)
             return
         report_plugin = _plugin_resource_name(parsed.path, "reports")
+        if parsed.path.startswith("/api/deployment-rollouts/"):
+            if not self._allow_json_body():
+                return
+            try:
+                status, value = self.service.rollout_operation(parsed.path, self._read_json_body())
+            except (ValueError, json.JSONDecodeError) as exc:
+                status, value = 400, {"error": str(exc)}
+            except (RuntimeError, OSError) as exc:
+                LOG.exception("deployment rollout operation failed")
+                status, value = 500, {"error": str(exc)}
+            self._send(status, value)
+            return
+        if parsed.path == "/api/deployment-profiles" or parsed.path.startswith("/api/deployment-profiles/"):
+            if not self._allow_json_body():
+                return
+            try:
+                status, value = self.service.profile_operation(parsed.path, self._read_json_body())
+            except (ValueError, json.JSONDecodeError) as exc:
+                status, value = 400, {"error": str(exc)}
+            except (RuntimeError, OSError) as exc:
+                LOG.exception("deployment profile operation failed")
+                status, value = 500, {"error": str(exc)}
+            self._send(status, value)
+            return
         if parsed.path in {"/api/deployments/batch", "/api/deployments/batch/preview"} or parsed.path.startswith("/api/agents/"):
             if not self._allow_json_body():
                 return
@@ -651,6 +783,8 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path.startswith("/api/config/"):
                 status, value = self.service.management_request(
                     self.service.management.save_config, parsed.path.removeprefix("/api/config/"), body)
+            elif parsed.path.startswith("/api/deployment-profiles/"):
+                status, value = self.service.profile_operation(parsed.path, body, method="PUT")
             elif parsed.path.startswith("/api/deployments/"):
                 status, value = self.service.update_deployment(parsed.path, body)
             else:

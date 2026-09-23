@@ -207,9 +207,68 @@ bool Storage::FinishRun(const std::string& id, const std::string& status) {
 }
 bool Storage::CancelQueuedRun(const std::string& id, const std::string& plugin) {
     return Exec("UPDATE runs SET status='cancelled',finished_at=now() "
-                "WHERE run_id=$1 AND plugin_type=$2 AND status='queued'",
+                // A previous attempt may have committed the database change
+                // before rollout sidecar publication failed.  Treat that
+                // durable cancelled state as an idempotent retry so the
+                // in-memory queue entry can be removed after publication.
+                "WHERE run_id=$1 AND plugin_type=$2 AND status IN "
+                "('queued','planning','failed','cancelled')",
                 {{id, false}, {plugin, false}});
 }
+bool Storage::HasUnfinishedRuns(const std::string& plugin_type, bool& has_unfinished) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto result = common::PgQuery(connection_.get(),
+        "SELECT EXISTS(SELECT 1 FROM runs WHERE plugin_type=$1 "
+        "AND status IN ('queued','planning','running','stopped'))",
+        {{plugin_type, false}});
+    if (!result || PQresultStatus(result.get()) != PGRES_TUPLES_OK || PQntuples(result.get()) != 1)
+        return false;
+    has_unfinished = common::PgCell(result.get(), 0, 0) == "t";
+    return true;
+}
+
+bool Storage::ReadUnfinishedRuns(const std::string& plugin, std::vector<RunRecord>& runs) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto result = common::PgQuery(connection_.get(),
+        "SELECT run_id,plugin_type,dataset_version,params,COALESCE(work_fingerprint,''),"
+        "force_rerun,COALESCE(force_rerun_reason,''),COALESCE(rerun_of,''),status,worker_ids::text,"
+        "COALESCE(execution_fingerprint,'') FROM runs WHERE plugin_type=$1 "
+        "AND status IN ('queued','planning','running','stopped') ORDER BY created_at,run_id", {{plugin, false}});
+    if (!result || PQresultStatus(result.get()) != PGRES_TUPLES_OK) return false;
+    std::vector<RunRecord> records;
+    for (int i = 0; i < PQntuples(result.get()); ++i) {
+        records.push_back({common::PgCell(result.get(), i, 0), common::PgCell(result.get(), i, 1),
+            common::PgCell(result.get(), i, 2), common::PgCell(result.get(), i, 3),
+            common::PgCell(result.get(), i, 4), common::PgCell(result.get(), i, 5) == "t",
+            common::PgCell(result.get(), i, 6), common::PgCell(result.get(), i, 7), common::PgCell(result.get(), i, 8)});
+        if (!ParseWorkerIds(common::PgCell(result.get(), i, 9), records.back().worker_ids)) return false;
+        records.back().execution_fingerprint = common::PgCell(result.get(), i, 10);
+    }
+    runs.swap(records);
+    return true;
+}
+
+bool Storage::AbandonStoppedRun(const std::string& id, const std::string& plugin) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto result = common::PgQuery(connection_.get(),
+        "UPDATE runs SET status='cancelled',finished_at=now() WHERE run_id=$1 AND plugin_type=$2 "
+        "AND status IN ('stopped','cancelled')", {{id, false}, {plugin, false}});
+    return result && PQresultStatus(result.get()) == PGRES_COMMAND_OK && std::string(PQcmdTuples(result.get())) == "1";
+}
+
+bool Storage::ReadRolloutRunStatuses(const std::string& plugin, const std::vector<std::string>& ids,
+                                   std::unordered_map<std::string, std::string>& states) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto result = common::PgQuery(connection_.get(),
+        "SELECT run_id,status FROM runs WHERE plugin_type=$1 AND run_id IN "
+        "(SELECT jsonb_array_elements_text($2::jsonb))", {{plugin, false}, {nlohmann::json(ids).dump(), false}});
+    if (!result || PQresultStatus(result.get()) != PGRES_TUPLES_OK) return false;
+    states.clear();
+    for (int i = 0; i < PQntuples(result.get()); ++i)
+        states[common::PgCell(result.get(), i, 0)] = common::PgCell(result.get(), i, 1);
+    return true;
+}
+
 bool Storage::LoadUnfinishedRuns(std::vector<RunRecord>& runs,
                                  std::vector<RunRecord>& queued_runs) {
     std::lock_guard<std::mutex> lock(mutex_);

@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <iomanip>
 #include <sstream>
 #include <vector>
@@ -114,7 +115,15 @@ std::string Sha256Hex(const std::string& data) {
 
 bool FileSha256Hex(const std::string& path, std::string* out) {
     if (out == nullptr) return false;
-    std::ifstream input(path, std::ios::binary);
+    std::ifstream input;
+    try { input.open(std::filesystem::u8path(path), std::ios::binary); }
+    catch (const std::system_error&) {}
+#ifdef _WIN32
+    if (!input.is_open()) {
+        input.clear();
+        input.open(path, std::ios::binary);
+    }
+#endif
     if (!input) return false;
     std::ostringstream data;
     data << input.rdbuf();

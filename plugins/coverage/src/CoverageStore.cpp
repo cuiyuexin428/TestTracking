@@ -8,19 +8,36 @@
 #include <json.hpp>
 namespace coverage_plugin {
 namespace {
+bool FilePoints(const nlohmann::json& record,const std::string& file,
+                std::set<std::uint64_t>* points) {
+    if (!record.is_object() || !record.contains("file") || !record["file"].is_string() ||
+        record["file"]!=file || record.value("status",std::string("success"))!="success" ||
+        !record.contains("points") || !record["points"].is_array()) return false;
+    std::set<std::uint64_t> loaded;
+    for (const auto& point:record["points"]) {
+        if (!point.is_number_unsigned()) return false;
+        loaded.insert(point.get<std::uint64_t>());
+    }
+    *points=std::move(loaded); return true;
+}
 class FileCoverageStore : public CoverageResultStore {
 public:
     bool init(const std::string& config) override {
         directory_=nlohmann::json::parse(config).value("store_dir",std::string());
         return !directory_.empty();
     }
-    bool publish(const FileCoverageResult& result) override {
+    bool publish(FileCoverageResult& result) override {
         const auto path=pathFor(result.run_id,result.file);
         common::FilePublicationLock lock(path.string()+".lock");
         if (!lock.acquired()) return false;
         const auto existing=read(path);
         if (existing.is_object() && existing.value("status",std::string())=="success") {
-            return existing.value("file", std::string()) == result.file;
+            std::set<std::uint64_t> points;
+            if (!FilePoints(existing,result.file,&points)) return false;
+            result.points.assign(points.begin(),points.end());
+            result.successful=true;
+            result.detail.clear();
+            return true;
         }
         nlohmann::json record={{"file",result.file},{"attempt_id",result.attempt_id},
             {"status",result.successful?"success":"failed"},{"detail",result.detail}};
@@ -33,15 +50,7 @@ public:
     bool loadFileCoverage(const std::string& run,const std::string& file,std::set<std::uint64_t>* points) override {
         if (!points) return false;
         const auto record=read(pathFor(run,file));
-        if (!record.is_object() || !record.contains("file") || !record["file"].is_string() ||
-            record["file"]!=file || record.value("status",std::string("success"))!="success" ||
-            !record.contains("points") || !record["points"].is_array()) return false;
-        std::set<std::uint64_t> loaded;
-        for (const auto& point:record["points"]) {
-            if (!point.is_number_unsigned()) return false;
-            loaded.insert(point.get<std::uint64_t>());
-        }
-        *points=std::move(loaded); return true;
+        return FilePoints(record,file,points);
     }
     bool hasFileCov(const std::string& run,const std::string& file) override {
         const auto record=read(pathFor(run,file));
@@ -71,12 +80,29 @@ public:
             "CREATE TABLE IF NOT EXISTS coverage_cov_files(run_id text NOT NULL,file text NOT NULL,"
             "cov bytea,size_bytes bigint,PRIMARY KEY(run_id,file));");
     }
-    bool publish(const FileCoverageResult& result) override {
+    bool publish(FileCoverageResult& result) override {
         std::lock_guard<std::mutex> lock(mutex_);
         auto conn=connection_.get(); common::PgTransaction transaction(conn);
         bool accepted=false;
         if (!transaction.active() || !common::LockFileOutcome(conn,"coverage",result.run_id,result.file,&accepted)) return false;
-        if (accepted) return transaction.commit();
+        if (accepted) {
+            // Read under the same outcome lock so a duplicate reports exactly
+            // the successful publication that caused this attempt to lose.
+            auto stored=common::PgQuery(conn,
+                "SELECT points FROM coverage_file_points WHERE run_id=$1 AND file=$2",
+                {{result.run_id,false},{result.file,false}},true);
+            if (!stored || PQresultStatus(stored.get())!=PGRES_TUPLES_OK ||
+                PQntuples(stored.get())!=1 || PQgetisnull(stored.get(),0,0)) return false;
+            const auto bytes=common::PgCell(stored.get(),0,0);
+            if (bytes.size()%sizeof(std::uint64_t)) return false;
+            const auto unpacked=UnpackPoints(bytes);
+            const std::set<std::uint64_t> points(unpacked.begin(),unpacked.end());
+            if (!transaction.commit()) return false;
+            result.points.assign(points.begin(),points.end());
+            result.successful=true;
+            result.detail.clear();
+            return true;
+        }
         const std::vector<common::PgParam> identity={{result.run_id,false},{result.file,false}};
         if (result.successful) {
             if (!common::PgExec(conn,

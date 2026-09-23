@@ -83,6 +83,7 @@ class ServerPluginInstallerTests(unittest.TestCase):
         self.config = ServiceConfig.from_file(self.result_path)
         self.management = ManagementService(self.config)
         self.management.require_plugin_idle = Mock(return_value=None)
+        self.management.plugin_maintenance = Mock(return_value={"ok": True})
         self.management.get_status = Mock(return_value={"online": True, "instance_id": "scheduler-1"})
         self.store = ArtifactStore(self.root / "artifacts")
         self.installer = ServerPluginInstaller(self.config, self.store, self.management)
@@ -152,6 +153,78 @@ class ServerPluginInstallerTests(unittest.TestCase):
         self.assertEqual(2, self.management.require_plugin_idle.call_count)
         self.assertTrue(self.management._scheduler_save_pending)
         self.assertFalse(self.installer.journal.exists())
+
+    def test_install_commits_native_maintenance_until_restart(self):
+        outcome = self.install(self.upload())
+        calls = self.management.plugin_maintenance.call_args_list
+        self.assertEqual(["begin_plugin_maintenance", "end_plugin_maintenance"], [call.args[0] for call in calls])
+        self.assertEqual(calls[0].kwargs["token"], calls[1].kwargs["token"])
+        self.assertTrue(calls[1].kwargs["committed"])
+        self.assertEqual(outcome["scheduler_revision"], calls[1].kwargs["revision"])
+        self.assertFalse(self.installer.maintenance_journal.exists())
+
+    def test_configuration_alias_uses_persisted_runtime_type_for_maintenance(self):
+        self.management.get_status.return_value = {'online': True, 'instance_id': 'scheduler-1',
+            'plugin_config_keys': {'coverage': 'existing'}}
+        record = self.upload(make_bundle('existing', '2'), plugin='existing', version='2')
+        self.install(record)
+        self.assertTrue(all(call.args == ('coverage',) for call in self.management.require_plugin_idle.call_args_list))
+        self.assertTrue(all(call.kwargs['plugin'] == 'coverage'
+                            for call in self.management.plugin_maintenance.call_args_list))
+
+    def test_unreachable_native_barrier_never_changes_configuration(self):
+        before = self.scheduler_path.read_bytes(), self.result_path.read_bytes()
+        self.management.plugin_maintenance.side_effect = ManagementError("offline", 503)
+        with self.assertRaisesRegex(ManagementError, "offline"):
+            self.install(self.upload())
+        self.assertEqual(before, (self.scheduler_path.read_bytes(), self.result_path.read_bytes()))
+        self.assertTrue(self.installer.maintenance_journal.exists())
+        self.management.plugin_maintenance.side_effect = None
+        recovered = ServerPluginInstaller(self.config, self.store, self.management)
+        last = self.management.plugin_maintenance.call_args
+        self.assertEqual("end_plugin_maintenance", last.args[0])
+        self.assertFalse(last.kwargs["committed"])
+        self.assertEqual(hashlib.sha256(before[0]).hexdigest(), last.kwargs["revision"])
+        self.assertFalse(recovered.maintenance_journal.exists())
+
+    def test_lost_commit_reply_preserves_configuration_and_retries_same_token(self):
+        def maintenance(action, **values):
+            if action == "end_plugin_maintenance":
+                raise ManagementError("lost acknowledgement", 503)
+            return {"ok": True}
+        self.management.plugin_maintenance.side_effect = maintenance
+        outcome = self.install(self.upload())
+        self.assertTrue(outcome["installed"])
+        self.assertTrue(outcome["warnings"])
+        self.assertTrue(Path(outcome["installation_path"]).is_dir())
+        self.assertTrue(self.installer.maintenance_journal.exists())
+        original_token = self.management.plugin_maintenance.call_args.kwargs["token"]
+        # A disconnected scheduler cannot take down result-service startup.
+        offline = ServerPluginInstaller(self.config, self.store, self.management)
+        self.assertTrue(offline.transaction_warning)
+        self.assertTrue(offline.maintenance_journal.exists())
+        self.management.plugin_maintenance.side_effect = None
+        ServerPluginInstaller(self.config, self.store, self.management)
+        retried = self.management.plugin_maintenance.call_args
+        self.assertTrue(retried.kwargs["committed"])
+        self.assertEqual(original_token, retried.kwargs["token"])
+        self.assertFalse(self.installer.maintenance_journal.exists())
+
+    def test_maintenance_journal_cleanup_failure_does_not_remove_committed_installation(self):
+        original_unlink = Path.unlink
+        def fail_cleanup(path, *args, **kwargs):
+            if path == self.installer.maintenance_journal:
+                raise PermissionError('maintenance cleanup denied')
+            return original_unlink(path, *args, **kwargs)
+        with patch.object(Path, 'unlink', fail_cleanup):
+            outcome = self.install(self.upload())
+        self.assertTrue(outcome['installed'])
+        self.assertTrue(outcome['warnings'])
+        self.assertTrue(Path(outcome['installation_path']).is_dir())
+        self.assertTrue(self.installer.maintenance_journal.exists())
+        self.assertTrue(self.management.plugin_maintenance.call_args.kwargs['committed'])
+        ServerPluginInstaller(self.config, self.store, self.management)
+        self.assertFalse(self.installer.maintenance_journal.exists())
 
     def test_upgrade_preserves_business_configuration_and_does_not_overwrite_old_files(self):
         old_dll = self.root / "old.dll"
@@ -224,6 +297,9 @@ class ServerPluginInstallerTests(unittest.TestCase):
         self.assertEqual(old_marker, marker.read_bytes())
         self.assertEqual("previous", self.management._pending_scheduler_revision)
         self.assertFalse(self.installer.journal.exists())
+        self.assertEqual("end_plugin_maintenance", self.management.plugin_maintenance.call_args.args[0])
+        self.assertFalse(self.management.plugin_maintenance.call_args.kwargs["committed"])
+        self.assertEqual(hashlib.sha256(before[0]).hexdigest(), self.management.plugin_maintenance.call_args.kwargs["revision"])
 
     def test_interrupted_configuration_commit_is_recovered_on_next_initialization(self):
         old_scheduler, old_result = self.scheduler_path.read_bytes(), self.result_path.read_bytes()
@@ -311,6 +387,7 @@ class ServerPluginInstallerTests(unittest.TestCase):
     def test_http_upload_preview_install_and_restart_load_plugin_and_ai_context(self):
         service = ResultService(self.config)
         service.management.require_plugin_idle = Mock(return_value=None)
+        service.management.plugin_maintenance = Mock(return_value={"ok": True})
         service.management.get_status = Mock(return_value={"online": True, "instance_id": "scheduler-1"})
         handler = type("ServerPluginHTTPHandler", (Handler,), {
             "service": service, "log_message": lambda *args: None})
